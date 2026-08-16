@@ -1,7 +1,24 @@
 # Known traps — read before you start
 
-Five things that will cost you hours and teach you nothing. They are not part of the
-assessment. Fixes are given.
+Seven things that cost hours and teach nothing. They are not part of the assessment, and fixes
+are given for all of them.
+
+**Three are already fixed in the code you are given. The rest are live in the code you write.**
+
+| # | Trap | Status |
+|---|---|---|
+| 1 | `statsmodels` params are an unnamed array | **Live** — bites in your `stage5` bootstrap |
+| 2 | `yfinance` MultiIndex columns | Fixed in `stage1`; live if you add your own tickers |
+| 3 | `.where().rolling().std()` returns all-NaN | Fixed for realised volatility; live for features you add |
+| 4 | Regime labels arbitrary between fits | Fixed in `stage4`. **Live in your bootstrap** — every draw is a fresh fit |
+| 5 | Perturbation effect smaller than sampling noise | Half fixed: `score_field()` gives you the averaging; using it is yours |
+| 6 | Bootstrap is CPU-bound | **Live** — `stage5` is a stub |
+| 7 | Missing data hides in plain sight | A habit to build, not a bug to fix |
+
+**Traps 1, 4 and 6 all land in `src/stage5_uncertainty.py`**, which ships as a stub. Trap 4 is
+the dangerous one there: it is silent. Pooling bootstrap draws without re-ordering each fit's
+regimes yields a tidy, plausible interval that has quietly mixed different regimes together, and
+nothing in your output looks wrong.
 
 ---
 
@@ -57,6 +74,12 @@ df["downside_vol"] = (df["ret"].where(df["ret"] < 0)
 
 ## 4. Markov switching regime labels are arbitrary between runs
 
+> **This is the trap that will cost you marks rather than time.** `stage4` handles it for the
+> main fit. Your bootstrap in `stage5` refits the model on every draw, and each of those fits
+> labels its regimes independently. Re-order **inside the loop**, before pooling. And do not
+> order on `sigma2`: with `endog = log_rv` that is the variance of *log* volatility, not
+> volatility. Order on empirical realised volatility per assigned regime, as `stage4` does.
+
 Regime "0" in one fit is not regime "0" in the next. Sort by fitted volatility so labels
 mean something and are stable.
 
@@ -70,7 +93,7 @@ probs.columns = [remap[c] for c in probs.columns]
 
 ## 5. The perturbation effect is smaller than the sampling noise
 
-**Read this before section 5.3.**
+**Read this before section 8.3.**
 
 One scoring call at temperature 1.0 has a standard deviation of roughly **0.05 to 0.10**.
 The effect of changing one phrase in a document is about **the same size**. Measured naively,

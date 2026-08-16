@@ -18,7 +18,17 @@ from pydantic import BaseModel, Field
 import config
 
 load_dotenv()
-client = OpenAI()
+
+# Created on first use, not at import. Importing this module must not require an API key -
+# tests/test_contracts.py imports it to read the construct names.
+_client = None
+
+
+def client_():
+    global _client
+    if _client is None:
+        _client = OpenAI()
+    return _client
 
 # =============================================================================================
 # YOUR WORK STARTS HERE
@@ -113,7 +123,7 @@ def build_situations(scenarios: list[dict] | None = None) -> dict:
 
 
 def ask(persona_name: str, persona: str, situation: str) -> dict:
-    r = client.beta.chat.completions.parse(
+    r = client_().beta.chat.completions.parse(
         model=config.MODEL,
         messages=[{"role": "system",
                    "content": persona + "\n\nAnswer entirely in character. Do not hedge like an "

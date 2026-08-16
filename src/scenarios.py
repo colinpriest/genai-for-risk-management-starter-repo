@@ -18,7 +18,7 @@ WRITES
 from __future__ import annotations
 import config
 
-# The five transmission routes from section 5.4 Rule 3 of the brief.
+# The five transmission routes from section 8.4 Rule 3 of the brief.
 # Your three selected scenarios must use three DIFFERENT routes.
 TRANSMISSION_ROUTES = [
     "commodity_prices",

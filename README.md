@@ -33,7 +33,7 @@ not into re-deriving plumbing.
 | RBA HTML parsing, chunking, retrieval (`stage2`) | **The retrieval query** — which parts of a document matter |
 | Parallel calling, retries, raw saving, averaging (`stage3`) | **The prompts.** All six field descriptions are blank |
 | 4-regime fitting, regime ordering, risk metrics (`stage4`) | Which text features to include; the dependent variable choice |
-| Parallel block bootstrap, ensemble (`stage5`) | Interpreting the intervals |
+| — | **`stage5` is a stub.** All three uncertainty layers are yours: block bootstrap, specification ensemble, LLM spread. Traps 1, 4 and 6 all bite here. |
 | Perturbation + faithfulness harness, patterns verified against the RBA corpus | Running it and interpreting the result |
 
 **Read `TRAPS.md` first.** Six issues that cost hours and teach nothing, with fixes.
@@ -74,9 +74,9 @@ run_pipeline.py        Runs stages in order. Start here to see the flow.
 src/
   stage1_market_data.py    ASX 200 + macro indicators        OWNER: ?
   stage2_documents.py      RBA minutes + retrieval           OWNER: ?
-  stage3_sentiment.py      10 parallel calls -> scores       OWNER: ?
-  stage4_regime_model.py   3-regime Markov switching         OWNER: ?
-  stage5_uncertainty.py    3 uncertainty layers              OWNER: ?
+  stage3_riskvoice.py      10 parallel calls -> 5 constructs OWNER: ?
+  stage4_regime_model.py   Markov switching, 4 regimes and 3 OWNER: ?
+  stage5_uncertainty.py    3 uncertainty layers   *** STUB *** OWNER: ?
   dashboard.py             Plotly output                     OWNER: ?
   scenarios.py             Geopolitical scenarios            SHARED
 
@@ -97,7 +97,7 @@ outputs/                 dashboard.html and figures
 
 ## The harness is supplied — run it, do not rebuild it
 
-`harness/` contains the perturbation and faithfulness tools for section 5.3 of the brief. You run
+`harness/` contains the perturbation and faithfulness tools for section 8.3 of the brief. You run
 them and interpret the results. Rebuilding them is not worth marks; interpreting them is.
 
 Both take **your** functions as arguments, so they work with whatever you build in stage 3:
@@ -106,8 +106,13 @@ Both take **your** functions as arguments, so they work with whatever you build 
 from harness.perturbation import perturbation_sweep
 from harness.faithfulness import faithfulness_test
 
-result = perturbation_sweep(score_fn=my_sentiment_scorer, text=doc, edits=DEFAULT_EDITS)
-fx     = faithfulness_test(score_fn=my_sentiment_scorer, explain_fn=my_explainer, text=doc)
+from src.stage3_riskvoice import score_field
+
+# score_field averages several calls, which trap 5 requires - a single call is too noisy
+scorer = lambda t: score_field(t, "financial_conditions_concern", n=5)
+
+result = perturbation_sweep(score_fn=scorer, text=doc, edits=DEFAULT_EDITS)
+fx     = faithfulness_test(score_fn=scorer, explain_fn=my_explainer, text=doc)
 ```
 
 ---

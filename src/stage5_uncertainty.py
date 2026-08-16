@@ -8,7 +8,7 @@ PURPOSE
     and LLM (semantic spread across the parallel calls).
 
 READS
-    data/processed/regimes.parquet, sentiment_scores.parquet, llm_raw/
+    data/processed/regimes.parquet, riskvoice_scores.parquet, llm_raw/
 
 WRITES
     data/processed/uncertainty.parquet
@@ -33,10 +33,10 @@ def run() -> pd.DataFrame:
 
 # HINTS
 #   - The FOURTH layer - human agreement - is NOT computed here. It comes from your
-#     cross-review work (section 5.2) and lives in data/processed/agreement/.
+#     cross-review work (section 8.2) and lives in data/processed/agreement/.
 #   - Embeddings run locally via sentence-transformers. No API cost.
 #   - Report intervals, not point estimates. Most RBA decisions are holds, so accuracy
-#     is meaningless here (section 5.1 of the brief).
+#     is meaningless here (section 8.1 of the brief).
 
 
 if __name__ == "__main__":

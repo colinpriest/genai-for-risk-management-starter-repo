@@ -5,10 +5,10 @@ OWNER: <put your name here>
 
 PURPOSE
     Produce outputs/dashboard.html: Australian rates and market volatility against the
-    inferred regime and the extracted RBA sentiment, with uncertainty shown.
+    inferred regime and all five extracted risk-voice constructs, with uncertainty shown.
 
 READS
-    data/processed/regimes.parquet, sentiment_scores.parquet, uncertainty.parquet
+    data/processed/regimes.parquet, riskvoice_scores.parquet, uncertainty.parquet
 
 WRITES
     outputs/dashboard.html

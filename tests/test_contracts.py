@@ -5,18 +5,25 @@ Run after any stage produces output:
     pytest tests/ -v
 
 Each test skips if the stage has not run yet, so this is safe from Week 2 onward.
+
+These cover the SUPPLIED stages only. As you agree your own interface contracts in Week 2,
+add a test here for each one — a contract nobody checks is a comment, not a contract.
 """
 from __future__ import annotations
 import pytest
 import pandas as pd
 import config
 
+from src.stage3_riskvoice import FIELD_DESCRIPTIONS
+
+CONSTRUCTS = list(FIELD_DESCRIPTIONS.keys())
+
 # (file, required columns, grain description)
 CONTRACTS = {
     "market_data.parquet": (["date"], "one row per trading day"),
-    "documents.parquet": (["meeting_date", "text"], "one row per RBA meeting"),
-    "sentiment_scores.parquet": (
-        ["meeting_date", "sentiment_mean", "sentiment_sd", "n_calls_valid"],
+    "documents.parquet": (["meeting_date", "text_full"], "one row per RBA meeting"),
+    "riskvoice_scores.parquet": (
+        ["meeting_date", "n_calls_valid"] + CONSTRUCTS + [f"{c}_sd" for c in CONSTRUCTS],
         "one row per RBA meeting"),
     "regimes.parquet": (["date", "regime"], "one row per trading day"),
 }
@@ -37,20 +44,41 @@ def test_required_columns(name, spec):
     assert not missing, f"{name} is missing required columns: {missing}"
 
 
-def test_sentiment_ranges():
-    df = _load("sentiment_scores.parquet")
-    assert df["sentiment_mean"].between(-1, 1).all(), "sentiment_mean outside [-1, 1]"
-    assert (df["sentiment_sd"] >= 0).all(), "negative standard deviation"
-    assert df["n_calls_valid"].between(0, config.N_PARALLEL_CALLS).all()
+def test_riskvoice_grain():
+    df = _load("riskvoice_scores.parquet")
     assert df["meeting_date"].is_unique, "duplicate meeting_date - grain is one row per meeting"
     assert df["meeting_date"].is_monotonic_increasing, "rows must be in date order"
+    assert df["n_calls_valid"].between(0, config.N_PARALLEL_CALLS).all()
 
 
-def test_sentiment_never_silently_empty():
-    """A row with no valid calls must not carry a sentiment score."""
-    df = _load("sentiment_scores.parquet")
-    bad = df[(df["n_calls_valid"] == 0) & df["sentiment_mean"].notna()]
-    assert bad.empty, f"{len(bad)} rows have a score but zero valid calls"
+@pytest.mark.parametrize("construct", CONSTRUCTS)
+def test_construct_ranges(construct):
+    df = _load("riskvoice_scores.parquet")
+    ok = df[construct].dropna()
+    assert ok.between(0, 1).all(), f"{construct} outside [0, 1]"
+    assert (df[f"{construct}_sd"].dropna() >= 0).all(), f"{construct}_sd is negative"
+
+
+@pytest.mark.parametrize("construct", CONSTRUCTS)
+def test_construct_discriminates(construct):
+    """A construct that returns the same value for every document carries no information.
+
+    This is not a bug in the code - it means the field description needs rewriting.
+    """
+    df = _load("riskvoice_scores.parquet")
+    spread = df[construct].std()
+    assert spread > 0.02, (
+        f"{construct} has a between-document sd of {spread:.4f}: it is returning "
+        f"essentially the same value for every document. Rewrite its field description "
+        f"in src/stage3_riskvoice.py so that high and low are clearly distinguished.")
+
+
+def test_never_silently_empty():
+    """A row with no valid calls must not carry a score."""
+    df = _load("riskvoice_scores.parquet")
+    for c in CONSTRUCTS:
+        bad = df[(df["n_calls_valid"] == 0) & df[c].notna()]
+        assert bad.empty, f"{len(bad)} rows have a {c} score but zero valid calls"
 
 
 def test_regimes_count():

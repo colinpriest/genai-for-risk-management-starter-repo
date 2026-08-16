@@ -54,7 +54,17 @@ from pydantic import BaseModel, Field, create_model
 import config
 
 load_dotenv()
-client = OpenAI()
+
+# Created on first use, not at import. Importing this module must not require an API key -
+# tests/test_contracts.py imports it to read the construct names.
+_client = None
+
+
+def client_():
+    global _client
+    if _client is None:
+        _client = OpenAI()
+    return _client
 
 # =============================================================================================
 # YOUR WORK STARTS HERE
@@ -104,7 +114,7 @@ RiskVoice = create_model(
 
 def _one_call(text: str, seed: int) -> dict:
     try:
-        r = client.beta.chat.completions.parse(
+        r = client_().beta.chat.completions.parse(
             model=config.MODEL,
             messages=[{"role": "system", "content": SYSTEM_PROMPT},
                       {"role": "user", "content": f"RBA minutes:\n\n{text}"}],
