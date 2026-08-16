@@ -1,0 +1,17 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Stage outputs are regenerated; do not commit them
+data/interim/*
+data/processed/*
+!data/**/.gitkeep
+
+# EXCEPTION: raw LLM responses MUST be committed for reproducibility
+!data/processed/llm_raw/
+!data/processed/llm_raw/**
+
+outputs/figures/*
+!outputs/figures/.gitkeep
