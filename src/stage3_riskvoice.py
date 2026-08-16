@@ -21,7 +21,8 @@ YOURS (this is what is marked):
 THE FIVE CONSTRUCTS - AND WHY THESE FIVE
 =============================================================================================
 You are NOT scoring whether the RBA is hawkish or dovish. Stance tells you which way rates
-move; it says nothing about how uncertain the world is, and this model predicts VOLATILITY.
+move, which is a different question from how uncertain the world is - and this model predicts
+VOLATILITY.
 
 Score how much uncertainty and risk the Board is signalling:
 
@@ -32,7 +33,8 @@ Score how much uncertainty and risk the Board is signalling:
     5. uncertainty_language           how heavily the Board hedges
 
 A sixth field, policy_stance, is included as a DELIBERATE CONTRAST. It is the obvious thing
-to score and it is the wrong thing. Compare its behaviour against the five.
+to score, and it does carry information about volatility - but it behaves differently from the
+five above. Compare it against them and explain HOW it differs.
 
 =============================================================================================
 WRITES data/processed/riskvoice_scores.parquet

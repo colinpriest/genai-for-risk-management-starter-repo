@@ -169,6 +169,21 @@ def run() -> pd.DataFrame:
     print(f"\n  fourth regime worth it: {summary['four_beats_three_on_aic']} "
           f"(AIC gain {summary['aic_gain_from_fourth_regime']:+.1f})")
     print(f"  text improves 4-regime AIC by {summary['four_regimes']['text_gain']:+.1f}")
+
+    print("\n  WHICH PERIODS EACH REGIME PICKS UP")
+    yrs = pd.Series(out4.index.year, index=out4.index)
+    for r in sorted(out4["regime"].dropna().unique()):
+        top = yrs[out4["regime"] == r].value_counts().head(4).index.tolist()
+        print(f"    {config.REGIME_NAMES[int(r)]:10s} most often: "
+              f"{', '.join(str(y) for y in sorted(top))}")
+
+    if any(v.startswith("regime_") for v in config.REGIME_NAMES.values()):
+        print("\n  NAME YOUR REGIMES. They are still neutral placeholders.")
+        print("  Using the figures above - share of days, volatility, ES, and the periods each")
+        print("  regime covers - decide what each state actually IS, then rename them in")
+        print("  config.py. The naming argument is marked; the exact numbers are not.")
+        print("  Ask specifically: does the fourth regime separate two economically different")
+        print("  states, or has it just split one state in half?")
     return out4
 
 

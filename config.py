@@ -37,12 +37,20 @@ SEED = 20260817                        # call i uses SEED + i
 N_PARALLEL_CALLS = 10                  # matches the reference implementation
 
 # --- Regime model ------------------------------------------------------------
-# Four regimes, not three. The reference used three on US data; on Australian data four
-# fits materially better (AIC 12,903 vs 12,966) and the extra regime is interpretable -
-# it separates a long "stressed" state (2008-09, 2011) from short violent "crisis"
-# episodes (Oct 2008, Mar 2020). See README.
+# Four regimes, not the reference's three. Whether the fourth regime earns its place on YOUR
+# data is a finding you have to produce: stage4 fits three and four and reports AIC for both.
 N_REGIMES = 4
-REGIME_NAMES = {0: "quiet", 1: "normal", 2: "stressed", 3: "crisis"}
+
+# YOURS TO NAME. These are deliberately neutral placeholders - a regime cannot be named before
+# it has been fitted and inspected.
+#
+# Regimes are ordered automatically from LOWEST to HIGHEST realised volatility, so 0 is always
+# your calmest state and N-1 your most violent. That ordering is done for you and is stable.
+#
+# After running stage4, look at each regime's share of days, annualised volatility, Expected
+# Shortfall, and which historical periods it covers. Then replace these with names a risk
+# committee would understand, and use them consistently in your dashboard and report.
+REGIME_NAMES = {0: "regime_0", 1: "regime_1", 2: "regime_2", 3: "regime_3"}
 
 # The dependent variable for the regime model. THIS CHOICE MATTERS MORE THAN ANY OTHER.
 #   "log_rv"  - log realised volatility. Exogenous text features enter the mean equation,

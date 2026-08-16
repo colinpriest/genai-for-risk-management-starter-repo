@@ -40,9 +40,10 @@ not into re-deriving plumbing.
 
 ## Two decisions already made for you, and why
 
-**Four regimes, not three.** The reference used three on US data. On Australian data four fits
-materially better (AIC 12,903 vs 12,966) and the fourth regime is interpretable: it separates a
-long *stressed* state (2008–09, 2011) from short violent *crisis* episodes (Oct 2008, Mar 2020).
+**Four regimes, not three.** The reference used three on US data. `stage4` fits three *and* four
+and reports AIC for both, so whether the fourth regime earns its place on your data is something
+you measure and report — not something we tell you. `REGIME_NAMES` ships as neutral placeholders
+for the same reason: naming the regimes is your work, done after you have inspected them.
 
 **Sampling temperature is 1.0, not 0.** The parallel calls exist to measure how much the model
 disagrees with itself. At temperature 0 they come back identical and that measurement is
