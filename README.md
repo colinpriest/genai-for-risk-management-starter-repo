@@ -102,7 +102,10 @@ pytest tests/            # run after any stage produces output
 ## Data
 
 **Supplied:** `data/raw/rba-minutes/` — 211 RBA minutes, 3 Oct 2006 to 16 Jun 2026.
-Source: Reserve Bank of Australia. CC BY 4.0.
+
+> **Source: Reserve Bank of Australia.** Licensed **CC BY 4.0**. You must attribute the RBA in your
+> report and on any chart built from this corpus — see [DATA-LICENCE.md](DATA-LICENCE.md) for the
+> exact wording and for two exclusions that apply to ABS data and the Cash Rate.
 
 **Supplied:** `data/raw/geopolitical/` — GPR index (Caldara & Iacoviello).
 
