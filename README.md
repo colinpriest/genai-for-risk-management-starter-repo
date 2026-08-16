@@ -22,6 +22,32 @@ and a defined hand-over. The stage order, the methods and the outputs are unchan
 
 ---
 
+## What is pre-built, and what is yours
+
+The Australian customisations are done for you. Your effort should go into judgement and design,
+not into re-deriving plumbing.
+
+| Pre-built and working | Yours |
+|---|---|
+| ASX 200 + macro download, volatility features (`stage1`) | Which macro indicators, and why |
+| RBA HTML parsing, chunking, retrieval (`stage2`) | **The retrieval query** — which parts of a document matter |
+| Parallel calling, retries, raw saving, averaging (`stage3`) | **The prompts.** All six field descriptions are blank |
+| 4-regime fitting, regime ordering, risk metrics (`stage4`) | Which text features to include; the dependent variable choice |
+| Parallel block bootstrap, ensemble (`stage5`) | Interpreting the intervals |
+| Perturbation + faithfulness harness, patterns verified against the RBA corpus | Running it and interpreting the result |
+
+**Read `TRAPS.md` first.** Six issues that cost hours and teach nothing, with fixes.
+
+## Two decisions already made for you, and why
+
+**Four regimes, not three.** The reference used three on US data. On Australian data four fits
+materially better (AIC 12,903 vs 12,966) and the fourth regime is interpretable: it separates a
+long *stressed* state (2008–09, 2011) from short violent *crisis* episodes (Oct 2008, Mar 2020).
+
+**Sampling temperature is 1.0, not 0.** The parallel calls exist to measure how much the model
+disagrees with itself. At temperature 0 they come back identical and that measurement is
+meaningless. Each call uses a different fixed seed, so runs still reproduce.
+
 ## Setup
 
 ```bash

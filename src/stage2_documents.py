@@ -1,45 +1,105 @@
 """
-Stage 2 — documents
+Stage 2 — Documents and retrieval
 
-OWNER: <put your name here>
+OWNER: solution author
 
-PURPOSE
-    Load the RBA minutes corpus, extract clean text from the HTML, and build the retrieval
-    step that selects relevant passages for scoring.
+Parses the RBA minutes HTML, extracts clean text, and builds a retrieval step that selects
+the passages most relevant to monetary policy stance. Retrieval, not full-context stuffing.
 
-READS
-    data/raw/rba-minutes/*.html  (211 files, supplied)
-
-WRITES
-    data/processed/documents.parquet  and a retrieval index
-
-CONTRACT
-    See contracts/stage2_documents.md
-    Agree it in Week 2 and commit it BEFORE writing this code.
-    tests/test_contracts.py will check your output against it.
+WRITES data/processed/documents.parquet
 """
 from __future__ import annotations
+import re
+import glob
+import numpy as np
 import pandas as pd
+from bs4 import BeautifulSoup
 import config
+
+# Retrieval query: the concepts that drive a policy stance judgement.
+RETRIEVAL_QUERY = (
+    "inflation outlook and forecasts; labour market conditions and wages; "
+    "the cash rate decision and considerations; risks to the outlook; "
+    "policy stance whether restrictive or accommodative"
+)
+TOP_K = 8
+
+
+def extract_text(path: str) -> str:
+    html = open(path, encoding="utf-8", errors="replace").read()
+    soup = BeautifulSoup(html, "lxml")
+    for t in soup(["script", "style", "nav", "header", "footer", "aside"]):
+        t.decompose()
+    main = soup.find("div", {"id": "content"}) or soup.find("main") or soup
+    text = " ".join(main.get_text(" ").split())
+    # Drop the trailing "Related Information" block - it is navigation, not content.
+    text = re.split(r"\bRelated Information\b", text)[0]
+    return text.strip()
+
+
+def split_paragraphs(text: str, min_chars: int = 220) -> list[str]:
+    """RBA minutes are one long run of sentences after HTML stripping, so chunk on
+    sentence boundaries and glue short fragments onto the previous chunk."""
+    sents = re.split(r"(?<=[.!?])\s+", text)
+    chunks, cur = [], ""
+    for s in sents:
+        cur = (cur + " " + s).strip()
+        if len(cur) >= min_chars:
+            chunks.append(cur)
+            cur = ""
+    if cur:
+        if chunks:
+            chunks[-1] += " " + cur
+        else:
+            chunks.append(cur)
+    return chunks
 
 
 def run() -> pd.DataFrame:
-    """Produce this stage's output and write it to the path in the contract.
+    from sentence_transformers import SentenceTransformer
 
-    Returns the DataFrame as well, so run_pipeline.py can chain stages in memory.
-    """
-    raise NotImplementedError("Stage 2 not implemented yet")
+    files = sorted(glob.glob(str(config.RBA_MINUTES_DIR / "*.html")))
+    if not files:
+        raise RuntimeError(f"No minutes found in {config.RBA_MINUTES_DIR}")
 
+    model = SentenceTransformer(config.EMBEDDING_MODEL)
+    q_emb = model.encode([RETRIEVAL_QUERY], normalize_embeddings=True)[0]
 
-# HINTS
-#   - Filenames are rba-minutes-YYYY-MM-DD.html. The date is the MEETING date.
-#   - Strip navigation, headers and footers before scoring. Check what your text
-#     extraction actually returns on one file before running all 211.
-#   - Retrieval, not full-context stuffing. The brief requires this (section 5.2).
-#   - Document length varies a lot across the corpus. Look at the distribution.
+    rows = []
+    for i, f in enumerate(files, 1):
+        date = re.search(r"(\d{4}-\d{2}-\d{2})", f).group(1)
+        full = extract_text(f)
+        chunks = split_paragraphs(full)
+        if not chunks:
+            print(f"  WARNING: no text extracted from {f}")
+            continue
+        emb = model.encode(chunks, normalize_embeddings=True, show_progress_bar=False)
+        sims = emb @ q_emb
+        top = np.argsort(-sims)[:TOP_K]
+        top = sorted(top)  # keep document order so the retrieved text reads coherently
+        retrieved = " ".join(chunks[j] for j in top)
+        rows.append({
+            "meeting_date": pd.to_datetime(date),
+            "n_chars_full": len(full),
+            "n_chunks": len(chunks),
+            "n_chars_retrieved": len(retrieved),
+            "mean_top_sim": float(sims[top].mean()),
+            "text_full": full,
+            "text_retrieved": retrieved,
+        })
+        if i % 50 == 0:
+            print(f"  {i}/{len(files)}")
+
+    df = pd.DataFrame(rows).sort_values("meeting_date").reset_index(drop=True)
+    df.to_parquet(config.DATA_PROCESSED / "documents.parquet", index=False)
+
+    print(f"  documents: {len(df)} rows, {df.meeting_date.min().date()} -> {df.meeting_date.max().date()}")
+    print(f"  full text chars   : median {df.n_chars_full.median():.0f}  min {df.n_chars_full.min()}  max {df.n_chars_full.max()}")
+    print(f"  retrieved chars   : median {df.n_chars_retrieved.median():.0f}")
+    print(f"  compression       : {df.n_chars_retrieved.sum()/df.n_chars_full.sum():.1%} of full text")
+    print(f"  retrieval quality : mean top-{TOP_K} similarity {df.mean_top_sim.mean():.3f}")
+    return df
 
 
 if __name__ == "__main__":
-    df = run()
-    print(df.head())
-    print(f"rows: {len(df)}")
+    run()

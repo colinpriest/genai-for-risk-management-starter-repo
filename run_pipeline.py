@@ -11,7 +11,7 @@ import config
 STAGES = [
     ("1", "market data", "src.stage1_market_data"),
     ("2", "documents", "src.stage2_documents"),
-    ("3", "sentiment", "src.stage3_sentiment"),
+    ("3", "risk-voice extraction", "src.stage3_riskvoice"),
     ("4", "regime model", "src.stage4_regime_model"),
     ("5", "uncertainty", "src.stage5_uncertainty"),
 ]

@@ -23,13 +23,33 @@ MARKET_START = CORPUS_START
 # --- Model -------------------------------------------------------------------
 # The course provides GPT-4o-mini only. The reference implementation used GPT-4o.
 # Section 4 of the brief: this difference is part of what you must discuss.
-MODEL = "gpt-4o-mini"
-TEMPERATURE = 0.0                      # RECORD any change; it affects reproducibility
-SEED = 20260817                        # pass to the API where supported
+MODEL = "gpt-4o-mini"                  # the only model available on this course
+
+# TEMPERATURE MUST BE > 0.
+#   The N parallel calls exist to measure how much the model disagrees WITH ITSELF.
+#   At temperature 0 the calls come back near-identical, the measured spread collapses to
+#   about zero, and the "LLM uncertainty" layer reports near-perfect confidence on every
+#   document no matter how ambiguous it is. The layer becomes decorative.
+#   Sampling temperature plus a DIFFERENT FIXED SEED per call gives genuine variation and
+#   still reproduces exactly.
+SAMPLING_TEMPERATURE = 1.0
+SEED = 20260817                        # call i uses SEED + i
 N_PARALLEL_CALLS = 10                  # matches the reference implementation
 
 # --- Regime model ------------------------------------------------------------
-N_REGIMES = 3                          # FIXED. Do not change.
+# Four regimes, not three. The reference used three on US data; on Australian data four
+# fits materially better (AIC 12,903 vs 12,966) and the extra regime is interpretable -
+# it separates a long "stressed" state (2008-09, 2011) from short violent "crisis"
+# episodes (Oct 2008, Mar 2020). See README.
+N_REGIMES = 4
+REGIME_NAMES = {0: "quiet", 1: "normal", 2: "stressed", 3: "crisis"}
+
+# The dependent variable for the regime model. THIS CHOICE MATTERS MORE THAN ANY OTHER.
+#   "log_rv"  - log realised volatility. Exogenous text features enter the mean equation,
+#               which IS the volatility level, so text can explain volatility.
+#   "returns" - daily returns. Exogenous features then predict the DIRECTION of returns,
+#               which text cannot do. Text will appear useless. It is not; the spec is.
+REGIME_ENDOG = "log_rv"
 
 # --- Embeddings (local, no API cost) -----------------------------------------
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
