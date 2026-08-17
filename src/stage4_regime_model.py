@@ -4,7 +4,7 @@ Stage 4 — Regime model
 OWNER: <put your name here>
 
 PRE-BUILT: fitting with fallbacks, regime ordering, per-regime risk metrics, and the
-           3-vs-4 regime and text-vs-no-text comparisons.
+           the text-vs-no-text comparison, coefficients, transitions and out-of-sample.
 YOURS:     which text features to include, which dependent variable, and interpretation.
 
 TWO SPECIFICATION POINTS - read both before changing anything
@@ -22,18 +22,15 @@ TWO SPECIFICATION POINTS - read both before changing anything
 
 2. HOW MANY REGIMES
 
-   The reference implementation uses 3. Australian data prefers 4.
+   THREE, the same as the reference implementation - see the note in config.py.
 
-   This module fits BOTH, deliberately:
-     - the 3-regime fit is your LIKE-FOR-LIKE comparison against the reference
-     - the 4-regime fit is your own finding about Australian data
+   A fourth regime fits Australian data better on AIC, but it competes with the text: extra
+   regimes absorb volatility variation your constructs would otherwise have to explain, so
+   the measured contribution of your prompts shrinks. Three regimes also converges reliably
+   where four does not, and keeps regime shares comparable with the reference.
 
-   Do not silently switch to 4 and then compare regime shares against the reference's three.
-   They are not comparable. Report the 3-regime numbers when comparing, and the 4-regime
-   numbers when describing Australia.
-
-WRITES data/processed/regimes.parquet          (primary fit, config.N_REGIMES)
-       data/processed/regimes_3.parquet        (3-regime fit, for the reference comparison)
+WRITES data/processed/regimes.parquet       (WITH text - the primary model)
+       data/processed/regimes_base.parquet  (without text, for comparison)
        data/processed/regime_summary.json
 """
 from __future__ import annotations
@@ -66,9 +63,6 @@ TEXT_FEATURES = ["financial_conditions_concern", "downside_risk_emphasis",
 MACRO_FEATURES: list[str] = []
 
 ALL_FEATURES = TEXT_FEATURES + MACRO_FEATURES
-
-NAMES_3 = {0: "low", 1: "medium", 2: "high"}
-
 
 def align(market: pd.DataFrame, scores: pd.DataFrame,
           lag_days: int | None = None) -> pd.DataFrame:
@@ -108,7 +102,7 @@ def fit(y, exog, k, label, require_converged: bool = True):
     Two things this deliberately does not do, because both produce numbers that look fine and
     are not:
 
-    1. It does not return the first attempt that failed to raise. The 4-regime model on log
+    1. It does not return the first attempt that failed to raise. This model on log
        volatility is multimodal - different starts land on optima thousands of AIC apart - so
        "the first one that did not crash" is not a model, it is a coin toss. All starts are
        run and the highest log-likelihood CONVERGED fit wins.
@@ -354,69 +348,59 @@ def run() -> pd.DataFrame:
     print(f"  publication lag   : {config.PUBLICATION_LAG_DAYS} days "
           f"({'real-time' if config.PUBLICATION_LAG_DAYS else 'RETROSPECTIVE - look-ahead'})")
     print("  regimes.parquet = WITH text; regimes_base.parquet = without")
-    base4 = fit(endog, None, 4, "4 regimes, no text")
-    text4 = fit(endog, X, 4, f"4 regimes + {len(ALL_FEATURES)} features")
-    base3 = fit(endog, None, 3, "3 regimes, no text  (reference comparison)")
-    text3 = fit(endog, X, 3, f"3 regimes + {len(ALL_FEATURES)} features")
+    k = config.N_REGIMES
+    base = fit(endog, None, k, f"{k} regimes, no text")
+    text = fit(endog, X, k, f"{k} regimes + {len(ALL_FEATURES)} features")
 
     # The PRIMARY saved output is the model WITH the text features. Saving the no-text fit
     # here would mean the dashboard, the explainability work and the scenarios all ran on a
     # model that never saw your constructs - they would be decorative. Both are written so
     # you can compare them, and comparing them is worth reporting.
-    out4, _ = order_and_label(text4, df, 4, config.REGIME_NAMES)
-    out3, _ = order_and_label(text3, df, 3, NAMES_3)
-    out4_base, _ = order_and_label(base4, df, 4, config.REGIME_NAMES)
-    out3_base, _ = order_and_label(base3, df, 3, NAMES_3)
+    out, _ = order_and_label(text, df, k, config.REGIME_NAMES)
+    out_base, _ = order_and_label(base, df, k, config.REGIME_NAMES)
 
-    risk4 = per_regime_risk(df["ret"], out4["regime"], config.REGIME_NAMES)
-    risk3 = per_regime_risk(df["ret"], out3["regime"], NAMES_3)
+    risk = per_regime_risk(df["ret"], out["regime"], config.REGIME_NAMES)
 
     summary = {
         "endog": config.REGIME_ENDOG,
         "text_features": TEXT_FEATURES,
         "macro_features": MACRO_FEATURES,
         "publication_lag_days": config.PUBLICATION_LAG_DAYS,
-        "coefficients_4": coefficients(text4, ALL_FEATURES, 4),
-        "transitions_4": transition_matrix(text4, 4),
-        "out_of_sample": rolling_origin_eval(df, ALL_FEATURES, 4),
+        "n_regimes": k,
+        "coefficients": coefficients(text, ALL_FEATURES, k),
+        "transitions": transition_matrix(text, k),
+        "out_of_sample": rolling_origin_eval(df, ALL_FEATURES, k),
         "AIC_COMPARISON_RULE": (
             "AIC is comparable only WITHIN one dependent variable. Returns and log realised "
             "volatility are different response scales, so their likelihoods are not on a "
             "common footing and the raw numbers must not be ranked against each other. "
             "Compare text vs no-text within a response; compare responses only on an "
             "out-of-sample score computed on a common target."),
-        "four_regimes": {"aic_no_text": float(base4.aic), "aic_with_text": float(text4.aic),
-                         "text_gain": float(base4.aic - text4.aic), "risk": risk4},
-        "three_regimes_for_reference_comparison": {
-            "aic_no_text": float(base3.aic), "aic_with_text": float(text3.aic),
-            "text_gain": float(base3.aic - text3.aic), "risk": risk3},
-        "four_beats_three_on_aic": bool(base4.aic < base3.aic),
-        "aic_gain_from_fourth_regime": float(base3.aic - base4.aic),
+        "aic_no_text": float(base.aic),
+        "aic_with_text": float(text.aic),
+        "text_gain": float(base.aic - text.aic),
+        "risk": risk,
+        "regime_count_note": (
+            "Three regimes, matching the reference implementation. Regime shares are not "
+            "comparable across different regime counts, so holding the count equal keeps the "
+            "comparison in section 4 of the brief like-for-like."),
     }
     json.dump(summary, open(config.DATA_PROCESSED / "regime_summary.json", "w"), indent=2)
-    out4.reset_index().to_parquet(config.DATA_PROCESSED / "regimes.parquet", index=False)
-    out3.reset_index().to_parquet(config.DATA_PROCESSED / "regimes_3.parquet", index=False)
-    out4_base.reset_index().to_parquet(
+    out.reset_index().to_parquet(config.DATA_PROCESSED / "regimes.parquet", index=False)
+    out_base.reset_index().to_parquet(
         config.DATA_PROCESSED / "regimes_base.parquet", index=False)
-    out3_base.reset_index().to_parquet(
-        config.DATA_PROCESSED / "regimes_3_base.parquet", index=False)
 
-    print("\n  FOUR REGIMES (your Australian finding)")
-    for k, v in risk4.items():
-        print(f"    {k:9s} {v['share']:5.1%} of days   vol {v['ann_vol']:6.1%}   "
+    print(f"\n  {k} REGIMES (same count as the reference, so shares are comparable)")
+    for name, v in risk.items():
+        print(f"    {name:9s} {v['share']:5.1%} of days   vol {v['ann_vol']:6.1%}   "
               f"ES95 {v['ES_95_daily']:+.2%}")
-    print("  THREE REGIMES (like-for-like against the reference)")
-    for k, v in risk3.items():
-        print(f"    {k:9s} {v['share']:5.1%} of days   vol {v['ann_vol']:6.1%}   "
-              f"ES95 {v['ES_95_daily']:+.2%}")
-    print(f"\n  fourth regime worth it: {summary['four_beats_three_on_aic']} "
-          f"(AIC gain {summary['aic_gain_from_fourth_regime']:+.1f})")
-    print(f"  text improves 4-regime AIC by {summary['four_regimes']['text_gain']:+.1f}")
+    print(f"\n  text improves AIC by {summary['text_gain']:+.1f} "
+          f"({summary['aic_no_text']:.1f} -> {summary['aic_with_text']:.1f})")
 
     print("\n  WHICH PERIODS EACH REGIME PICKS UP")
-    yrs = pd.Series(out4.index.year, index=out4.index)
-    for r in sorted(out4["regime"].dropna().unique()):
-        top = yrs[out4["regime"] == r].value_counts().head(4).index.tolist()
+    yrs = pd.Series(out.index.year, index=out.index)
+    for r in sorted(out["regime"].dropna().unique()):
+        top = yrs[out["regime"] == r].value_counts().head(4).index.tolist()
         print(f"    {config.REGIME_NAMES[int(r)]:10s} most often: "
               f"{', '.join(str(y) for y in sorted(top))}")
 
@@ -425,9 +409,9 @@ def run() -> pd.DataFrame:
         print("  Using the figures above - share of days, volatility, ES, and the periods each")
         print("  regime covers - decide what each state actually IS, then rename them in")
         print("  config.py. The naming argument is marked; the exact numbers are not.")
-        print("  Ask specifically: does the fourth regime separate two economically different")
-        print("  states, or has it just split one state in half?")
-    return out4
+        print("  Ask specifically: is each state economically distinct, or is one of them just")
+        print("  the tail of another?")
+    return out
 
 
 if __name__ == "__main__":

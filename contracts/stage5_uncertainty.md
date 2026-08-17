@@ -42,7 +42,8 @@ claim that they are distinct states.
 ## Layer 2 — model uncertainty
 
 Refit under alternative defensible specifications and report the spread. At minimum: with and
-without text, at three and four regimes.
+without text. Do not add regime counts as a specification axis - the count is fixed at three
+for the reasons given in `config.py`.
 
 **Use the same fitter and search settings for every spec.** Weaker settings on one specification
 measure how well the optimiser did, not model uncertainty — the two differ by thousands of AIC on

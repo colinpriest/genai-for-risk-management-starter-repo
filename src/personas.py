@@ -93,7 +93,7 @@ def build_situations(scenarios: list[dict] | None = None) -> dict:
     """Situations built from YOUR model's real output, not from hypotheticals."""
     reg = pd.read_parquet(config.DATA_PROCESSED / "regimes.parquet")
     summ = json.load(open(config.DATA_PROCESSED / "regime_summary.json"))
-    risk = summ["four_regimes"]["risk"] if "four_regimes" in summ else summ["per_regime_risk"]
+    risk = summ["risk"]
     cur = reg.iloc[-1]
     now = config.REGIME_NAMES[int(cur["regime"])]
     worst = config.REGIME_NAMES[config.N_REGIMES - 1]

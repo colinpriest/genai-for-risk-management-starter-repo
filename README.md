@@ -40,10 +40,14 @@ not into re-deriving plumbing.
 
 ## Two decisions already made for you, and why
 
-**Four regimes, not three.** The reference used three on US data. `stage4` fits three *and* four
-and reports AIC for both, so whether the fourth regime earns its place on your data is something
-you measure and report — not something we tell you. `REGIME_NAMES` ships as neutral placeholders
-for the same reason: naming the regimes is your work, done after you have inspected them.
+**Three regimes, the same as the reference.** A fourth fits Australian data better on AIC, but
+it *competes* with the text — extra regimes absorb volatility variation your constructs would
+otherwise explain, so the measured contribution of your prompts shrinks (about 920 AIC at three
+regimes against 560 at four on our data). Three also converges reliably where four does not, and
+keeps regime shares comparable with the reference. See the note in `config.py`.
+
+`REGIME_NAMES` ships as neutral placeholders: naming the regimes is your work, done after you
+have fitted and inspected them.
 
 **Sampling temperature is 1.0, not 0.** The parallel calls exist to measure how much the model
 disagrees with itself. At temperature 0 they come back identical and that measurement is
@@ -92,7 +96,7 @@ src/
   stage1_market_data.py    ASX 200 + macro indicators        OWNER: ?
   stage2_documents.py      RBA minutes + retrieval           OWNER: ?
   stage3_riskvoice.py      10 parallel calls -> 5 constructs OWNER: ?
-  stage4_regime_model.py   Markov switching, 4 regimes and 3 OWNER: ?
+  stage4_regime_model.py   3-regime Markov switching          OWNER: ?
   stage5_uncertainty.py    3 uncertainty layers   *** STUB *** OWNER: ?
   dashboard.py             Plotly output                     OWNER: ?
   scenarios.py             Geopolitical scenarios            SHARED

@@ -148,7 +148,6 @@ def test_submission_artefacts_present(request):
         "documents.parquet":        "stage 2 never parsed the corpus",
         "riskvoice_scores.parquet": "stage 3 never scored the documents",
         "regimes.parquet":          "stage 4 never fitted the regime model",
-        "regimes_3.parquet":        "stage 4 never fitted the 3-regime comparison",
         "regimes_base.parquet":     "stage 4 never fitted the no-text comparison",
         "uncertainty.json":         "stage 5 is still a stub - the three uncertainty layers "
                                     "are a required part of the submission",
