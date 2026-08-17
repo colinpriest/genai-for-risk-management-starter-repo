@@ -58,27 +58,27 @@ MAX_CONCURRENT_CALLS = 20
 #    Holding the count equal removes a confound from the one comparison the assignment is
 #    built around.
 #
-# 2. RELIABLE CONVERGENCE. Across four optimiser starts the 3-regime model converged 4/4.
-#    The 4-regime model managed 2/4 and landed on optima up to 1,300 AIC apart. You run this
-#    once, and a fit that depends on which random start it drew is not an instrument you can
-#    report from.
+# 2. RELIABLE CONVERGENCE. Across the optimiser starts in stage 4 the 3-regime model
+#    converged on nearly all of them. The 4-regime model converged on about half, and the
+#    ones that did converge landed on visibly different optima. You run this once, and a fit
+#    that depends on which start it drew is not an instrument you can report from.
 #
 # 3. PARSIMONY AND INTERPRETABILITY. Three states map onto language a risk committee already
 #    uses. A fourth state has to be characterised, named and defended, and on this data it is
 #    not clear it separates two economically different states rather than splitting one.
 #
-# A SENSITIVITY RESULT, WHICH IS NOT A REASON FOR THE CHOICE. The measured AIC contribution
-# of the text features is LARGER at three regimes than at four, which is unsurprising: extra
-# regimes absorb volatility variation the constructs would otherwise have to explain. Fit
-# both and quote YOUR OWN numbers - the size of the gap depends on which features you
-# include and on how many rows they cost you, so any figure quoted here would not match
-# what you get. Report it as a robustness observation.
+# A SENSITIVITY RESULT, WHICH IS NOT A REASON FOR THE CHOICE. The measured out-of-sample
+# contribution of the text features is LARGER at three regimes than at four, which is
+# unsurprising: extra regimes absorb volatility variation the constructs would otherwise
+# have to explain. Fit both and quote YOUR OWN numbers - the size of the gap depends on
+# which features you include and on how many rows they cost you, so any figure quoted here
+# would not match what you get. Report it as a robustness observation.
 #
 # But do NOT choose the specification because it makes your features look better. Picking the
 # model that maximises the apparent contribution of the thing you are advocating is
 # outcome-driven specification selection, and it is exactly the practice this course teaches
-# you to audit in other people's work. The regime count is settled by 1-3 above; the AIC
-# difference is something you observe afterwards and disclose.
+# you to audit in other people's work. The regime count is settled by 1-3 above; the
+# difference in measured contribution is something you observe afterwards and disclose.
 N_REGIMES = 3
 
 # YOURS TO NAME. These are deliberately neutral placeholders - a regime cannot be named before

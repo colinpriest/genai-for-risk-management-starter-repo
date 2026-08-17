@@ -50,15 +50,17 @@ not into re-deriving plumbing.
 1. **Comparability.** Regime shares are not comparable across different regime counts, and
    section 4 of the brief asks you to compare your results against the reference program's.
    Holding the count equal removes a confound you would otherwise have to argue around.
-2. **Convergence.** The three-regime model fits reliably from every optimiser start we tried.
-   The four-regime model does not, and lands on optima hundreds of AIC apart. You run this
-   once, so a fit that depends on the random start is not something you can report.
+2. **Convergence.** The three-regime model fits reliably from nearly every optimiser start
+   in stage 4. The four-regime model does not, and the starts that do converge land on
+   visibly different optima. You run this once, so a fit that depends on which start it drew
+   is not something you can report.
 3. **Interpretability.** Three states map onto something a risk committee can act on. A fourth
    tends to split one of them rather than reveal a new one.
 
-A fourth regime does fit better on AIC, and you may fit it as an extension. Note that it also
-*competes* with the text — extra regimes absorb variation the constructs would otherwise
-explain — but that is a consequence of the choice, not the reason for it. See `config.py`.
+A fourth regime fits the training data more closely, and you may fit it as an extension.
+Note that it also *competes* with the text — extra regimes absorb variation the constructs
+would otherwise explain — but that is a consequence of the choice, not the reason for it.
+See `config.py`.
 
 `REGIME_NAMES` ships as neutral placeholders: naming the regimes is your work, done after you
 have fitted and inspected them.

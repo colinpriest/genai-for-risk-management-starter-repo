@@ -13,6 +13,13 @@ data/processed/*
 !data/processed/llm_raw/
 !data/processed/llm_raw/**
 
+# EXCEPTION: the human agreement labels are EVIDENCE, not regenerable output. The blind
+# labels and their commit timestamps are what prove the labelling was done before anyone saw
+# the model's scores - section 8.2 Part B. Without this exception the rule above silently
+# ignores them, `git add` reports nothing, and the evidence never reaches the repository.
+!data/processed/agreement/
+!data/processed/agreement/**
+
 outputs/figures/*
 !outputs/figures/.gitkeep
 

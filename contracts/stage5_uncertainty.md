@@ -15,7 +15,11 @@
     "regime0_ann_vol_p5_p50_p95": [0.090, 0.102, 0.123],
     "regime2_ann_vol_p5_p50_p95": [0.222, 0.298, 0.598]
   },
-  "layer2_model": [{"spec": "...", "k_regimes": 3, "aic": -5352.1, "converged": true}],
+  "layer2_model": {"specifications": [{"spec": "...", "k_regimes": 3,
+                                      "regime_ann_vol": [0.10, 0.16, 0.30],
+                                      "converged": true}],
+                   "spread_across_specifications": {
+                       "regime2_ann_vol": {"min": 0.27, "max": 0.34, "range": 0.07}}},
   "layer3_llm": {"financial_conditions_concern": {"within_doc_sd_mean": 0.072,
                                                   "between_doc_sd": 0.136,
                                                   "signal_to_noise": 1.9}},
@@ -43,18 +47,23 @@ claim that they are distinct states.
 
 ## Layer 2 — model uncertainty
 
-Refit under alternative defensible specifications and report the spread. At minimum: with and
-without text. Do not add regime counts as a specification axis - the count is fixed at three
-for the reasons given in `config.py`.
+Refit under alternative defensible specifications and report **how far the answer moves**. At
+minimum: with and without text. Do not add regime counts as a specification axis — the count is
+fixed at three for the reasons given in `config.py`.
+
+**This layer is not a model-selection contest, and nothing here may be ranked "best".** The
+question is how much the quantity your report relies on — the annualised volatility of each
+regime — changes when a defensible analyst makes a different specification choice. Report each
+specification's regime volatilities and the spread across them. A layer that names a winner has
+answered a question nobody asked and hidden the uncertainty it was supposed to measure.
 
 **Use the same fitter and search settings for every spec.** Weaker settings on one specification
-measure how well the optimiser did, not model uncertainty — the two differ by thousands of AIC on
-this data. **Reject non-converged fits** rather than reporting their AIC.
+measure how well the optimiser did, not model uncertainty. **Reject non-converged fits.**
 
-**Do not compare raw AIC across different dependent variables.** Returns and log realised
-volatility are different response scales, so their likelihoods are not on a common footing.
-Compare *within* a response definition (text versus no text), and compare response definitions
-only on an out-of-sample score expressed on a common target.
+**Compute the spread only across specifications sharing one dependent variable.** Returns and log
+realised volatility are different response scales, so regimes defined on one are not the same
+states as regimes defined on the other. Include the alternative-response fit in the listing,
+exclude it from the spread, and say why.
 
 ## Layer 3 — LLM uncertainty
 

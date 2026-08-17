@@ -17,8 +17,8 @@ TWO SPECIFICATION POINTS - read both before changing anything
                         return. They cannot, and should not be able to. Text looks useless.
    endog = log_rv    -> the mean equation IS the volatility level, so text can explain it.
 
-   On our data that is the difference between text making AIC ~46 points WORSE and several
-   hundred points BETTER. Same text, same model, same data.
+   On our data that is the difference between the text measurably hurting held-out
+   prediction and measurably helping it. Same text, same model, same data.
 
 2. HOW MANY REGIMES
 
@@ -28,10 +28,10 @@ TWO SPECIFICATION POINTS - read both before changing anything
    converges 4/4 across optimiser starts where the 4-regime model manages 2/4; and three
    states are interpretable without inventing a name for a fourth.
 
-   The text's measured AIC contribution happens to be larger at three regimes than at four.
-   That is a sensitivity result to disclose, NOT a reason to prefer three - choosing a
-   specification because it flatters your own features is the practice this course teaches
-   you to catch in other people's work.
+   The text's measured out-of-sample contribution happens to be larger at three regimes
+   than at four. That is a sensitivity result to disclose, NOT a reason to prefer three -
+   choosing a specification because it flatters your own features is the practice this
+   course teaches you to catch in other people's work.
 
 WRITES data/processed/regimes.parquet       (WITH text - the primary model)
        data/processed/regimes_base.parquet  (without text, for comparison)
@@ -87,10 +87,36 @@ def align(market: pd.DataFrame, scores: pd.DataFrame,
     return df
 
 
-STARTS = [dict(em_iter=20, search_reps=8, maxiter=200),
-          dict(em_iter=20, search_reps=0, maxiter=200),
-          dict(em_iter=50, search_reps=0, maxiter=500),
-          dict(em_iter=10, search_reps=0, maxiter=100)]
+# DETERMINISTIC multi-start. Two things were wrong with the obvious approach.
+#
+# First, statsmodels' `search_reps` asks for random starting values drawn from a global RNG
+# we do not control, so two runs of the SAME specification can land on different optima and
+# report different numbers. Nothing here is reproducible if that is left on.
+#
+# Second, a handful of starts is not enough. This likelihood is strongly multimodal once
+# exogenous regressors enter: the log-likelihood spread across converged starts within ONE
+# specification runs to several hundred points. A few draws from that surface will not
+# reliably find the best mode, so what gets compared is two arbitrary local optima.
+#
+# EM_STARTS varies the EM burn-in and iteration budget deterministically; the perturbed
+# starts jitter the best EM solution using a generator we own and seed, so the search is
+# broad AND reproduces exactly.
+EM_STARTS = [dict(em_iter=n, search_reps=0, maxiter=m)
+             for n, m in [(5, 100), (10, 200), (20, 200), (35, 400), (50, 500), (80, 800)]]
+N_PERTURBED_STARTS = 6          # seeded perturbations of the best EM solution
+PERTURB_SCALE = 0.25            # relative sd of the perturbation
+
+# REDUCED budget for the out-of-sample fold fits and the ablation refits. Those run dozens of
+# times and the full budget makes stage 4 take over an hour. The fold fits are shorter
+# samples and start more easily; the cost of the smaller budget is a slightly noisier held-out
+# score, which is visible in per_fold rather than hidden.
+OOS_EM_STARTS = EM_STARTS[:3]
+OOS_N_PERTURBED = 3
+
+# Leave-one-out ablation refits every feature on every fold, so it is the most expensive
+# thing in the module: n_features x ABLATION_FOLDS fits. Two folds is enough to show whether
+# a feature's contribution holds up in more than one period without tripling the runtime.
+ABLATION_FOLDS = 2
 
 
 def _standardise(X):
@@ -103,11 +129,11 @@ def _standardise(X):
     with "Could not untransform parameters" rather than returning something wrong.
 
     That is the good case. The dangerous one is a fit that half-works: with
-    require_converged=False a badly scaled model returns parameters, an AIC, and a set of
-    regime probabilities that all look ordinary and are not.
+    require_converged=False a badly scaled model returns parameters and a set of regime
+    probabilities that all look ordinary and are not.
 
-    Standardising is a reparameterisation of the mean equation, so the likelihood, the AIC and
-    the fitted regimes are unchanged - only the units of the coefficients move. They are moved
+    Standardising is a reparameterisation of the mean equation, so the likelihood and the
+    fitted regimes are unchanged - only the units of the coefficients move. They are moved
     back by unscaled_params() before anything is reported, so nothing downstream has to know
     this happened.
     """
@@ -156,24 +182,25 @@ def unscaled_params(res, k: int, n_feat: int):
     return const_o, beta_o, sigma
 
 
-def fit(y, exog, k, label, require_converged: bool = True):
+def fit(y, exog, k, label, require_converged: bool = True,
+        em_starts: list | None = None, n_perturbed: int | None = None):
     """Fit from several starts and return the BEST CONVERGED result.
 
     Two things this deliberately does not do, because both produce numbers that look fine and
     are not:
 
     1. It does not return the first attempt that failed to raise. This model on log
-       volatility is multimodal - different starts land on optima thousands of AIC apart - so
-       "the first one that did not crash" is not a model, it is a coin toss. All starts are
-       run and the highest log-likelihood CONVERGED fit wins.
+       volatility is multimodal - different starts land on optima hundreds of log-likelihood
+       points apart - so "the first one that did not crash" is not a model, it is a coin
+       toss. All starts are run and the highest log-likelihood CONVERGED fit wins.
 
     2. It does not hide warnings. Convergence failures and Hessian problems are reported. A
-       non-converged fit has an AIC, and that AIC means nothing; reporting it as evidence is
-       the mistake this guards against.
+       non-converged fit still produces coefficients and regime probabilities, and they mean
+       nothing; using them is the mistake this guards against.
 
     require_converged=False returns the best non-converged fit with a loud warning, for the
     cases where nothing converges and you would rather see something than nothing. If you use
-    it, say so in your report and do not draw conclusions from the AIC.
+    it, say so in your report and do not draw conclusions from that fit.
     """
     scaler = None
     if exog is not None:
@@ -183,34 +210,60 @@ def fit(y, exog, k, label, require_converged: bool = True):
     mod = sm.tsa.MarkovRegression(y, k_regimes=k, trend="c", exog=exog,
                                   switching_variance=True)
     converged, failed, errors = [], [], []
-    for i, kw in enumerate(STARTS):
+
+    def _try(kw, start_params, tag):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             try:
-                res = mod.fit(disp=False, **kw)
+                res = mod.fit(disp=False, start_params=start_params, **kw)
             except Exception as e:                           # noqa: BLE001
-                errors.append(f"start {i}: {str(e)[:80]}")
-                continue
+                errors.append(f"{tag}: {str(e)[:70]}")
+                return
         msgs = {str(w.message)[:60] for w in caught}
-        (converged if res.mle_retvals.get("converged") else failed).append((res, i, msgs))
+        (converged if res.mle_retvals.get("converged") else failed).append((res, tag, msgs))
+
+    # Pass 1: deterministic EM budgets, no random search. The budget can be reduced by
+    # callers that fit dozens of models (ablation), at the cost of a wider spread - which
+    # those callers report rather than hide.
+    em_starts = EM_STARTS if em_starts is None else em_starts
+    n_perturbed = N_PERTURBED_STARTS if n_perturbed is None else n_perturbed
+    for i, kw in enumerate(em_starts):
+        _try(kw, None, f"em{i}")
+
+    # Pass 2: seeded perturbations of the best solution so far. Our RNG, our seed, so the
+    # search is wide and still reproduces exactly.
+    best = max(converged or failed, key=lambda t: t[0].llf, default=None)
+    if best is not None:
+        rng = np.random.default_rng(config.SEED)
+        base_params = np.asarray(best[0].params, dtype=float)
+        kw = dict(em_iter=10, search_reps=0, maxiter=400)
+        for j in range(n_perturbed):
+            noise = 1.0 + PERTURB_SCALE * rng.standard_normal(base_params.shape)
+            _try(kw, base_params * noise, f"perturb{j}")
 
     pool = converged or ([] if require_converged else failed)
     if not pool:
-        detail = "; ".join(errors) if errors else f"{len(failed)} starts ran but none converged"
+        detail = "; ".join(errors[:3]) if errors else f"{len(failed)} starts ran, none converged"
         raise RuntimeError(f"{label}: no converged fit ({detail})")
 
-    res, i, msgs = max(pool, key=lambda t: t[0].llf)
-    flag = "" if converged else "  *** NOT CONVERGED - AIC IS NOT EVIDENCE ***"
-    print(f"  {label:48s} k={k} aic={res.aic:9.1f} conv={bool(converged)}"
-          f"  [start {i}, {len(converged)}/{len(STARTS)} converged]{flag}")
+    res, tag, msgs = max(pool, key=lambda t: t[0].llf)
+    n_starts = len(em_starts) + n_perturbed
+    flag = "" if converged else "  *** NOT CONVERGED - DO NOT USE THIS FIT AS EVIDENCE ***"
+    # Spread across converged starts, in log-likelihood. This is a SEARCH diagnostic: it says
+    # how rugged the surface was, not how good the model is. Nothing in the pipeline compares
+    # models on it - comparison happens out of sample, in rolling_origin_eval().
+    spread = None
     if len(converged) > 1:
-        spread = max(t[0].aic for t in converged) - min(t[0].aic for t in converged)
-        if spread > 10:
-            print(f"      AIC spread across converged starts: {spread:.0f}. The optimum is not "
-                  f"well identified - report this as model uncertainty.")
+        spread = max(t[0].llf for t in converged) - min(t[0].llf for t in converged)
+    print(f"  {label:44s} k={k} llf={res.llf:9.1f} conv={bool(converged)}"
+          f"  [{tag}, {len(converged)}/{n_starts} converged"
+          + (f", llf spread {spread:.0f}" if spread is not None else "") + f"]{flag}")
     for m in sorted(msgs)[:2]:
         print(f"      warning: {m}")
+
     res._exog_scaler = scaler          # unscaled_params() undoes the standardisation
+    res._llf_spread = spread           # how rugged the surface was at this specification
+    res._n_converged = len(converged)
     return res
 
 
@@ -286,7 +339,7 @@ def per_regime_risk(ret: pd.Series, regime: pd.Series, names: dict) -> dict:
 
 
 def coefficients(res, features: list[str], k: int) -> dict:
-    """Which feature moves what, and by how much. AIC alone cannot tell you this.
+    """Which feature moves what, and by how much.
 
     statsmodels names exogenous coefficients POSITIONALLY (x1, x2, ...) in exog column order,
     so they are mapped back to feature names here. With endog = log_rv, a coefficient is the
@@ -386,12 +439,15 @@ def hamilton_one_step_scores(y, mu_t, sigma, P, p0):
 
 
 def rolling_origin_eval(df: pd.DataFrame, features: list[str], k: int,
-                        n_folds: int = 4, min_train: float = 0.5) -> dict:
+                        n_folds: int = 4, min_train: float = 0.5,
+                        arms: dict | None = None, require_all_arms: bool = True,
+                        fit_kwargs: dict | None = None) -> dict:
     """Blocked rolling-origin out-of-sample evaluation, with recursive filtering.
 
-    Everything else in this module is IN-SAMPLE. AIC rewards fit on the data you fitted to,
-    and with a flexible regime model that is a low bar. This is the only number here that
-    says whether the features help on data the model has not seen.
+    THE ONLY MODEL-COMPARISON METRIC IN THIS PIPELINE. Everything else that fits a model -
+    nested_fits(), ablation_oos(), permutation_importance() - either supplies coefficients or
+    reports a difference in the score computed here. Nothing is compared on in-sample fit,
+    because a flexible regime model can always fit the data it was given better.
 
     Expanding window: train on the first 50%, skip FOLD_GAP_DAYS, score the next block,
     extend, repeat. No shuffling and no random splits - the data is a time series and a
@@ -406,6 +462,11 @@ def rolling_origin_eval(df: pd.DataFrame, features: list[str], k: int,
       - per-fold scores, because a positive mean can hide two negative folds
       - a persistence baseline, because the target is 95% overlapping and easy to predict
       - how many folds were REJECTED for not converging, instead of scoring them anyway
+
+    `arms` overrides the default three-arm comparison with any {label: columns} mapping, so
+    the same folds, the same gap and the same pairing logic can be reused for leave-one-out
+    ablation - see ablation_oos(). With many arms, set require_all_arms=False so one bad arm
+    does not destroy the fold for every other arm; pairing is still done per comparison.
     """
     endog_all = (np.log(df["rv_21"].values) if config.REGIME_ENDOG == "log_rv"
                  else (df["ret"] * 100).values)
@@ -415,11 +476,14 @@ def rolling_origin_eval(df: pd.DataFrame, features: list[str], k: int,
     # (text+macro vs macro-only) is the one that answers "what did the language add?".
     text_cols = [f for f in features if f in TEXT_FEATURES]
     macro_cols = [f for f in features if f not in TEXT_FEATURES]
-    ARMS = {
+    ARMS = arms if arms is not None else {
         "text_and_macro": features or None,
         "macro_only": macro_cols or None,
+        "text_only": text_cols or None,
         "intercept_only": None,
     }
+    fk = dict(em_starts=OOS_EM_STARTS, n_perturbed=OOS_N_PERTURBED)
+    fk.update(fit_kwargs or {})
     n = len(endog_all)
     start = int(n * min_train)
     edges = np.linspace(start, n, n_folds + 1).astype(int)
@@ -444,6 +508,10 @@ def rolling_origin_eval(df: pd.DataFrame, features: list[str], k: int,
         folds["persistence"].append(float(np.mean(
             _gaussian_logpdf(actual, prev, max(resid_sd, 1e-9)))))
 
+        # A fold is only usable if EVERY arm fits on it. Dropping one arm and keeping the
+        # others would compare arms averaged over different folds - a different sample, not a
+        # different feature set. Fit all arms first, then keep the fold only if all succeeded.
+        fold_scores = {}
         for label, cols in ARMS.items():
             X = df[cols].values if cols else None
             try:
@@ -451,7 +519,7 @@ def rolling_origin_eval(df: pd.DataFrame, features: list[str], k: int,
                 # score, and that score is not evidence. The previous version explicitly
                 # allowed them, so a fold could be won by an optimiser failure.
                 r = fit(endog_all[:tr_end], None if X is None else X[:tr_end], k,
-                        f"OOS fold {i+1} {label}", require_converged=True)
+                        f"OOS fold {i+1} {label}", require_converged=True, **fk)
                 n_feat = 0 if X is None else X.shape[1]
                 mu, beta, sig = unscaled_params(r, k, n_feat)
                 if X is not None:
@@ -467,10 +535,19 @@ def rolling_origin_eval(df: pd.DataFrame, features: list[str], k: int,
                 p0 = np.asarray(r.filtered_marginal_probabilities)[-1]
                 p0 = propagate(P, p0, FOLD_GAP_DAYS)
                 s = hamilton_one_step_scores(endog_all[te_start:te_end], mu_t, sig, P, p0)
-                folds[label].append(float(np.mean(s)))
+                fold_scores[label] = float(np.mean(s))
             except Exception as e:                           # noqa: BLE001
                 print(f"      OOS fold {i+1} {label} rejected: {str(e)[:70]}")
-                folds[label].append(None)
+                fold_scores[label] = None
+
+        complete = all(v is not None for v in fold_scores.values())
+        if not complete and require_all_arms:
+            missing = [k2 for k2, v in fold_scores.items() if v is None]
+            print(f"      OOS fold {i+1} DROPPED for all arms - {missing} did not converge, "
+                  f"and an unpaired fold cannot be compared")
+        keep = complete or not require_all_arms
+        for label in ARMS:
+            folds[label].append(fold_scores[label] if keep else None)
 
     def _mean(v):
         good = [x for x in v if x is not None]
@@ -491,13 +568,9 @@ def rolling_origin_eval(df: pd.DataFrame, features: list[str], k: int,
 
     out = {
         "per_fold": {k2: v for k2, v in folds.items()},
-        "text_and_macro": _mean(folds["text_and_macro"]),
-        "macro_only": _mean(folds["macro_only"]),
-        "intercept_only": _mean(folds["intercept_only"]),
+        "mean_score": {name: _mean(folds[name]) for name in ARMS},
         "persistence_baseline": _mean(folds["persistence"]),
-        "features_in_each_arm": {"text_and_macro": features,
-                                 "macro_only": macro_cols,
-                                 "intercept_only": []},
+        "features_in_each_arm": {name: (cols or []) for name, cols in ARMS.items()},
         "n_folds_attempted": n_folds,
         "n_folds_scored": len([x for x in folds["text_and_macro"] if x is not None]),
         "n_folds_rejected_not_converged": len([x for x in folds["text_and_macro"]
@@ -505,65 +578,169 @@ def rolling_origin_eval(df: pd.DataFrame, features: list[str], k: int,
         "train_test_gap_days": FOLD_GAP_DAYS,
     }
 
-    g, npair = _paired_gain("text_and_macro", "macro_only")
-    out["text_gain_conditional_on_macro"] = g
-    out["n_folds_paired_conditional"] = npair
-    if g is not None:
-        out["text_helps_conditional"] = bool(g > 0)
+    # ALL comparisons, in ONE metric, each paired over the folds where both arms converged.
+    # The whole nested decomposition lives here - there is no separate in-sample criterion to
+    # reconcile it against, because there is no second metric.
+    gains, pairs = {}, {}
+    for label, (a, b) in {
+            "text_gain_conditional_on_macro": ("text_and_macro", "macro_only"),
+            "text_gain_marginal":             ("text_only", "intercept_only"),
+            "macro_gain_marginal":            ("macro_only", "intercept_only"),
+            "all_features_gain_vs_intercept": ("text_and_macro", "intercept_only"),
+            "gain_over_persistence":          ("text_and_macro", "persistence"),
+    }.items():
+        if a not in folds or b not in folds:
+            continue
+        g, npair = _paired_gain(a, b)
+        gains[label] = g
+        pairs[label] = npair
+    out["gains"] = gains
+    out["n_folds_paired"] = pairs
+    if gains.get("text_gain_conditional_on_macro") is not None:
+        out["text_helps_conditional"] = bool(gains["text_gain_conditional_on_macro"] > 0)
+    if gains.get("gain_over_persistence") is not None:
+        out["beats_persistence"] = bool(gains["gain_over_persistence"] > 0)
 
-    g, npair = _paired_gain("text_and_macro", "intercept_only")
-    out["all_features_gain_vs_intercept"] = g
-    out["n_folds_paired_marginal"] = npair
-
-    g, _ = _paired_gain("text_and_macro", "persistence")
-    out["gain_over_persistence"] = g
-    if g is not None:
-        out["beats_persistence"] = bool(g > 0)
-
-    out["metric"] = ("mean RECURSIVE one-step-ahead predictive log score, higher is better. "
-                     "Comparable only within one dependent variable.")
+    out["metric"] = ("mean RECURSIVE one-step-ahead predictive log score on held-out data, "
+                     "higher is better. This is the ONLY model-comparison metric used "
+                     "anywhere in this pipeline - the nested comparison, the leave-one-out "
+                     "ablation and the permutation importance are all differences in it, so "
+                     "they can be read against each other directly. Comparable only within "
+                     "one dependent variable.")
     out["_how_to_read"] = (
-        "QUOTE text_gain_conditional_on_macro as the text's out-of-sample contribution. "
+        "QUOTE gains.text_gain_conditional_on_macro as the text's contribution. "
         "all_features_gain_vs_intercept includes whatever the macro features did and must not "
-        "be described as a text gain. Report per_fold, not only the mean - four folds covering "
+        "be described as a text gain, and text_gain_marginal is what the text is worth with "
+        "nothing to compete against. Report per_fold, not only the mean - four folds covering "
         "different market conditions can average positive while two are negative. And report "
         "gain_over_persistence: with a trailing 21-day target, beating an intercept-only "
         "regime model is easy and beating persistence is not.")
     return out
 
 
-def nested_comparison(df: pd.DataFrame, endog, k: int) -> dict:
-    """Four nested fits, so the text contribution is not confounded with the macro one.
+def permutation_importance(df: pd.DataFrame, features: list[str], k: int,
+                           n_repeats: int = 10, n_folds: int | None = None,
+                           min_train: float = 0.5, seed: int | None = None) -> dict:
+    """Shuffle each feature in the HELD-OUT block and measure how much prediction degrades.
 
-    THE BUG THIS REPLACES. The previous version fitted exactly two models - intercept-only,
-    and text-plus-macro - and labelled the whole AIC difference `text_gain`. If you put
-    anything in MACRO_FEATURES, that number silently credits your text constructs with
-    whatever the macro series contributed. Since realised-volatility macro features are far
-    stronger predictors of a volatility regime than any language measure, the attribution can
-    be almost entirely wrong while looking spectacular.
+    THE OTHER HALF OF ATTRIBUTION. ablation_oos() refits without the feature, which answers
+    "how much worse is the best model I can build without it?". Permutation keeps the FITTED
+    coefficients and destroys only the feature's alignment with time, which answers "how much
+    of this model's performance depends on that feature carrying real information?".
 
-    The four fits:
+    They differ, and the difference is the finding. A feature cheap to ablate but expensive
+    to permute was redundant with something else at fit time yet is doing work in the fitted
+    model. A feature expensive to ablate but cheap to permute is carrying almost no signal -
+    the model is using its MEAN, not its variation.
+
+    SCORED OUT OF SAMPLE, ON THE SAME FOLDS, IN THE SAME UNITS as ablation_oos() and
+    rolling_origin_eval(). An in-sample version would answer a different question from the
+    ablation it is supposed to be compared against, and the comparison is the point.
+
+    Cheap: one fit per fold, not one per feature. The model is fitted once on each training
+    window, then the test block's columns are shuffled and rescored with the coefficients
+    held fixed. Shuffling is repeated because one shuffle is one draw - the spread across
+    repeats says whether a small drop is real.
+    """
+    n_folds = ABLATION_FOLDS if n_folds is None else n_folds
+    rng = np.random.default_rng(config.SEED if seed is None else seed)
+    endog_all = (np.log(df["rv_21"].values) if config.REGIME_ENDOG == "log_rv"
+                 else (df["ret"] * 100).values)
+    X_all = df[features].to_numpy(dtype=float)
+
+    n = len(endog_all)
+    edges = np.linspace(int(n * min_train), n, n_folds + 1).astype(int)
+    per_fold_base, per_fold_drops = [], {f: [] for f in features}
+
+    for i in range(n_folds):
+        tr_end, te_end = edges[i], edges[i + 1]
+        te_start = tr_end + FOLD_GAP_DAYS
+        if te_end - te_start < 40:
+            continue
+        try:
+            r = fit(endog_all[:tr_end], X_all[:tr_end], k, f"permutation fold {i+1}",
+                    require_converged=True, em_starts=OOS_EM_STARTS,
+                    n_perturbed=OOS_N_PERTURBED)
+        except Exception as e:                               # noqa: BLE001
+            print(f"      permutation fold {i+1} rejected: {str(e)[:70]}")
+            continue
+
+        mu, beta, sig = unscaled_params(r, k, X_all.shape[1])
+        P = np.asarray(r.regime_transition).reshape(k, k)
+        if not np.allclose(P.sum(axis=0), 1.0):
+            P = P.T
+        p0 = propagate(P, np.asarray(r.filtered_marginal_probabilities)[-1], FOLD_GAP_DAYS)
+        y_te = endog_all[te_start:te_end]
+        X_te = X_all[te_start:te_end]
+
+        def _score(Xm: np.ndarray) -> float:
+            mu_t = mu[None, :] + Xm @ beta.T
+            return float(np.mean(hamilton_one_step_scores(y_te, mu_t, sig, P, p0)))
+
+        base = _score(X_te)
+        per_fold_base.append(base)
+        for j, f in enumerate(features):
+            for _ in range(n_repeats):
+                Xp = X_te.copy()
+                rng.shuffle(Xp[:, j])
+                per_fold_drops[f].append(base - _score(Xp))
+
+    if not per_fold_base:
+        return {"error": "no fold produced a converged fit", "features": {}}
+
+    out = {"baseline_score": float(np.mean(per_fold_base)),
+           "n_repeats": n_repeats, "n_folds_scored": len(per_fold_base),
+           "metric": ("mean held-out one-step-ahead predictive log score lost when the "
+                      "feature is shuffled. Same units as ablation_oos.ablation_cost."),
+           "features": {}}
+    for f in features:
+        drops = np.asarray(per_fold_drops[f], dtype=float)
+        sd = float(drops.std(ddof=1)) if len(drops) > 1 else None
+        out["features"][f] = {
+            "mean_drop": float(drops.mean()),
+            "sd_drop": sd,
+            "min_drop": float(drops.min()),
+            "max_drop": float(drops.max()),
+            # A drop smaller than its own spread across shuffles is not distinguishable
+            # from the noise the shuffling itself introduces.
+            "distinguishable_from_shuffle_noise":
+                bool(drops.mean() > 2 * sd) if sd else None,
+        }
+    out["_how_to_read"] = (
+        "mean_drop is held-out predictive log score lost when this feature's values are "
+        "scrambled in time. Compare it directly against ablation_oos.ablation_cost - same "
+        "metric, same folds: a feature cheap to ablate but expensive to permute is redundant "
+        "at fit time yet load-bearing in the fitted model, and one expensive to ablate but "
+        "cheap to permute is being used for its mean rather than its variation.")
+    return out
+
+
+def nested_fits(df: pd.DataFrame, endog, k: int) -> dict:
+    """Fit the four nested specifications IN SAMPLE, and return the fitted models.
+
+    THIS FUNCTION PRODUCES COEFFICIENTS, NOT EVIDENCE. It exists because the pipeline needs
+    fitted parameters to save: regimes.parquet comes from `text_and_macro`, regimes_base.parquet
+    from the comparator without text, and the report's marginal effects come from their
+    coefficients. Whether the text HELPS is not decided here - it is decided out of sample, in
+    rolling_origin_eval(), on data none of these fits has seen.
+
+    No in-sample information criterion is computed anywhere in this module. When held-out
+    performance can be measured directly - and it can, on every comparison this assignment
+    asks for - there is nothing for an approximation to it to add.
+
+    The four specifications:
 
         intercept_only     no exogenous features at all
         text_only          the five risk-voice constructs
         macro_only         your macro / cross-asset choices
         text_and_macro     both - this is the PRIMARY model, saved to regimes.parquet
 
-    and the two things you can then say:
-
-        MARGINAL text contribution     AIC(intercept_only) - AIC(text_only)
-            what the text buys you when it is the only thing in the model
-
-        CONDITIONAL text contribution  AIC(macro_only)     - AIC(text_and_macro)
-            what the text buys you ON TOP OF the macro features - the number to report if
-            you have any macro features, and the one section 8.1 of the brief asks for
-
-    The gap between those two is the answer to "did the RBA language add anything the market
-    data did not already tell me?" A construct with a large marginal contribution and a
-    negligible conditional one is tracking volatility that VIX already told you about. That
-    is a legitimate and reportable finding - it is not a failure.
-
-    AIC is comparable here because all four fits share one dependent variable and one sample.
+    Keeping all four matters even though the numbers come from elsewhere, because the
+    comparison the brief asks for is CONDITIONAL: what the text adds on top of the macro
+    features, not what it adds to nothing. Realised-volatility macro features are far stronger
+    predictors of a volatility regime than any language measure, so a text contribution
+    measured against an empty model can look spectacular while being almost entirely the macro
+    features' work.
     """
     X_text = df[TEXT_FEATURES].values if TEXT_FEATURES else None
     X_macro = df[MACRO_FEATURES].values if MACRO_FEATURES else None
@@ -572,19 +749,21 @@ def nested_comparison(df: pd.DataFrame, endog, k: int) -> dict:
     specs = {"intercept_only": None, "text_only": X_text,
              "macro_only": X_macro, "text_and_macro": X_all}
 
-    fits, aics = {}, {}
+    fits = {}
     for name, X in specs.items():
         n_feat = 0 if X is None else X.shape[1]
         fits[name] = fit(endog, X, k, f"{name} ({n_feat} features)")
-        aics[name] = float(fits[name].aic)
 
     out = {
-        "aic": aics,
-        "text_gain_marginal": aics["intercept_only"] - aics["text_only"],
-        "text_gain_conditional": aics["macro_only"] - aics["text_and_macro"],
-        "macro_gain_marginal": aics["intercept_only"] - aics["macro_only"],
         "n_text_features": len(TEXT_FEATURES),
         "n_macro_features": len(MACRO_FEATURES),
+        # SEARCH diagnostic only. How far apart the converged starts landed, in log-likelihood.
+        # A large number here says the surface is rugged and the fitted coefficients are one
+        # of several defensible answers - which belongs in your limitations. It is NOT a model
+        # comparison and nothing should be ranked by it.
+        "llf_spread_across_starts": {n: getattr(f, "_llf_spread", None)
+                                     for n, f in fits.items()},
+        "n_converged": {n: getattr(f, "_n_converged", None) for n, f in fits.items()},
         "_fits": fits,
     }
 
@@ -598,10 +777,85 @@ def nested_comparison(df: pd.DataFrame, endog, k: int) -> dict:
             "model. Do not write 'market features dominate' or 'the text survives controls' "
             "on the basis of this run.")
 
+    ragged = {n: v for n, v in out["llf_spread_across_starts"].items()
+              if v is not None and v > 50}
+    if ragged:
+        out["NOTE_rugged_likelihood"] = (
+            f"{sorted(ragged)}: converged starts landed more than 50 log-likelihood points "
+            f"apart, so these coefficients are the best of several local optima rather than "
+            f"a unique answer. This does not invalidate the out-of-sample comparison, which "
+            f"is scored on held-out data, but it does belong in your limitations section.")
+
     out["_how_to_report"] = (
-        "Quote text_gain_conditional as the contribution of your constructs whenever "
-        "MACRO_FEATURES is non-empty. text_gain_marginal overstates it by however much the "
-        "macro features were doing.")
+        "These are coefficients. For whether the text CONTRIBUTES, quote "
+        "out_of_sample.gains.text_gain_conditional_on_macro - a held-out predictive log "
+        "score difference. Do not compute or report an in-sample information criterion.")
+    return out
+
+
+def ablation_oos(df: pd.DataFrame, features: list[str], k: int,
+                 n_folds: int | None = None) -> dict:
+    """Leave-one-out ablation, scored OUT OF SAMPLE in the same units as everything else.
+
+    For each feature: refit without it and measure how much held-out predictive log score is
+    lost, paired fold by fold against the full model. Positive cost = the model got worse
+    without that feature.
+
+    WHY THE SAME UNITS AS PERMUTATION IMPORTANCE. The two measures answer different questions
+    and the brief asks students to compare them - which is only possible if they are on one
+    scale. Both are now differences in mean held-out one-step-ahead log score.
+
+      ablation    refits without the feature: how much worse is the best model I can build
+                  WITHOUT it? Cheap to ablate = something else could do its job.
+      permutation keeps the fitted coefficients and destroys only the feature's alignment
+                  with time: how much of THIS model's performance depends on it carrying
+                  real information? Cheap to permute = the model is using its mean, not its
+                  variation.
+
+    A feature cheap to ablate but expensive to permute was redundant at fit time yet is
+    load-bearing in the model you actually have. The reverse pattern means it is acting as an
+    intercept shift. Both are reportable findings.
+
+    COST. n_features x n_folds refits, the most expensive thing in this module. ABLATION_FOLDS
+    defaults to 2.
+    """
+    n_folds = ABLATION_FOLDS if n_folds is None else n_folds
+    arms = {"full": list(features)}
+    for f in features:
+        arms[f"without_{f}"] = [c for c in features if c != f] or None
+
+    print(f"    leave-one-out ablation: {len(features)} features x {n_folds} folds "
+          f"= {len(features) * n_folds} refits")
+    # require_all_arms=False: with a dozen arms, insisting that every one converges on every
+    # fold would throw away folds wholesale. Pairing is still exact - each feature's cost is
+    # averaged only over folds where BOTH that arm and the full model scored.
+    ev = rolling_origin_eval(df, features, k, n_folds=n_folds, arms=arms,
+                             require_all_arms=False)
+
+    per_fold = ev["per_fold"]
+    full = per_fold["full"]
+    out = {"metric": ev["metric"], "n_folds": n_folds, "features": {}}
+    for f in features:
+        pairs = [(a, b) for a, b in zip(full, per_fold[f"without_{f}"])
+                 if a is not None and b is not None]
+        if not pairs:
+            out["features"][f] = {"ablation_cost": None,
+                                  "note": "no fold where both models converged"}
+            continue
+        diffs = [a - b for a, b in pairs]
+        out["features"][f] = {
+            "ablation_cost": float(np.mean(diffs)),
+            "per_fold_cost": [float(d) for d in diffs],
+            "n_folds_paired": len(diffs),
+            # Two folds that disagree in SIGN mean the feature helped in one period and hurt
+            # in another. That is a finding about regime dependence, not a number to average.
+            "consistent_sign": bool(all(d > 0 for d in diffs) or all(d < 0 for d in diffs)),
+        }
+    out["_how_to_read"] = (
+        "ablation_cost is held-out log score LOST by removing the feature: positive means "
+        "the model needs it, negative means it was actively hurting out-of-sample "
+        "performance. Directly comparable with permutation_importance.mean_drop, which is in "
+        "the same units - read the two together and explain any feature where they disagree.")
     return out
 
 
@@ -844,7 +1098,6 @@ def build_model_artifact(res, out: pd.DataFrame, k: int, features: list[str],
         "regimes": regimes,
         "filtered_last": (p_last / p_last.sum()).tolist(),
         "filtered_last_date": str(out.index[-1].date()),
-        "aic": float(res.aic),
         "converged": bool(res.mle_retvals.get("converged", False)),
         "_note": ("Ordered regime space: index 0 is calmest. Transition matrix is DAILY and "
                   "column-stochastic (columns sum to 1); use stage4.propagate() to advance "
@@ -908,7 +1161,7 @@ def run() -> pd.DataFrame:
     print(f"  regimes.parquet = text + macro; regimes_base.parquet = "
           f"{'macro only' if MACRO_FEATURES else 'intercept only'} (differs by text alone)")
     k = config.N_REGIMES
-    nested = nested_comparison(df, endog, k)
+    nested = nested_fits(df, endog, k)
     text = nested["_fits"]["text_and_macro"]
     # The "without text" comparator must differ from the reported model ONLY in the text.
     # Using intercept-only strips the macro controls too, so regimes_base.parquet would
@@ -936,26 +1189,31 @@ def run() -> pd.DataFrame:
         "n_regimes": k,
         "coefficients": coefficients(text, ALL_FEATURES, k),
         "transitions": transition_matrix(text, k, remap),
+        # THE EVIDENCE. One metric, held-out, used for every comparison in this pipeline:
+        # the four nested specifications, the leave-one-out ablation and the permutation
+        # importance are all differences in mean one-step-ahead predictive log score on data
+        # the model has not seen, paired fold by fold.
+        #
+        # There is deliberately no in-sample information criterion here. Reporting one
+        # alongside this would leave the reader arbitrating between a measured quantity and
+        # an approximation to it, and the approximation assumes a well-behaved interior
+        # optimum that this likelihood does not have.
         "out_of_sample": rolling_origin_eval(df, ALL_FEATURES, k),
+        "PRIMARY_EVIDENCE": (
+            "out_of_sample.gains.text_gain_conditional_on_macro - the held-out predictive log "
+            "score the text constructs add on top of the macro features. Report it with "
+            "out_of_sample.per_fold and out_of_sample.gains.gain_over_persistence beside it."),
+        "ablation_out_of_sample": ablation_oos(df, ALL_FEATURES, k),
+        "permutation_importance": permutation_importance(df, ALL_FEATURES, k),
         "forward_vol_out_of_sample": forward_vol_eval(df, ALL_FEATURES, k),
-        "AIC_COMPARISON_RULE": (
-            "AIC is comparable only WITHIN one dependent variable. Returns and log realised "
-            "volatility are different response scales, so their likelihoods are not on a "
-            "common footing and the raw numbers must not be ranked against each other. "
-            "Compare text vs no-text within a response; compare responses only on an "
-            "out-of-sample score computed on a common target."),
-        "nested_comparison": {kk: vv for kk, vv in nested.items() if kk != "_fits"},
-        # Named for WHAT THEY ARE, not "with/without". aic_no_text was ambiguous: it meant
-        # intercept-only in an earlier version and macro-only now, and nothing in the name
-        # said which.
-        "aic_baseline_comparator": float(base.aic),
+        "METRIC_COMPARISON_RULE": (
+            "The held-out log score is comparable only WITHIN one dependent variable. Returns "
+            "and log realised volatility are different response scales, so their predictive "
+            "densities are not on a common footing and must not be ranked against each other. "
+            "Compare text vs no-text within a response; compare responses only on a score "
+            "computed for a common target."),
+        "nested_fits": {kk: vv for kk, vv in nested.items() if kk != "_fits"},
         "baseline_comparator_is": base_name,
-        "aic_text_and_macro": float(text.aic),
-        "aic_text_gain_conditional": float(base.aic - text.aic),
-        "aic_text_gain_conditional_note": (
-            f"AIC improvement from adding the text constructs to a model that already "
-            f"contains {'the macro features' if MACRO_FEATURES else 'nothing but an intercept'}. "
-            f"See nested_comparison for the full four-model decomposition."),
         "risk": risk,
         "regime_count_note": (
             "Three regimes, matching the reference implementation. Regime shares are not "
@@ -990,30 +1248,63 @@ def run() -> pd.DataFrame:
         f"{config.REGIME_NAMES[i]} {summary['transitions']['expected_duration_days'][i]:.0f}"
         for i in range(k)))
     nc = summary["nested_comparison"]
-    print("\n  NESTED MODEL COMPARISON (AIC, lower is better)")
-    for name in ("intercept_only", "text_only", "macro_only", "text_and_macro"):
-        print(f"    {name:16s} {nc['aic'][name]:10.1f}")
-    print(f"    text contribution, MARGINAL    {nc['text_gain_marginal']:+9.1f}"
-          f"   (vs intercept only)")
-    print(f"    text contribution, CONDITIONAL {nc['text_gain_conditional']:+9.1f}"
-          f"   (on top of macro - REPORT THIS ONE)")
-    print(f"    macro contribution, marginal   {nc['macro_gain_marginal']:+9.1f}")
+    if "NOTE_rugged_likelihood" in nc:
+        print(f"    note: {nc['NOTE_rugged_likelihood'][:96]}...")
     if "WARNING_no_macro_features" in nc:
         print("    *** MACRO_FEATURES is empty: marginal and conditional are the same fit. "
               "You have not controlled for market data. ***")
 
     oos = summary["out_of_sample"]
-    print(f"\n  OUT OF SAMPLE (recursive one-step-ahead log score, {oos['n_folds_scored']}"
-          f"/{oos['n_folds_attempted']} folds scored, "
-          f"{oos['n_folds_rejected_not_converged']} rejected)")
-    for name in ("with_features", "without_features", "persistence_baseline"):
-        v = oos.get(name)
+    print(f"\n  NESTED COMPARISON, OUT OF SAMPLE (recursive one-step-ahead log score, "
+          f"higher is better, {oos['n_folds_scored']}/{oos['n_folds_attempted']} folds "
+          f"scored, {oos['n_folds_rejected_not_converged']} rejected)")
+    for name in ("text_and_macro", "macro_only", "text_only", "intercept_only"):
+        v = oos["mean_score"].get(name)
         print(f"    {name:22s} {v:+8.4f}" if v is not None else f"    {name:22s}   n/a")
-    if oos.get("gain_over_persistence") is not None:
+    pb = oos.get("persistence_baseline")
+    print(f"    {'persistence_baseline':22s} {pb:+8.4f}" if pb is not None
+          else f"    {'persistence_baseline':22s}   n/a")
+
+    gains, npair = oos["gains"], oos["n_folds_paired"]
+    g = gains.get("text_gain_conditional_on_macro")
+    if g is not None:
+        print(f"    -> text, CONDITIONAL on macro: {g:+.4f} "
+              f"(paired over {npair['text_gain_conditional_on_macro']} folds) <- REPORT THIS")
+    if gains.get("text_gain_marginal") is not None:
+        print(f"    -> text, MARGINAL (vs intercept only): "
+              f"{gains['text_gain_marginal']:+.4f}")
+    if gains.get("macro_gain_marginal") is not None:
+        print(f"    -> macro, marginal           : {gains['macro_gain_marginal']:+.4f}")
+    if gains.get("all_features_gain_vs_intercept") is not None:
+        print(f"    -> all features vs intercept : "
+              f"{gains['all_features_gain_vs_intercept']:+.4f}  (NOT a text gain)")
+    if gains.get("gain_over_persistence") is not None:
         verdict = "BEATS" if oos["beats_persistence"] else "DOES NOT BEAT"
-        print(f"    -> {verdict} persistence by {oos['gain_over_persistence']:+.4f}")
-    print(f"    per fold, with features: "
-          f"{[None if v is None else round(v, 3) for v in oos['per_fold']['with_features']]}")
+        print(f"    -> {verdict} persistence by {gains['gain_over_persistence']:+.4f}")
+    print(f"    per fold, text+macro: "
+          f"{[None if v is None else round(v, 3) for v in oos['per_fold']['text_and_macro']]}")
+
+    # ATTRIBUTION, in the same units as everything above, so the two measures can be read
+    # against each other rather than converted.
+    abl = summary["ablation_out_of_sample"]["features"]
+    perm = summary["permutation_importance"].get("features", {})
+    print("\n  PER-FEATURE ATTRIBUTION (held-out log score, same metric as above)")
+    print(f"    {'feature':28s} {'ablation':>9s} {'permute':>9s}  reading")
+    for f in ALL_FEATURES:
+        a = abl.get(f, {}).get("ablation_cost")
+        pm = perm.get(f, {}).get("mean_drop")
+        if a is None or pm is None:
+            print(f"    {f:28s} {'n/a':>9s} {'n/a':>9s}")
+            continue
+        if a < 0.005 and pm >= 0.005:
+            note = "redundant at fit time, load-bearing in this model"
+        elif a >= 0.005 and pm < 0.005:
+            note = "used for its mean, not its variation"
+        elif a < 0.005 and pm < 0.005:
+            note = "carrying little"
+        else:
+            note = "contributes on both measures"
+        print(f"    {f:28s} {a:+9.4f} {pm:+9.4f}  {note}")
 
     fv = summary["forward_vol_out_of_sample"]
     if "error" not in fv:
