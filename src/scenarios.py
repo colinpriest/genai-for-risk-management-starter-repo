@@ -13,7 +13,8 @@ READS
     data/processed/regimes.parquet  (the response function)
 
 WRITES
-    data/processed/scenarios.json  - selected AND rejected, with the model's reasons
+    data/processed/scenarios_final.json  - selected AND rejected, with the model's reasons,
+                                           pool diversity, ranking stability and transmission
 """
 from __future__ import annotations
 import config
@@ -76,7 +77,8 @@ def predict_regime_under(feature_values: dict, horizon_days: int = 63) -> dict:
     the answer. Here the fitted coefficients do the work.
 
     How it works:
-      1. Refit the primary specification (same endog, same features as stage 4).
+      1. Load the model stage 4 fitted and ordered (`model_artifact.json`). No refitting -
+         a second fit can land on a different optimum from the one your report describes.
       2. Substitute YOUR scenario's feature values into the mean equation, giving a predicted
          log realised volatility for each regime.
       3. Propagate today's filtered regime distribution forward `horizon_days` using the
@@ -90,8 +92,16 @@ def predict_regime_under(feature_values: dict, horizon_days: int = 63) -> dict:
     """
     import numpy as np
     import pandas as pd
-    import statsmodels.api as sm
-    from src.stage4_regime_model import ALL_FEATURES, align, fit
+    from src.stage4_regime_model import (ALL_FEATURES, align, load_model_artifact,
+                                         predicted_log_vol, propagate)
+
+    # Load the model stage 4 already fitted and ordered. DO NOT refit here. An earlier
+    # version called fit() again and then indexed the result as though raw state k-1 meant
+    # "stressed". Raw Markov state labels are arbitrary between fits, so that is wrong most
+    # of the time, and a second fit can land on a different optimum from the one your report
+    # describes. See build_model_artifact() in stage 4.
+    art = load_model_artifact()
+    k = art["n_regimes"]
 
     market = pd.read_parquet(config.DATA_PROCESSED / "market_data.parquet").set_index("date")
     scores = pd.read_parquet(config.DATA_PROCESSED / "riskvoice_scores.parquet")
@@ -101,40 +111,17 @@ def predict_regime_under(feature_values: dict, horizon_days: int = 63) -> dict:
     if missing:
         raise ValueError(f"scenario_to_features() did not set: {missing}")
 
-    endog = (np.log(df["rv_21"].values) if config.REGIME_ENDOG == "log_rv"
-             else (df["ret"] * 100).values)
     X = df[ALL_FEATURES].values
-    res = fit(endog, X, config.N_REGIMES, "scenario transmission")
 
-    k = config.N_REGIMES
-    pmap = dict(zip(res.model.param_names, np.asarray(res.params)))
-    x_star = np.array([feature_values[f] for f in ALL_FEATURES], dtype=float)
+    # Conditional mean per ORDERED regime, under the scenario's feature values and at the
+    # sample average, from the saved coefficients.
+    mu = predicted_log_vol(art, feature_values)
+    mu_base = predicted_log_vol(art, dict(zip(ALL_FEATURES, X.mean(axis=0))))
 
-    # Predicted mean per regime under the scenario's feature values.
-    #
-    # statsmodels names exogenous coefficients POSITIONALLY - x1, x2, ... in the column order
-    # of the exog matrix - not by feature name. Looking them up by feature name silently
-    # returns zero and makes every scenario produce the same answer, which looks plausible.
-    # ALL_FEATURES order is the exog column order, so x{i+1} is ALL_FEATURES[i].
-    mu = []
-    for r in range(k):
-        c = pmap.get(f"const[{r}]", pmap.get("const", 0.0))
-        beta = np.array([pmap.get(f"x{i+1}[{r}]", pmap.get(f"x{i+1}", 0.0))
-                         for i in range(len(ALL_FEATURES))])
-        mu.append(float(c + beta @ x_star))
-    mu = np.array(mu)
-    sigma = np.sqrt([pmap.get(f"sigma2[{r}]", 1.0) for r in range(k)])
-
-    # Today's regime distribution, propagated forward by the transition matrix.
-    P = np.asarray(res.regime_transition).reshape(k, k)
-    if not np.allclose(P.sum(axis=0), 1.0):
-        P = P.T
-    p_now = np.asarray(res.filtered_marginal_probabilities)[-1]
-    steps = max(1, horizon_days // 21)
-    p_h = p_now.copy()
-    for _ in range(steps):
-        p_h = P @ p_h
-    p_h = p_h / p_h.sum()
+    # Today's regime distribution, propagated forward by the DAILY transition matrix.
+    # 63 trading days means 63 applications of it - see stage4.propagate().
+    P = np.array(art["transition_daily_col_from_row_to"])
+    p_h = propagate(P, np.array(art["filtered_last"]), horizon_days)
 
     # WHAT NOT TO DO HERE. An earlier version derived a scenario-implied volatility from the
     # regime means, then reweighted the regimes by how close each mean was to that value. That
@@ -147,36 +134,109 @@ def predict_regime_under(feature_values: dict, horizon_days: int = 63) -> dict:
     # predicted volatility under the scenario against the same quantity at baseline features,
     # and leave the regime distribution as the transition matrix gives it.
     y_star = float(mu @ p_h)
-    mu_base = np.array([pmap.get(f"const[{r}]", pmap.get("const", 0.0))
-                        + np.array([pmap.get(f"x{i+1}[{r}]", 0.0)
-                                    for i in range(len(ALL_FEATURES))]) @ X.mean(axis=0)
-                        for r in range(k)])
     y_base = float(mu_base @ p_h)
 
     ann_vol = float(np.exp(y_star)) if config.REGIME_ENDOG == "log_rv" else float("nan")
     ann_vol_base = float(np.exp(y_base)) if config.REGIME_ENDOG == "log_rv" else float("nan")
-    post = p_h
-    names = [config.REGIME_NAMES[i] for i in range(k)]
-    base_worst = float((df.index.size and
-                        (pd.read_parquet(config.DATA_PROCESSED / "regimes.parquet")["regime"]
-                         == k - 1).mean()))
+    names = art["regime_names"]
+    base_worst = float((pd.read_parquet(config.DATA_PROCESSED / "regimes.parquet")["regime"]
+                        == k - 1).mean())
+
     return {
         "horizon_days": horizon_days,
+        "transition_steps_applied": horizon_days,
         "feature_values": feature_values,
+
+        # ---- MODEL-IMPLIED, and conditional on your scenario -------------------------
         "predicted_ann_vol": ann_vol,
         "baseline_ann_vol": ann_vol_base,
         "vol_multiple_vs_baseline": (float(ann_vol / ann_vol_base)
                                      if ann_vol_base else float("nan")),
+
+        # ---- MODEL-IMPLIED, but NOT conditional on your scenario ---------------------
+        # These come from the transition matrix alone. They are identical for every
+        # scenario you run. Reporting them as "the model gives this scenario an X%
+        # chance of stress" is false, and it is the most common way this module is
+        # misused - see evidence_types below.
         "regime_probabilities_from_transition_matrix": dict(
-            zip(names, [float(v) for v in post])),
-        "p_worst_regime": float(post[-1]),
-        "p_worst_unconditional": base_worst,
-        "note": ("Volatility predicted from the fitted model under your scenario's feature "
-                 "values, against the same model at average features. The regime distribution "
-                 "is the transition matrix propagated forward and does NOT depend on the "
-                 "scenario - the scenario acts on the conditional mean, not on the regime "
-                 "probabilities. Do not present it as a scenario-specific probability."),
+            zip(names, [float(v) for v in p_h])),
+        "p_worst_regime_unconditional_forecast": float(p_h[-1]),
+        "p_worst_long_run_base_rate": base_worst,
+
+        "evidence_types": {
+            "predicted_ann_vol": "MODEL-IMPLIED, CONDITIONAL on the scenario's features",
+            "regime_probabilities_from_transition_matrix":
+                "MODEL-IMPLIED, NOT conditional on the scenario - same for every scenario",
+            "p_worst_long_run_base_rate": "EMPIRICAL, observed share of days in the sample",
+        },
+        "note": (f"Volatility is predicted from the fitted model under your scenario's "
+                 f"feature values, against the same model at average features. The regime "
+                 f"distribution is today's filtered state propagated {horizon_days} trading "
+                 f"days through the DAILY transition matrix; it does NOT depend on the "
+                 f"scenario, because the scenario acts on the conditional mean rather than "
+                 f"on the regime probabilities. Do not describe it as a scenario-specific "
+                 f"probability. If you want scenario-conditional regime probabilities you "
+                 f"have to build a model whose transitions depend on the features, and say "
+                 f"that you did."),
     }
+
+
+def select_three(ranked: list[dict]) -> tuple[list[dict], list[dict], dict]:
+    """YOURS. Take the three highest-ranked scenarios that use three DIFFERENT routes.
+
+    Return (selected, rejected, conflict_record). The conflict record must say what the naive
+    top three would have been and how much cumulative relevance route diversity cost, because
+    section 8.4 Rule 6 asks you to report that trade-off rather than hide it.
+    """
+    raise NotImplementedError
+
+
+def ranking_stability(pool: list[dict], n: int = 3) -> dict:
+    """YOURS. Re-rank the SAME pool several times and report how stable the order is.
+
+    The pool is fixed. Only the ranking call is repeated - different seeds, and at least one
+    reworded prompt. Regenerating the pool each time measures generation variance, which is a
+    different question and does not tell you whether your ranking is trustworthy.
+
+    Report at least: top-three overlap across runs, and whether the route set is stable.
+    """
+    raise NotImplementedError
+
+
+def run() -> dict:
+    """Orchestrate the whole scenario phase. `run_pipeline.py --scenarios` calls this.
+
+    generate -> rank (separately) -> check ranking stability -> select three with different
+    routes -> map each to features -> push through the fitted model -> save everything.
+
+    WRITES data/processed/scenarios_final.json
+    """
+    import json
+
+    pool = generate_pool()
+    print(f"  pool of {len(pool)}")
+
+    ranked = rank_relevance(pool)
+    div = pool_diversity(pool)
+    stab = ranking_stability(pool)
+    print(f"  pool diversity {div}")
+    print(f"  ranking stability {stab}")
+
+    chosen, rejected, conflict = select_three(ranked)
+    routes = [s.get("transmission_route") for s in chosen]
+    if len(set(routes)) != len(routes):
+        raise SystemExit(
+            f"\nSTOP: your three scenarios use routes {routes}.\n"
+            "Rule 3 is a hard requirement - three scenarios on two routes test two things.\n")
+
+    for s in chosen:
+        s["model_transmission"] = predict_regime_under(scenario_to_features(s))
+
+    out = {"pool": pool, "ranked": ranked, "selected": chosen, "rejected": rejected,
+           "route_conflict": conflict, "pool_diversity": div, "ranking_stability": stab}
+    json.dump(out, open(config.DATA_PROCESSED / "scenarios_final.json", "w"), indent=2)
+    print(f"  wrote scenarios_final.json: {len(chosen)} selected, {len(rejected)} rejected")
+    return out
 
 
 # HINTS
@@ -186,5 +246,4 @@ def predict_regime_under(feature_values: dict, horizon_days: int = 63) -> dict:
 #   - Save the REJECTED candidates too. They are evidence of the search.
 
 if __name__ == "__main__":
-    pool = generate_pool()
-    print(f"pool size: {len(pool)}  diversity: {pool_diversity(pool):.3f}")
+    run()

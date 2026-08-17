@@ -61,3 +61,45 @@ def test_perturbation_sweep_shape():
     s = summarise(res)
     missing = REQUIRED_SWEEP_KEYS - set(s)
     assert not missing, f"summarise() dropped documented keys: {sorted(missing)}"
+
+
+# =============================================================================================
+# PIPELINE WIRING
+# =============================================================================================
+# `run_pipeline.py --all` dispatches by looking for run() or build() on each module. A phase
+# whose module exposes neither is silently unrunnable: --all appears to succeed and simply
+# skips it. src/scenarios.py was in exactly that state - it had only a __main__ block.
+
+def test_every_phase_has_an_entry_point():
+    import ast, re, io, pathlib
+    src = io.open("run_pipeline.py", encoding="utf-8").read()
+    mods = sorted(set(re.findall(r'"(src\.[a-z0-9_]+)"', src)))
+    assert mods, "no phase modules found in run_pipeline.py - has PHASES been renamed?"
+    missing = []
+    for m in mods:
+        path = pathlib.Path(m.replace(".", "/") + ".py")
+        assert path.exists(), f"run_pipeline.py names {m}, which does not exist"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        fns = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+        if not ({"run", "build"} & fns):
+            missing.append(m)
+    assert not missing, (
+        f"these phase modules expose neither run() nor build(), so `--all` cannot run them: "
+        f"{missing}")
+
+
+def test_scenario_output_filename_is_consistent():
+    """One filename for the scenario output, everywhere.
+
+    personas.py read scenarios.json while the tests and the marker used
+    scenarios_final.json, so a student could produce scenarios and have the persona module
+    silently find nothing.
+    """
+    import io, pathlib
+    offenders = []
+    for p in pathlib.Path("src").glob("*.py"):
+        txt = io.open(p, encoding="utf-8").read()
+        if '"scenarios.json"' in txt or "'scenarios.json'" in txt:
+            offenders.append(p.name)
+    assert not offenders, (
+        f"{offenders} refer to scenarios.json; the agreed filename is scenarios_final.json")

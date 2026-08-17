@@ -11,8 +11,13 @@ RISK5110 group assignment. Adapt the US reference implementation to Australian d
 The reference is a single 147 KB Python file. That works for one author and fails badly for a team
 of four — every merge is a conflict and nobody owns anything.
 
-This starter has **the same pipeline**, split into one module per stage so each stage has an owner
-and a defined hand-over. The stage order, the methods and the outputs are unchanged.
+This starter has the **same stage order** as the reference, split into one module per stage so
+each stage has an owner and a defined hand-over.
+
+**The methods are not all unchanged.** Three things differ deliberately, and section 1 of the
+brief explains each: five risk-voice constructs instead of one sentiment score, log realised
+volatility instead of returns as the dependent variable, and a fourth uncertainty layer from
+human agreement. The regime count and the Markov-switching approach itself are unchanged.
 
 | Reference | Here |
 |---|---|
@@ -40,14 +45,28 @@ not into re-deriving plumbing.
 
 ## Two decisions already made for you, and why
 
-**Three regimes, the same as the reference.** A fourth fits Australian data better on AIC, but
-it *competes* with the text — extra regimes absorb volatility variation your constructs would
-otherwise explain, so the measured contribution of your prompts shrinks (about 920 AIC at three
-regimes against 560 at four on our data). Three also converges reliably where four does not, and
-keeps regime shares comparable with the reference. See the note in `config.py`.
+**Three regimes, the same as the reference.** Three reasons, in order of weight:
+
+1. **Comparability.** Regime shares are not comparable across different regime counts, and
+   section 4 of the brief asks you to compare your results against the reference program's.
+   Holding the count equal removes a confound you would otherwise have to argue around.
+2. **Convergence.** The three-regime model fits reliably from every optimiser start we tried.
+   The four-regime model does not, and lands on optima hundreds of AIC apart. You run this
+   once, so a fit that depends on the random start is not something you can report.
+3. **Interpretability.** Three states map onto something a risk committee can act on. A fourth
+   tends to split one of them rather than reveal a new one.
+
+A fourth regime does fit better on AIC, and you may fit it as an extension. Note that it also
+*competes* with the text — extra regimes absorb variation the constructs would otherwise
+explain — but that is a consequence of the choice, not the reason for it. See `config.py`.
 
 `REGIME_NAMES` ships as neutral placeholders: naming the regimes is your work, done after you
 have fitted and inspected them.
+
+**Reproducibility here is best-effort.** A fixed seed makes a rerun today close, but the
+provider can change model weights or routing without notice, so a rerun months later can differ
+with the same seed. The saved raw responses under `data/processed/llm_raw/<fingerprint>/` are
+the only record that cannot change underneath you — keep them.
 
 **Sampling temperature is 1.0, not 0.** The parallel calls exist to measure how much the model
 disagrees with itself. At temperature 0 they come back identical and that measurement is

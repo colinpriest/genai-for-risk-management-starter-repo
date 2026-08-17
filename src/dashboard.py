@@ -8,7 +8,9 @@ PURPOSE
     inferred regime and all five extracted risk-voice constructs, with uncertainty shown.
 
 READS
-    data/processed/regimes.parquet, riskvoice_scores.parquet, uncertainty.parquet
+    data/processed/regimes.parquet, riskvoice_scores.parquet, uncertainty.json
+    (uncertainty is JSON, not parquet - the layers have different shapes and do
+     not form one table. See contracts/stage5_uncertainty.md.)
 
 WRITES
     outputs/dashboard.html

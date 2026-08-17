@@ -29,6 +29,29 @@ DEFAULT_EDITS = [
     ("conditions_soften", r"conditions had continued to improve",
      "conditions had continued to deteriorate"),
 
+    # --- financial-conditions signal edits -------------------------------------
+    # The edits above are about inflation, labour and growth. If you are explaining
+    # financial_conditions_concern, they mostly perturb text the construct does not read, and
+    # a small measured effect then says nothing about the construct. These reverse the
+    # meaning of FINANCIAL CONDITIONS language specifically. Every pattern below was checked
+    # against the RBA corpus and fires on at least 5% of documents.
+    ("fincond_ease", r"financial conditions (had )?(tightened|become more restrictive)",
+     r"financial conditions \1remained accommodative"),
+    ("fincond_tighten", r"financial conditions (had )?(remained |been )?(accommodative|easy|supportive)",
+     r"financial conditions \1tightened"),
+    ("funding_costs_down", r"funding costs (had )?(risen|increased)",
+     r"funding costs \1declined"),
+    ("funding_costs_up", r"funding costs (had )?(declined|fallen|eased)",
+     r"funding costs \1risen"),
+    ("credit_growth_up", r"credit growth (had )?(slowed|eased|moderated)",
+     r"credit growth \1picked up"),
+    ("credit_growth_down", r"credit growth (had )?(picked up|strengthened|increased)",
+     r"credit growth \1slowed"),
+    ("spreads_narrow", r"spreads (had )?(widened|increased)", r"spreads \1narrowed"),
+    ("spreads_widen", r"spreads (had )?(narrowed|declined|tightened)", r"spreads \1widened"),
+    ("housing_fin_up", r"housing (credit|finance|loan) (growth|commitments) (had )?(declined|fallen|slowed)",
+     r"housing \1 \2 \3picked up"),
+
     # --- control edits: meaning-preserving ------------------------------------
     # A well-behaved scorer should NOT move on these. If it does, it is responding to
     # surface wording rather than to economic content.

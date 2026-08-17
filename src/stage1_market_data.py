@@ -15,7 +15,11 @@ import pandas as pd
 import yfinance as yf
 import config
 
-warnings.filterwarnings("ignore")
+# Targeted, not global. A blanket filterwarnings("ignore") here previously hid
+# yfinance's "possibly delisted" and pandas' all-NaN slice warnings, which are
+# exactly how you find out a ticker returned nothing.
+warnings.filterwarnings("ignore", message=".*invalid value encountered.*")
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 def _download(ticker: str, start: str) -> pd.DataFrame:

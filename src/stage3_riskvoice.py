@@ -43,6 +43,7 @@ WRITES data/processed/riskvoice_scores.parquet
 from __future__ import annotations
 import hashlib
 import json
+import os
 import random
 import threading
 import time
@@ -92,14 +93,22 @@ What should it calibrate against?
 # axis all assume it, and a mixed-scale feature set makes the constructs incomparable.
 #
 # For the two fields that are naturally SIGNED, 0.5 is the neutral midpoint:
-#   downside_risk_emphasis  0 = risks discussed skew to the UPSIDE, 0.5 = balanced,
-#                           1 = risks skew to the DOWNSIDE
+#   downside_risk_emphasis  0 = risks skew to the UPSIDE, 0.5 = balanced, 1 = DOWNSIDE
+#                           DOWNSIDE TO WHAT: Australian real activity, employment or
+#                           financial stability. Say so in your description.
+#                           THE TRAP: "upside risk to INFLATION" is not upside in this sense.
+#                           It is adverse, it usually implies tighter policy, and scoring it
+#                           as upside inverts the construct on the periods that matter most.
+#                           Score the inflation balance separately if you want it.
 #   policy_stance           0 = clearly dovish, 0.5 = neutral, 1 = clearly hawkish
 #
 # Your description must state what 0, 0.5 and 1 mean, in RBA language, for every field.
 FIELD_DESCRIPTIONS = {
     "financial_conditions_concern": "TODO: 0 to 1. What does 0 mean, 0.5, and 1?",
-    "downside_risk_emphasis":       "TODO: 0 to 1. 0 = upside, 0.5 = balanced, 1 = downside.",
+    "downside_risk_emphasis":       "TODO: 0 to 1. 0 = risks skew UPSIDE, 0.5 = balanced, "
+                                    "1 = risks skew DOWNSIDE. State downside TO WHAT "
+                                    "(activity/employment/financial stability) and how you "
+                                    "treat upside inflation risk.",
     "global_risk_salience":         "TODO: 0 to 1. What does 0 mean, 0.5, and 1?",
     "vigilance":                    "TODO: 0 to 1. What does 0 mean, 0.5, and 1?",
     "uncertainty_language":         "TODO: 0 to 1. What does 0 mean, 0.5, and 1?",
@@ -147,13 +156,38 @@ BACKOFF_BASE = 1.5      # seconds; doubles each attempt, with jitter
 _GATE = threading.Semaphore(config.MAX_CONCURRENT_CALLS)
 
 
+# Bump this if the response SCHEMA changes shape in a way that makes old cached rows
+# unusable - adding or removing a scored field, or renaming the rationale field.
+SCHEMA_VERSION = 2
+
+
 def _settings_fingerprint() -> str:
-    """Anything that changes the ANSWER must change the cache key: model, temperature, and
-    every word of your prompts. Edit a field description and the cache correctly misses."""
-    blob = json.dumps({"model": config.MODEL,
+    """Everything that can change the ANSWER, hashed into the cache key.
+
+    THE BUG THIS FIXES. The previous fingerprint covered the model, the temperature and the
+    prompts - but not the TEXT BEING SCORED, nor the retrieval settings that decide which
+    passages become that text, nor the number of calls, nor the seeds. The cache file was
+    named after the meeting date alone.
+
+    So: change RETRIEVAL_QUERY or TOP_K, re-run, and stage 3 happily returns scores computed
+    from the OLD retrieved passages. Nothing errors. The manifest records your new retrieval
+    settings next to scores that never saw them, and the mismatch is undetectable afterwards.
+
+    A document-text hash is included in the FILENAME (see _cache_path) rather than here, so
+    that changing retrieval invalidates only the documents whose text actually moved.
+    """
+    from src.stage2_documents import RETRIEVAL_QUERY, TOP_K
+    blob = json.dumps({"schema_version": SCHEMA_VERSION,
+                       "model": config.MODEL,
                        "temperature": config.SAMPLING_TEMPERATURE,
+                       "seed_base": config.SEED,
+                       "n_parallel_calls": config.N_PARALLEL_CALLS,
+                       "text_column": TEXT_COLUMN,
+                       "retrieval_query": RETRIEVAL_QUERY,
+                       "top_k": TOP_K,
                        "system": SYSTEM_PROMPT,
                        "fields": FIELD_DESCRIPTIONS,
+                       "rationale_field": RATIONALE_FIELD,
                        "rationale": RATIONALE_DESC}, sort_keys=True)
     return hashlib.sha256(blob.encode()).hexdigest()[:12]
 
@@ -164,23 +198,68 @@ def _cache_dir():
     return d
 
 
+def _cache_path(date: str, text: str):
+    """Cache file for one document. The name carries a hash of the TEXT that was scored, so
+    a document whose retrieved passages changed cannot collide with its own earlier run."""
+    h = hashlib.sha256(text.encode("utf-8")).hexdigest()[:10]
+    return _cache_dir() / f"{date}__{h}.json"
+
+
+def _write_atomic(path, obj) -> None:
+    """Write via a temp file and replace. A crash or an interrupt part-way through a direct
+    json.dump leaves a truncated file that the next run reads as a valid short cache."""
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as fh:
+        json.dump(obj, fh, indent=1)
+    os.replace(tmp, path)
+
+
+def _valid_calls(calls) -> list[dict]:
+    """Cached rows that actually carry a score, rather than an error row."""
+    if not isinstance(calls, list):
+        return []
+    return [c for c in calls
+            if isinstance(c, dict) and not c.get("_error")
+            and all(f in c for f in FIELD_DESCRIPTIONS)]
+
+
 def cached_score_doc(text: str, date: str, n: int | None = None) -> tuple[list[dict], bool]:
     """Score a document, reusing a previous run when nothing that affects the answer changed.
 
-    Raw responses are kept per PROMPT VERSION, so iterating on a prompt no longer overwrites
-    the evidence from the previous version - you can compare them, and you do not pay twice
-    for a run you already made. Returns (calls, was_cached).
+    Raw responses are kept per PROMPT VERSION and per DOCUMENT TEXT, so iterating on a prompt
+    or on retrieval no longer overwrites the evidence from the previous version - you can
+    compare them, and you do not pay twice for a run you already made.
+
+    TOPS UP SHORT CACHES. The previous version accepted any non-empty list. A run that was
+    rate-limited into 3 successful calls out of 10 was therefore cached as complete and
+    reused indefinitely, and the uncertainty layer silently measured spread across 3 calls
+    while the manifest said 10. Now the count is checked and the missing calls are made.
+
+    Returns (calls, was_cached).
     """
-    p = _cache_dir() / f"{date}.json"
+    n = n or config.N_PARALLEL_CALLS
+    p = _cache_path(date, text)
+
     if p.exists():
         try:
-            calls = json.load(open(p))
-            if isinstance(calls, list) and calls:
-                return calls, True
+            cached = json.load(open(p))
         except Exception:                                    # noqa: BLE001
-            pass
+            cached = None                                    # truncated or corrupt: re-run
+        good = _valid_calls(cached)
+        if len(good) >= n:
+            return good[:n], True
+        if good:
+            # Partial cache: buy only what is missing, keeping the seeds distinct from the
+            # ones already used so the extra calls are genuinely independent draws.
+            used = {c.get("_seed") for c in good}
+            topped = list(good)
+            for extra in score_doc(text, n - len(good), seed_offset=len(used)):
+                topped.append(extra)
+            _write_atomic(p, topped)
+            return topped[:n], False
+
     calls = score_doc(text, n)
-    json.dump(calls, open(p, "w"), indent=1)
+    _write_atomic(p, calls)
     return calls, False
 
 
@@ -217,12 +296,17 @@ def _one_call(text: str, seed: int) -> dict:
     return {"_seed": seed, "_error": last, "_attempts": MAX_ATTEMPTS}
 
 
-def score_doc(text: str, n: int | None = None) -> list[dict]:
-    """N separate calls, run in parallel. Different seed each, so they can differ."""
+def score_doc(text: str, n: int | None = None, seed_offset: int = 0) -> list[dict]:
+    """N separate calls, run in parallel. Different seed each, so they can differ.
+
+    seed_offset lets a partially cached document be topped up with calls that use seeds not
+    already spent on it - reusing the same seeds would add rows without adding information,
+    and would understate the measured spread.
+    """
     n = n or config.N_PARALLEL_CALLS
     with ThreadPoolExecutor(max_workers=n) as ex:
         return [f.result() for f in
-                [ex.submit(_one_call, text, config.SEED + i) for i in range(n)]]
+                [ex.submit(_one_call, text, config.SEED + seed_offset + i) for i in range(n)]]
 
 
 def score_field(text: str, field: str = "financial_conditions_concern", n: int = 5) -> float:

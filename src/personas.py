@@ -91,22 +91,58 @@ def check_personas_written() -> None:
 
 def build_situations(scenarios: list[dict] | None = None) -> dict:
     """Situations built from YOUR model's real output, not from hypotheticals."""
+    import numpy as np
+
     reg = pd.read_parquet(config.DATA_PROCESSED / "regimes.parquet")
     summ = json.load(open(config.DATA_PROCESSED / "regime_summary.json"))
     risk = summ["risk"]
+    k = config.N_REGIMES
+    worst = config.REGIME_NAMES[k - 1]
+
+    # FILTERED, not smoothed. Smoothed probabilities use the whole sample, including days
+    # after the one being labelled, so presenting them as "where we are now" tells the
+    # stakeholder something no observer could have known. pf_* / regime_filtered are the
+    # information-set-at-the-time view and are the only honest basis for a current call.
+    fcols = [f"pf_{config.REGIME_NAMES[i]}" for i in range(k)]
+    has_filtered = all(c in reg.columns for c in fcols)
     cur = reg.iloc[-1]
-    now = config.REGIME_NAMES[int(cur["regime"])]
-    worst = config.REGIME_NAMES[config.N_REGIMES - 1]
+    if has_filtered:
+        p_now = cur[fcols].to_numpy(dtype=float)
+        now = config.REGIME_NAMES[int(np.argmax(p_now))]
+        conf = float(p_now.max())
+        basis = "filtered (information available at the time)"
+    else:
+        p_now = None
+        now = config.REGIME_NAMES[int(cur["regime"])]
+        conf = float(cur["regime_confidence"])
+        basis = "SMOOTHED - full-sample, uses information from after this date"
+
+    # The forward probability is COMPUTED from the fitted transition matrix, and shown next
+    # to the unconditional base rate. Asserting that it is "materially raised" without a
+    # number is a claim the model has not made.
+    base_rate = float((reg["regime"] == k - 1).mean())
+    P = np.array(summ["transitions"]["matrix_col_from_row_to"], dtype=float)
+    if p_now is None:
+        p_fwd = base_rate
+    else:
+        p = p_now / p_now.sum()
+        for _ in range(63):
+            p = P @ p
+        p_fwd = float(p[k - 1] / p.sum())
+    direction = ("raised" if p_fwd > base_rate * 1.25 else
+                 "lower than" if p_fwd < base_rate * 0.8 else "close to")
 
     sits = {
         "current regime call": (
             f"A risk model reports the Australian share market is currently in its '{now}' "
-            f"volatility regime, with {cur['regime_confidence']:.0%} confidence. Historically "
+            f"volatility regime, with {conf:.0%} confidence [{basis}]. Historically "
             f"that regime has had annualised volatility of {risk[now]['ann_vol']:.0%} and a daily "
             f"expected shortfall of {risk[now]['ES_95_daily']:.1%}. What is your reaction?"),
-        "crisis regime warning": (
-            f"The model now reports a materially raised probability of entering its '{worst}' "
-            f"regime over the next quarter. Historically that regime has had annualised volatility "
+        f"{worst} regime outlook": (
+            f"Carrying today's regime estimate forward one quarter using the model's own "
+            f"transition probabilities, the chance of being in the '{worst}' regime is "
+            f"{p_fwd:.0%}, against a long-run base rate of {base_rate:.0%} - {direction} the "
+            f"base rate. Historically that regime has had annualised volatility "
             f"of {risk[worst]['ann_vol']:.0%}, and its worst single day was "
             f"{risk[worst]['worst_day']:.1%}. The model does NOT forecast interest rates - it "
             "models market volatility. What is your reaction?"),
@@ -138,7 +174,7 @@ def ask(persona_name: str, persona: str, situation: str) -> dict:
 def run(scenarios: list[dict] | None = None) -> dict:
     check_personas_written()
     if scenarios is None:
-        p = config.DATA_PROCESSED / "scenarios.json"
+        p = config.DATA_PROCESSED / "scenarios_final.json"
         scenarios = json.load(open(p)).get("selected") if p.exists() else None
 
     sits = build_situations(scenarios)

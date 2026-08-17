@@ -7,13 +7,15 @@
 
 ```json
 {
-  "specification": {"endog": "log_rv", "n_regimes": 4, "text_features": ["..."]},
+  "specification": {"endog": "log_rv", "n_regimes": 3, "text_features": ["..."]},
   "layer1_parameter": {
-    "n_draws": 48, "n_requested": 60, "block_length_days": 63,
+    "n_draws_used": 48, "n_requested": 60,
+    "draw_outcomes": {"ok": 48, "not_converged": 9, "degenerate": 3, "exception": 0},
+    "excluded_from_interval": 12, "block_length_days": 63,
     "regime0_ann_vol_p5_p50_p95": [0.090, 0.102, 0.123],
-    "regime3_ann_vol_p5_p50_p95": [0.222, 0.298, 0.598]
+    "regime2_ann_vol_p5_p50_p95": [0.222, 0.298, 0.598]
   },
-  "layer2_model": [{"spec": "...", "k_regimes": 4, "aic": -5352.1, "converged": true}],
+  "layer2_model": [{"spec": "...", "k_regimes": 3, "aic": -5352.1, "converged": true}],
   "layer3_llm": {"financial_conditions_concern": {"within_doc_sd_mean": 0.072,
                                                   "between_doc_sd": 0.136,
                                                   "signal_to_noise": 1.9}},
@@ -61,7 +63,12 @@ between-document sd, and their ratio. **The ratio is what matters**: a construct
 between-document spread barely exceeds its own measurement noise is not discriminating.
 
 `embedding_spread` measures whether the calls agreed for the same *reasons*, which the numeric
-sd cannot see. Report it alongside.
+sd cannot see.
+
+**It must appear in `layer3_llm`, not merely exist in stage 3's output.** Report, per construct
+or pooled: mean, p90 and max of `embedding_spread`, and the share of documents above 0.4. A
+document where the numbers agree and the rationales do not is the case this layer exists to
+find, and an aggregate of standard deviations alone cannot show it.
 
 **Name this layer accurately.** It is output stability under a stated sampling protocol at
 temperature 1.0. It is not calibrated epistemic uncertainty, and it must not be presented as a

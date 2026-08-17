@@ -68,7 +68,11 @@ def run() -> dict:
 
     for name, d in EVENTS.items():
         d = pd.Timestamp(d)
-        pre, post = reg.loc[:d].tail(WINDOW), reg.loc[d:].head(WINDOW)
+        # STRICTLY before and strictly after. reg.loc[:d] and reg.loc[d:] both INCLUDE d
+        # when it is a trading day, so the event day itself - usually the most violent one -
+        # was counted in both windows and inflated the "before" volatility.
+        pre = reg.loc[reg.index < d].tail(WINDOW)
+        post = reg.loc[reg.index > d].head(WINDOW)
         if len(post) < 20:
             print(f"  {name}: too close to the end of the data, skipped")
             continue
