@@ -333,7 +333,17 @@ def run() -> pd.DataFrame:
             f"\nMACRO_FEATURES names columns stage1 did not produce: {missing}\n"
             f"Add the series to config.MACRO_TICKERS and re-run stage 1, or remove them here.\n"
             f"Available: {avail}\n")
-    df = align(market, scores).dropna(subset=["ret", "rv_21"] + ALL_FEATURES)
+    aligned = align(market, scores)
+    df = aligned.dropna(subset=["ret", "rv_21"] + ALL_FEATURES)
+    lost = len(aligned.dropna(subset=["ret", "rv_21"])) - len(df)
+    if lost:
+        # A feature with a short history costs you rows SILENTLY. Some macro series start
+        # years after the ASX data, and dropna() removes every day they are missing.
+        per = {c: int(aligned[c].isna().sum()) for c in ALL_FEATURES if aligned[c].isna().any()}
+        print(f"  WARNING: {lost} rows dropped for missing features "
+              f"({lost/max(len(aligned), 1):.0%} of the sample)")
+        for c, n in sorted(per.items(), key=lambda x: -x[1])[:4]:
+            print(f"    {c}: {n} missing")
 
     endog = np.log(df["rv_21"].values) if config.REGIME_ENDOG == "log_rv" else (df["ret"] * 100).values
     X = df[ALL_FEATURES].values

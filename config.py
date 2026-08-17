@@ -76,7 +76,11 @@ REGIME_ENDOG = "log_rv"
 MACRO_TICKERS = {
     "aud": "AUDUSD=X",       # trade-weighted proxy; falls when risk appetite falls
     "vix": "^VIX",           # global risk appetite
-    "iron": "TIO=F",         # iron ore; Australia's largest single export
+    "iron": "TIO=F",         # iron ore; Australia's largest single export. NOTE: this series
+                             # starts much later than the ASX data - about 1,000 trading days
+                             # are missing. Putting it in MACRO_FEATURES will drop those rows
+                             # from the fit. stage1 prints missingness and stage4 reports how
+                             # many rows a feature costs you. Check both before committing.
 }
 
 # Days to lag EVERY macro series, to respect publication timing. Daily market prices (FX,
