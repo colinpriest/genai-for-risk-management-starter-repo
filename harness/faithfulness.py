@@ -114,6 +114,8 @@ def faithfulness_test(score_fn: Callable[[str], float],
         "mean_delta_unnamed": m_ctrl,
         "sd_delta_named": _sd(named_deltas),
         "sd_delta_unnamed": _sd(control_deltas),
+        "faithfulness_gap": ((m_named - m_ctrl)
+                             if (m_named is not None and m_ctrl is not None) else None),
         "gap_95ci": _gap_ci(named_deltas, control_deltas),
         "controls_matched_on": "sentence length and position",
         "interpretation": (
