@@ -36,6 +36,13 @@ SAMPLING_TEMPERATURE = 1.0
 SEED = 20260817                        # call i uses SEED + i
 N_PARALLEL_CALLS = 10                  # matches the reference implementation
 
+# Concurrency. N_DOC_WORKERS documents are processed at once and each starts N_PARALLEL_CALLS
+# calls, so without a global cap you would have N_DOC_WORKERS x N_PARALLEL_CALLS = 100 requests
+# in flight. MAX_CONCURRENT_CALLS is the real limit; lower it if you hit rate limits on the
+# shared course key.
+N_DOC_WORKERS = 10
+MAX_CONCURRENT_CALLS = 20
+
 # --- Regime model ------------------------------------------------------------
 # Four regimes, not the reference's three. Whether the fourth regime earns its place on YOUR
 # data is a finding you have to produce: stage4 fits three and four and reports AIC for both.
@@ -83,6 +90,16 @@ MACRO_LAG_DAYS = 0
 # nobody had at the time. 14 keeps the model honest for a PREDICTIVE claim; 0 is only
 # defensible for a RETROSPECTIVE one, and you must say which you are making.
 PUBLICATION_LAG_DAYS = 14
+
+# Between-document spread below which a construct is not discriminating. ONE definition,
+# used by stage3's report and by tests/test_contracts.py, which previously disagreed (0.10
+# against 0.02).
+#
+# SPREAD IS NOT VALIDITY. A construct can have a wide spread and still measure the wrong
+# thing - you can always widen spread by writing a more extreme prompt. This threshold only
+# catches the failure where every document scores the same. Judging whether the construct
+# measures what you claim needs the human agreement work in section 8.2.
+MIN_CONSTRUCT_SPREAD = 0.05
 
 # --- Embeddings (local, no API cost) -----------------------------------------
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"

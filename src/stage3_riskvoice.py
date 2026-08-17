@@ -41,8 +41,10 @@ WRITES data/processed/riskvoice_scores.parquet
        data/processed/llm_raw/<date>.json
 """
 from __future__ import annotations
+import hashlib
 import json
 import random
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -140,6 +142,47 @@ RiskVoice = create_model(
 MAX_ATTEMPTS = 4
 BACKOFF_BASE = 1.5      # seconds; doubles each attempt, with jitter
 
+# ONE global cap on calls in flight. Without it the outer pool of 10 documents each starts 10
+# inner calls, so 100 requests hit the API at once and a shared course key rate-limits.
+_GATE = threading.Semaphore(config.MAX_CONCURRENT_CALLS)
+
+
+def _settings_fingerprint() -> str:
+    """Anything that changes the ANSWER must change the cache key: model, temperature, and
+    every word of your prompts. Edit a field description and the cache correctly misses."""
+    blob = json.dumps({"model": config.MODEL,
+                       "temperature": config.SAMPLING_TEMPERATURE,
+                       "system": SYSTEM_PROMPT,
+                       "fields": FIELD_DESCRIPTIONS,
+                       "rationale": RATIONALE_DESC}, sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()[:12]
+
+
+def _cache_dir():
+    d = config.LLM_RAW / _settings_fingerprint()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def cached_score_doc(text: str, date: str, n: int | None = None) -> tuple[list[dict], bool]:
+    """Score a document, reusing a previous run when nothing that affects the answer changed.
+
+    Raw responses are kept per PROMPT VERSION, so iterating on a prompt no longer overwrites
+    the evidence from the previous version - you can compare them, and you do not pay twice
+    for a run you already made. Returns (calls, was_cached).
+    """
+    p = _cache_dir() / f"{date}.json"
+    if p.exists():
+        try:
+            calls = json.load(open(p))
+            if isinstance(calls, list) and calls:
+                return calls, True
+        except Exception:                                    # noqa: BLE001
+            pass
+    calls = score_doc(text, n)
+    json.dump(calls, open(p, "w"), indent=1)
+    return calls, False
+
 
 def _one_call(text: str, seed: int) -> dict:
     """One scored call, with bounded exponential backoff.
@@ -151,14 +194,15 @@ def _one_call(text: str, seed: int) -> dict:
     last = ""
     for attempt in range(MAX_ATTEMPTS):
         try:
-            r = client_().beta.chat.completions.parse(
-                model=config.MODEL,
-                messages=[{"role": "system", "content": SYSTEM_PROMPT},
-                          {"role": "user", "content": f"RBA minutes:\n\n{text}"}],
-                response_format=RiskVoice,
-                temperature=config.SAMPLING_TEMPERATURE,   # MUST be > 0, see config.py
-                seed=seed,
-            )
+            with _GATE:                       # global cap on calls in flight
+                r = client_().beta.chat.completions.parse(
+                    model=config.MODEL,
+                    messages=[{"role": "system", "content": SYSTEM_PROMPT},
+                              {"role": "user", "content": f"RBA minutes:\n\n{text}"}],
+                    response_format=RiskVoice,
+                    temperature=config.SAMPLING_TEMPERATURE,   # MUST be > 0, see config.py
+                    seed=seed,
+                )
             d = r.choices[0].message.parsed.model_dump()
             d["_seed"] = seed
             d["_attempts"] = attempt + 1
@@ -226,16 +270,21 @@ def run() -> pd.DataFrame:
     docs = pd.read_parquet(config.DATA_PROCESSED / "documents.parquet")
     rows, t0, ti, to = [], time.time(), 0, 0
 
-    def work(rec):
-        return rec, score_doc(rec[TEXT_COLUMN])
+    fp = _settings_fingerprint()
+    print(f"  prompt fingerprint {fp}; raw responses cached under llm_raw/{fp}/")
 
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    def work(rec):
+        date = pd.Timestamp(rec["meeting_date"]).strftime("%Y-%m-%d")
+        calls, was_cached = cached_score_doc(rec[TEXT_COLUMN], date)
+        return rec, calls, was_cached
+
+    n_cached = 0
+    with ThreadPoolExecutor(max_workers=config.N_DOC_WORKERS) as ex:
         futs = [ex.submit(work, r) for _, r in docs.iterrows()]
         done = 0
         for f in as_completed(futs):
-            rec, calls = f.result()
-            date = pd.Timestamp(rec["meeting_date"]).strftime("%Y-%m-%d")
-            json.dump(calls, open(config.LLM_RAW / f"{date}.json", "w"), indent=1)
+            rec, calls, was_cached = f.result()
+            n_cached += int(was_cached)
             ok = [c for c in calls if "_error" not in c]
             ti += sum(c.get("_tok_in", 0) for c in ok)
             to += sum(c.get("_tok_out", 0) for c in ok)
@@ -254,12 +303,22 @@ def run() -> pd.DataFrame:
     df = pd.DataFrame(rows).sort_values("meeting_date").reset_index(drop=True)
     df.to_parquet(config.DATA_PROCESSED / "riskvoice_scores.parquet", index=False)
 
+    json.dump({"fingerprint": _settings_fingerprint(), "model": config.MODEL,
+               "temperature": config.SAMPLING_TEMPERATURE, "seed": config.SEED,
+               "n_parallel_calls": config.N_PARALLEL_CALLS,
+               "n_documents": int(len(df)), "text_column": TEXT_COLUMN,
+               "note": "Seeds make runs best-effort reproducible, not identical. The provider "
+                       "may change model weights or routing without notice, so a rerun months "
+                       "later can differ with the same seed. Keep the raw responses."},
+              open(_cache_dir() / "MANIFEST.json", "w"), indent=1)
+
     print(f"\n  {len(df)} meetings in {time.time()-t0:.0f}s   "
           f"est cost ${ti/1e6*0.15 + to/1e6*0.60:.2f}")
     print(f"  {'construct':32s} {'mean':>7s} {'spread':>8s} {'within-doc sd':>14s}  discriminating?")
     for fld in FIELDS:
         spread = df[fld].std()
-        flag = "yes" if spread > 0.10 else "NO - scores are bunched, revise the description"
+        flag = ("yes" if spread > config.MIN_CONSTRUCT_SPREAD
+                else "NO - scores are bunched, revise the description")
         print(f"  {fld:32s} {df[fld].mean():+7.3f} {spread:8.3f} "
               f"{df[f'{fld}_sd'].mean():14.3f}  {flag}")
     return df

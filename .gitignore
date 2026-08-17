@@ -20,3 +20,9 @@ outputs/figures/*
 # ignored, so the snapshot lives here and IS tracked.
 !data/snapshot/
 !data/snapshot/**
+
+# Windows Explorer / macOS / pytest droppings - never part of a submission
+desktop.ini
+.DS_Store
+Thumbs.db
+.pytest_cache/

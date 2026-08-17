@@ -67,8 +67,9 @@ def test_construct_discriminates(construct):
     """
     df = _load("riskvoice_scores.parquet")
     spread = df[construct].std()
-    assert spread > 0.02, (
-        f"{construct} has a between-document sd of {spread:.4f}: it is returning "
+    assert spread > config.MIN_CONSTRUCT_SPREAD, (
+        f"{construct} has a between-document sd of {spread:.4f} (< "
+        f"{config.MIN_CONSTRUCT_SPREAD}): it is returning "
         f"essentially the same value for every document. Rewrite its field description "
         f"in src/stage3_riskvoice.py so that high and low are clearly distinguished.")
 
@@ -124,3 +125,64 @@ def test_text_model_is_the_saved_one():
 def test_corpus_present():
     n = len(list(config.RBA_MINUTES_DIR.glob("*.html")))
     assert n >= 200, f"expected ~211 RBA minutes, found {n}"
+
+
+# =============================================================================================
+# SUBMISSION MODE
+# =============================================================================================
+# Everything above SKIPS when a stage has not run yet, which is right while you are building
+# and wrong when you are submitting: an empty repository reports "all tests passed".
+#
+# Run this before you submit:
+#
+#     pytest tests/ -q --submission
+#
+# In submission mode a missing artefact is a FAILURE, not a skip.
+
+def test_submission_artefacts_present(request):
+    if not request.config.getoption("--submission"):
+        pytest.skip("development mode; run with --submission to enforce")
+
+    required = {
+        "market_data.parquet":      "stage 1 never produced market data",
+        "documents.parquet":        "stage 2 never parsed the corpus",
+        "riskvoice_scores.parquet": "stage 3 never scored the documents",
+        "regimes.parquet":          "stage 4 never fitted the regime model",
+        "regimes_3.parquet":        "stage 4 never fitted the 3-regime comparison",
+        "regimes_base.parquet":     "stage 4 never fitted the no-text comparison",
+        "uncertainty.json":         "stage 5 is still a stub - the three uncertainty layers "
+                                    "are a required part of the submission",
+    }
+    missing = {n: why for n, why in required.items()
+               if not (config.DATA_PROCESSED / n).exists()}
+    assert not missing, "Missing required outputs:\n" + "\n".join(
+        f"  {n}: {why}" for n, why in missing.items())
+
+
+def test_submission_prompts_written(request):
+    if not request.config.getoption("--submission"):
+        pytest.skip("development mode; run with --submission to enforce")
+    from src.stage3_riskvoice import SYSTEM_PROMPT, FIELD_DESCRIPTIONS
+    todo = [k for k, v in FIELD_DESCRIPTIONS.items() if "TODO" in v]
+    assert "TODO" not in SYSTEM_PROMPT, "SYSTEM_PROMPT is still the placeholder"
+    assert not todo, f"field descriptions still placeholders: {todo}"
+
+
+def test_submission_regimes_named(request):
+    if not request.config.getoption("--submission"):
+        pytest.skip("development mode; run with --submission to enforce")
+    placeholders = [v for v in config.REGIME_NAMES.values() if v.startswith("regime_")]
+    assert not placeholders, (
+        f"regimes are still unnamed placeholders: {placeholders}. Naming them from your own "
+        f"output is marked work - see section 6.1 of the brief.")
+
+
+def test_submission_agreement_work_present(request):
+    if not request.config.getoption("--submission"):
+        pytest.skip("development mode; run with --submission to enforce")
+    d = config.DATA_PROCESSED / "agreement"
+    labels = list(d.glob("labels_*.csv")) if d.exists() else []
+    assert len(labels) >= 3, (
+        f"found {len(labels)} blind labelling files in data/processed/agreement/. The fourth "
+        f"uncertainty layer needs independent labels from every team member - see "
+        f"team-templates/human-agreement-protocol.md")

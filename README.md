@@ -29,10 +29,10 @@ not into re-deriving plumbing.
 
 | Pre-built and working | Yours |
 |---|---|
-| ASX 200 + macro download, volatility features (`stage1`) | Which macro indicators, and why |
+| ASX 200 + macro download, volatility features (`stage1`) | Which macro series (`config.MACRO_TICKERS`) and **which of them enter the model** (`stage4.MACRO_FEATURES`) |
 | RBA HTML parsing, chunking, retrieval (`stage2`) | **The retrieval query** — which parts of a document matter |
 | Parallel calling, retries, raw saving, averaging (`stage3`) | **The prompts.** All six field descriptions are blank |
-| 4-regime fitting, regime ordering, risk metrics (`stage4`) | Which text features to include; the dependent variable choice |
+| Best-converged fitting, regime ordering, risk metrics, coefficients, transitions, rolling-origin out-of-sample (`stage4`) | Which features to include; interpreting the dependent-variable comparison |
 | — | **`stage5` is a stub.** All three uncertainty layers are yours: block bootstrap, specification ensemble, LLM spread. Traps 1, 4 and 6 all bite here. |
 | Perturbation + faithfulness harness, patterns verified against the RBA corpus | Running it and interpreting the result |
 
@@ -51,13 +51,29 @@ meaningless. Each call uses a different fixed seed, so runs still reproduce.
 
 ## Setup
 
+**Python 3.12.** Other versions may work; 3.12 is what this was tested on.
+
+**Windows (PowerShell or Git Bash):**
+
 ```bash
 python -m venv .venv
-.venv\Scripts\activate          # Windows
+.venv\Scripts\activate
 pip install -r requirements.txt
-copy .env.example .env            # then put your API key in .env
-python run_pipeline.py --check    # verifies setup without calling the API
+copy .env.example .env
+python run_pipeline.py --check
 ```
+
+**macOS / Linux:**
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+python run_pipeline.py --check
+```
+
+Then put your API key in `.env`. `--check` verifies setup and makes no API calls.
 
 **Your API key goes in `.env`, which is git-ignored. Never commit it.**
 Run `python run_pipeline.py --check` before your first commit — it will tell you if a key is
@@ -69,7 +85,8 @@ about to be exposed.
 
 ```
 config.py              Shared settings. Paths, model name, corpus window.
-run_pipeline.py        Runs stages in order. Start here to see the flow.
+run_pipeline.py        Phases: --all --core --calibration --scenarios --stakeholders
+                       --dashboard --stage N --check. Start here to see the flow.
 
 src/
   stage1_market_data.py    ASX 200 + macro indicators        OWNER: ?
@@ -126,8 +143,14 @@ you write the code they describe.
 a tested one fails at the boundary and names the stage that broke it.
 
 ```bash
-pytest tests/            # run after any stage produces output
+pytest tests/                 # development: missing outputs SKIP
+pytest tests/ --submission    # before you submit: missing outputs FAIL
 ```
+
+**Run `pytest tests/ --submission` before you hand in.** In development mode a missing stage
+output is skipped, so an almost-empty repository reports "all tests passed". Submission mode
+turns every missing required artefact into a failure, and also checks that your prompts are
+written, your regimes are named, and your blind agreement labels exist.
 
 ---
 
@@ -147,8 +170,17 @@ pytest tests/            # run after any stage produces output
 
 ## Before you commit
 
-- [ ] `.env` is not staged
-- [ ] Raw API responses saved under `data/processed/llm_raw/`
+- [ ] `.env` is not staged — `python run_pipeline.py --check` verifies this properly
+- [ ] Raw API responses saved under `data/processed/llm_raw/<prompt-fingerprint>/`
 - [ ] Temperature and seed recorded in `config.py`
 - [ ] `pytest tests/` passes
 - [ ] Your name is in the `OWNER:` line of your stage
+
+## Before you SUBMIT
+
+- [ ] `pytest tests/ --submission` passes
+- [ ] Regimes renamed from `regime_0` … in `config.py`
+- [ ] Fixed market-data copy committed under `data/snapshot/`
+- [ ] Blind agreement labels committed under `data/processed/agreement/`
+- [ ] You have said whether your model is retrospective or predictive
+      (`config.PUBLICATION_LAG_DAYS`)
