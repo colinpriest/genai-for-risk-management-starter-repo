@@ -15,3 +15,4 @@ python-dotenv>=1.0
 pytest>=8.0
 pyarrow>=15.0
 pypdf>=4.0
+xlrd>=2.0                # legacy .xls, required to read the supplied GPR workbook

@@ -14,7 +14,7 @@ write in Week 2 for your own hand-overs must be this specific.
 | `meeting_date` | date | — | Date of the meeting the minutes describe | Never missing. Primary key. |
 | `financial_conditions_concern` | float | 0 to 1 | Mean across the parallel calls | Never missing |
 | `financial_conditions_concern_sd` | float | ≥ 0 | Standard deviation across those calls. **This is the LLM uncertainty layer** — do not drop it. | Missing if fewer than 2 valid calls |
-| `downside_risk_emphasis` | float | 0 to 1 | Mean across the parallel calls | Never missing |
+| `downside_risk_emphasis` | float | 0 to 1 | Mean across the parallel calls. 0 = risks skew to the upside, 0.5 = balanced, 1 = risks skew to the downside | Never missing |
 | `downside_risk_emphasis_sd` | float | ≥ 0 | Standard deviation across those calls | Missing if fewer than 2 valid calls |
 | `global_risk_salience` | float | 0 to 1 | Mean across the parallel calls | Never missing |
 | `global_risk_salience_sd` | float | ≥ 0 | Standard deviation across those calls | Missing if fewer than 2 valid calls |
@@ -22,10 +22,17 @@ write in Week 2 for your own hand-overs must be this specific.
 | `vigilance_sd` | float | ≥ 0 | Standard deviation across those calls | Missing if fewer than 2 valid calls |
 | `uncertainty_language` | float | 0 to 1 | Mean across the parallel calls | Never missing |
 | `uncertainty_language_sd` | float | ≥ 0 | Standard deviation across those calls | Missing if fewer than 2 valid calls |
-| `policy_stance` | float | 0 to 1 | The deliberate contrast field, not one of the five constructs | Never missing |
+| `policy_stance` | float | 0 to 1 | The deliberate contrast field, not one of the five constructs. 0 = dovish, 0.5 = neutral, 1 = hawkish | Never missing |
 | `policy_stance_sd` | float | ≥ 0 | Standard deviation across those calls | Missing if fewer than 2 valid calls |
 | `n_calls_valid` | int | 0–10 | Calls returning valid structured output | Never missing. Below 10 means the means use fewer calls. |
-| `embedding_spread` | float | ≥ 0 | Semantic spread across responses | Missing if `n_calls_valid` < 3 |
+| `embedding_spread` | float | 0 to ~1 | Mean pairwise cosine **distance** between the calls' `rationale` texts. 0 = all calls reasoned identically. Produced by `semantic_spread()` | Missing if fewer than 3 valid rationales |
+
+**Every score is on 0 to 1**, including the two that are naturally signed — 0.5 is their neutral
+midpoint. Pydantic enforces the bounds at parse time, and `tests/test_contracts.py` re-checks them.
+
+**Missingness is not silent.** If a meeting returns `n_calls_valid == 0`, every construct mean is
+`NaN` for that row and stage 4 will drop it. A run with more than a handful of such rows is a
+failed run, not a run with gaps — investigate before using the output.
 
 **What stage 4 does with this.** Only the columns named in `stage4.TEXT_FEATURES` enter the
 model. Choosing which of the five belong there is your decision — see section 5.3 of the brief.

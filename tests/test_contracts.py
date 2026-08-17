@@ -73,6 +73,16 @@ def test_construct_discriminates(construct):
         f"in src/stage3_riskvoice.py so that high and low are clearly distinguished.")
 
 
+def test_embedding_spread_present():
+    """The LLM layer promises SEMANTIC spread, not just numeric spread."""
+    df = _load("riskvoice_scores.parquet")
+    assert "embedding_spread" in df.columns, (
+        "embedding_spread missing. stage3 computes it from the per-call rationales; if it is "
+        "absent, the contract's semantic-spread column is unfulfilled.")
+    ok = df["embedding_spread"].dropna()
+    assert (ok >= 0).all(), "embedding_spread is a distance and cannot be negative"
+
+
 def test_never_silently_empty():
     """A row with no valid calls must not carry a score."""
     df = _load("riskvoice_scores.parquet")
@@ -82,9 +92,33 @@ def test_never_silently_empty():
 
 
 def test_regimes_count():
+    """All N regimes must be present AND materially occupied.
+
+    `n <= N_REGIMES` passes on a degenerate fit that collapsed to one state, which is exactly
+    the failure worth catching.
+    """
     df = _load("regimes.parquet")
-    n = df["regime"].nunique()
-    assert n <= config.N_REGIMES, f"found {n} regimes; N_REGIMES is {config.N_REGIMES}"
+    labels = set(df["regime"].dropna().astype(int))
+    assert labels == set(range(config.N_REGIMES)), (
+        f"expected regimes {set(range(config.N_REGIMES))}, found {labels} - a regime with no "
+        f"assigned days means the fit collapsed")
+    share = df["regime"].value_counts(normalize=True)
+    thin = share[share < 0.01]
+    assert thin.empty, (f"regime(s) {list(thin.index)} hold under 1% of days; the fit has "
+                        f"effectively collapsed to fewer regimes")
+
+
+def test_text_model_is_the_saved_one():
+    """regimes.parquet must come from the model that USED the text features."""
+    p = config.DATA_PROCESSED / "regimes_base.parquet"
+    if not p.exists():
+        pytest.skip("regimes_base.parquet not produced yet")
+    a = _load("regimes.parquet")
+    b = pd.read_parquet(p)
+    same = (a["regime"].values == b["regime"].values).all() if len(a) == len(b) else False
+    assert not same, (
+        "regimes.parquet is identical to the no-text fit. The saved regimes must come from "
+        "the model including TEXT_FEATURES, or your constructs are decorative.")
 
 
 def test_corpus_present():

@@ -11,10 +11,10 @@ READS
     data/processed/regimes.parquet, riskvoice_scores.parquet, llm_raw/
 
 WRITES
-    data/processed/uncertainty.parquet
+    data/processed/uncertainty.json
 
 CONTRACT
-    See contracts/stage5_uncertainty.md
+    See contracts/stage5_uncertainty.md (supplied)
     Agree it in Week 2 and commit it BEFORE writing this code.
     tests/test_contracts.py will check your output against it.
 """

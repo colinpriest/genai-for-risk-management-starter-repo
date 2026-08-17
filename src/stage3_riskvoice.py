@@ -42,6 +42,7 @@ WRITES data/processed/riskvoice_scores.parquet
 """
 from __future__ import annotations
 import json
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -85,13 +86,23 @@ Who is the model? What is it reading? What is it trying to judge, and why?
 What should it calibrate against?
 """
 
+# EVERY FIELD IS ON 0 TO 1. This is not negotiable: the contract, the tests and the dashboard
+# axis all assume it, and a mixed-scale feature set makes the constructs incomparable.
+#
+# For the two fields that are naturally SIGNED, 0.5 is the neutral midpoint:
+#   downside_risk_emphasis  0 = risks discussed skew to the UPSIDE, 0.5 = balanced,
+#                           1 = risks skew to the DOWNSIDE
+#   policy_stance           0 = clearly dovish, 0.5 = neutral, 1 = clearly hawkish
+#
+# Your description must state what 0, 0.5 and 1 mean, in RBA language, for every field.
 FIELD_DESCRIPTIONS = {
-    "financial_conditions_concern": "TODO: 0 to 1. What does high mean? What does low mean?",
-    "downside_risk_emphasis":       "TODO: -1 to +1. Which end is which?",
-    "global_risk_salience":         "TODO: 0 to 1.",
-    "vigilance":                    "TODO: 0 to 1.",
-    "uncertainty_language":         "TODO: 0 to 1.",
-    "policy_stance":                "TODO: -1 to +1. The contrast field.",
+    "financial_conditions_concern": "TODO: 0 to 1. What does 0 mean, 0.5, and 1?",
+    "downside_risk_emphasis":       "TODO: 0 to 1. 0 = upside, 0.5 = balanced, 1 = downside.",
+    "global_risk_salience":         "TODO: 0 to 1. What does 0 mean, 0.5, and 1?",
+    "vigilance":                    "TODO: 0 to 1. What does 0 mean, 0.5, and 1?",
+    "uncertainty_language":         "TODO: 0 to 1. What does 0 mean, 0.5, and 1?",
+    "policy_stance":                "TODO: 0 to 1. 0 = dovish, 0.5 = neutral, 1 = hawkish. "
+                                    "The contrast field.",
 }
 
 # Which part of the document to send. 'text_retrieved' is the passages your stage 2 retrieval
@@ -105,30 +116,61 @@ TEXT_COLUMN = "text_retrieved"
 
 FIELDS = list(FIELD_DESCRIPTIONS)
 
+# ge/le are enforced by Pydantic, so an out-of-range score is rejected at parse time rather
+# than quietly averaged into your features. A description is documentation; this is validation.
+RATIONALE_FIELD = "rationale"
+RATIONALE_DESC = ("One or two sentences saying WHY you gave these scores, naming the specific "
+                  "wording in the minutes that drove them. This is not scored; it is compared "
+                  "across the parallel calls to measure whether they agreed for the same "
+                  "reasons.")
+
+# The rationale exists so the LLM uncertainty layer can measure SEMANTIC spread, not just
+# numeric spread. Two calls can return 0.6 and 0.6 for opposite reasons: the numbers agree and
+# the reasoning does not. Embedding the rationales is what detects that, and it is why the
+# assignment uses an embedding model as well as a generative one.
 RiskVoice = create_model(
     "RiskVoice",
-    **{name: (float, Field(description=desc)) for name, desc in FIELD_DESCRIPTIONS.items()},
+    **{name: (float, Field(description=desc, ge=0.0, le=1.0))
+       for name, desc in FIELD_DESCRIPTIONS.items()},
+    **{RATIONALE_FIELD: (str, Field(description=RATIONALE_DESC))},
     __base__=BaseModel,
 )
 
 
+MAX_ATTEMPTS = 4
+BACKOFF_BASE = 1.5      # seconds; doubles each attempt, with jitter
+
+
 def _one_call(text: str, seed: int) -> dict:
-    try:
-        r = client_().beta.chat.completions.parse(
-            model=config.MODEL,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT},
-                      {"role": "user", "content": f"RBA minutes:\n\n{text}"}],
-            response_format=RiskVoice,
-            temperature=config.SAMPLING_TEMPERATURE,   # MUST be > 0, see config.py
-            seed=seed,
-        )
-        d = r.choices[0].message.parsed.model_dump()
-        d["_seed"] = seed
-        d["_tok_in"] = r.usage.prompt_tokens
-        d["_tok_out"] = r.usage.completion_tokens
-        return d
-    except Exception as e:                                   # noqa: BLE001
-        return {"_seed": seed, "_error": str(e)[:200]}
+    """One scored call, with bounded exponential backoff.
+
+    Rate limits and transient 5xx are the common failures on a shared course key. Returning
+    an error row on the first exception silently shrinks n_calls_valid and quietly widens
+    your uncertainty layer, so retry before giving up.
+    """
+    last = ""
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            r = client_().beta.chat.completions.parse(
+                model=config.MODEL,
+                messages=[{"role": "system", "content": SYSTEM_PROMPT},
+                          {"role": "user", "content": f"RBA minutes:\n\n{text}"}],
+                response_format=RiskVoice,
+                temperature=config.SAMPLING_TEMPERATURE,   # MUST be > 0, see config.py
+                seed=seed,
+            )
+            d = r.choices[0].message.parsed.model_dump()
+            d["_seed"] = seed
+            d["_attempts"] = attempt + 1
+            d["_tok_in"] = r.usage.prompt_tokens
+            d["_tok_out"] = r.usage.completion_tokens
+            return d
+        except Exception as e:                               # noqa: BLE001
+            last = str(e)[:200]
+            if attempt == MAX_ATTEMPTS - 1:
+                break
+            time.sleep(BACKOFF_BASE * (2 ** attempt) * (0.5 + random.random()))
+    return {"_seed": seed, "_error": last, "_attempts": MAX_ATTEMPTS}
 
 
 def score_doc(text: str, n: int | None = None) -> list[dict]:
@@ -147,6 +189,29 @@ def score_field(text: str, field: str = "financial_conditions_concern", n: int =
     """
     ok = [c[field] for c in score_doc(text, n) if "_error" not in c]
     return float(np.mean(ok)) if ok else float("nan")
+
+
+_embedder = None
+
+
+def semantic_spread(texts: list[str]) -> float:
+    """Mean pairwise cosine DISTANCE between the calls' rationales.
+
+    0 = every call gave the same reasoning. Larger = the calls reached their scores by
+    different routes. Runs locally on a sentence-transformer, so it costs nothing; the model
+    downloads (~90 MB) on first use.
+    """
+    texts = [t for t in texts if isinstance(t, str) and t.strip()]
+    if len(texts) < 3:
+        return float("nan")                  # too few to be meaningful; see the contract
+    global _embedder
+    if _embedder is None:
+        from sentence_transformers import SentenceTransformer
+        _embedder = SentenceTransformer(config.EMBEDDING_MODEL)
+    v = _embedder.encode(texts, normalize_embeddings=True)
+    sims = v @ v.T
+    iu = np.triu_indices(len(texts), k=1)
+    return float(1.0 - sims[iu].mean())
 
 
 def check_prompts_written() -> None:
@@ -179,6 +244,8 @@ def run() -> pd.DataFrame:
                 v = [c[fld] for c in ok]
                 row[fld] = float(np.mean(v)) if v else np.nan
                 row[f"{fld}_sd"] = float(np.std(v, ddof=1)) if len(v) > 1 else np.nan
+            row["embedding_spread"] = semantic_spread(
+                [c.get(RATIONALE_FIELD, "") for c in ok])
             rows.append(row)
             done += 1
             if done % 50 == 0:

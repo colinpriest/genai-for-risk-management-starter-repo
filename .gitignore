@@ -15,3 +15,8 @@ data/processed/*
 
 outputs/figures/*
 !outputs/figures/.gitkeep
+
+# The brief requires a FIXED copy of your market data so results reproduce. data/processed/ is
+# ignored, so the snapshot lives here and IS tracked.
+!data/snapshot/
+!data/snapshot/**

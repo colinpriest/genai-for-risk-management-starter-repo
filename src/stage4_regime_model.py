@@ -53,15 +53,28 @@ TEXT_FEATURES = ["financial_conditions_concern", "downside_risk_emphasis",
 NAMES_3 = {0: "low", 1: "medium", 2: "high"}
 
 
-def align(market: pd.DataFrame, scores: pd.DataFrame) -> pd.DataFrame:
-    """Scores are per meeting; market data is daily. Forward-fill from the meeting date.
+def align(market: pd.DataFrame, scores: pd.DataFrame,
+          lag_days: int | None = None) -> pd.DataFrame:
+    """Scores are per meeting; market data is daily. Forward-fill from the PUBLICATION date.
 
-    This assumes a reading holds until the next meeting. An announcement-day-only
+    LOOK-AHEAD WARNING. The minutes of a meeting are not published on the meeting day - the
+    RBA releases them about a fortnight later. Attaching a score to the meeting date gives
+    your model information nobody could have had at the time, and any predictive claim built
+    on it is invalid.
+
+    config.PUBLICATION_LAG_DAYS shifts each score to the date it could first have been read.
+    Set it to 0 only if you are making a RETROSPECTIVE (explanatory) claim, and say so.
+
+    This still assumes a reading holds until the next meeting. An announcement-day-only
     specification is defensible too - if you use it, say so in your report.
     """
+    lag = config.PUBLICATION_LAG_DAYS if lag_days is None else lag_days
     df = market.copy()
-    s = scores.set_index("meeting_date")
-    for c in [c for c in s.columns if not c.endswith("_sd") and c != "n_calls_valid"]:
+    s = scores.copy()
+    s["available_from"] = pd.to_datetime(s["meeting_date"]) + pd.Timedelta(days=lag)
+    s = s.set_index("available_from").sort_index()
+    for c in [c for c in s.columns
+              if not c.endswith("_sd") and c not in ("n_calls_valid", "meeting_date")]:
         df[c] = s[c].reindex(df.index, method="ffill")
     return df
 
@@ -132,13 +145,22 @@ def run() -> pd.DataFrame:
     X = df[TEXT_FEATURES].values
 
     print(f"  dependent variable: {config.REGIME_ENDOG}")
+    print(f"  publication lag   : {config.PUBLICATION_LAG_DAYS} days "
+          f"({'real-time' if config.PUBLICATION_LAG_DAYS else 'RETROSPECTIVE - look-ahead'})")
+    print("  regimes.parquet = WITH text; regimes_base.parquet = without")
     base4 = fit(endog, None, 4, "4 regimes, no text")
     text4 = fit(endog, X, 4, f"4 regimes + {len(TEXT_FEATURES)} text features")
     base3 = fit(endog, None, 3, "3 regimes, no text  (reference comparison)")
     text3 = fit(endog, X, 3, f"3 regimes + {len(TEXT_FEATURES)} text features")
 
-    out4, _ = order_and_label(base4, df, 4, config.REGIME_NAMES)
-    out3, _ = order_and_label(base3, df, 3, NAMES_3)
+    # The PRIMARY saved output is the model WITH the text features. Saving the no-text fit
+    # here would mean the dashboard, the explainability work and the scenarios all ran on a
+    # model that never saw your constructs - they would be decorative. Both are written so
+    # you can compare them, and comparing them is worth reporting.
+    out4, _ = order_and_label(text4, df, 4, config.REGIME_NAMES)
+    out3, _ = order_and_label(text3, df, 3, NAMES_3)
+    out4_base, _ = order_and_label(base4, df, 4, config.REGIME_NAMES)
+    out3_base, _ = order_and_label(base3, df, 3, NAMES_3)
 
     risk4 = per_regime_risk(df["ret"], out4["regime"], config.REGIME_NAMES)
     risk3 = per_regime_risk(df["ret"], out3["regime"], NAMES_3)
@@ -157,6 +179,10 @@ def run() -> pd.DataFrame:
     json.dump(summary, open(config.DATA_PROCESSED / "regime_summary.json", "w"), indent=2)
     out4.reset_index().to_parquet(config.DATA_PROCESSED / "regimes.parquet", index=False)
     out3.reset_index().to_parquet(config.DATA_PROCESSED / "regimes_3.parquet", index=False)
+    out4_base.reset_index().to_parquet(
+        config.DATA_PROCESSED / "regimes_base.parquet", index=False)
+    out3_base.reset_index().to_parquet(
+        config.DATA_PROCESSED / "regimes_3_base.parquet", index=False)
 
     print("\n  FOUR REGIMES (your Australian finding)")
     for k, v in risk4.items():

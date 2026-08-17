@@ -59,6 +59,12 @@ REGIME_NAMES = {0: "regime_0", 1: "regime_1", 2: "regime_2", 3: "regime_3"}
 #               which text cannot do. Text will appear useless. It is not; the spec is.
 REGIME_ENDOG = "log_rv"
 
+# Days between a meeting and the publication of its minutes. The RBA releases minutes about
+# a fortnight after the meeting, so a score attached to the meeting date is information
+# nobody had at the time. 14 keeps the model honest for a PREDICTIVE claim; 0 is only
+# defensible for a RETROSPECTIVE one, and you must say which you are making.
+PUBLICATION_LAG_DAYS = 14
+
 # --- Embeddings (local, no API cost) -----------------------------------------
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 

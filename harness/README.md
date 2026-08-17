@@ -1,7 +1,7 @@
 # Supplied harness — do not modify
 
 Tools for section 8.3 of the brief. **You run these and interpret the results.** Rebuilding them
-earns no marks; interpreting them earns most of the 15.
+earns no marks; interpreting them earns most of the 20 that section 8.3 carries.
 
 Both take *your* functions as arguments, so they work with whatever you build in stage 3.
 

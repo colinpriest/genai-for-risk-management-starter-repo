@@ -131,8 +131,10 @@ with ProcessPoolExecutor(max_workers=os.cpu_count() - 2) as ex:
     results = list(ex.map(one_bootstrap_draw, range(n_draws)))
 ```
 
-`stage5_uncertainty.py` already does this. **40 draws is enough for a 90% interval** — you
-do not need 1,000.
+**`stage5_uncertainty.py` does NOT do this — it is a stub, and writing the bootstrap is your
+job.** 40–60 draws is enough for a 90% interval; you do not need 1,000. Report how many draws
+converged against how many you requested, because a quietly-dropped third of them is itself a
+finding about model stability.
 
 ---
 
