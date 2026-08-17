@@ -49,14 +49,38 @@ def run() -> pd.DataFrame:
                          .rolling(21, min_periods=5).std() * np.sqrt(252))
 
     # --- macro / cross-asset context --------------------------------------
-    aud = _download("AUDUSD=X", config.MARKET_START)
-    if not aud.empty:
-        df["aud_ret"] = np.log(aud["Close"]).diff().reindex(df.index)
-        df["aud_vol_21"] = df["aud_ret"].rolling(21).std() * np.sqrt(252)
+    # =========================================================================================
+    # YOUR CHOICE: which Australian macro / cross-asset series belong in the model.
+    #
+    # Add tickers to config.MACRO_TICKERS and they appear here as <name>_ret and <name>_vol_21.
+    # Whatever you add must then be named in stage4.MACRO_FEATURES to actually enter the fit -
+    # a series that is downloaded but not listed there is decoration.
+    #
+    # Two things to think about, both of which are marked:
+    #   1. RELEASE TIMING. A daily market price is known the same day. An ABS statistic is not:
+    #      CPI is published weeks after the quarter it describes. config.MACRO_LAG_DAYS shifts
+    #      every macro series by that many days so the model only sees what was published.
+    #      Daily market series (FX, VIX, commodities) need no lag - set it per series if they
+    #      differ, and say what you did.
+    #   2. WHY THIS SERIES. "It was available" is not a reason. Australia is a commodity
+    #      exporter with a floating currency; argue from that.
+    # =========================================================================================
+    for name, ticker in config.MACRO_TICKERS.items():
+        s = _download(ticker, config.MARKET_START)
+        if s.empty:
+            print(f"  WARNING: {name} ({ticker}) returned nothing - excluded")
+            continue
+        px_s = s["Close"].reindex(df.index).ffill()
+        if config.MACRO_LAG_DAYS:
+            px_s = px_s.shift(config.MACRO_LAG_DAYS)
+        df[f"{name}"] = px_s
+        df[f"{name}_ret"] = np.log(px_s).diff()
+        df[f"{name}_vol_21"] = df[f"{name}_ret"].rolling(21, min_periods=5).std() * np.sqrt(252)
 
-    vix = _download("^VIX", config.MARKET_START)
-    if not vix.empty:
-        df["vix"] = vix["Close"].reindex(df.index).ffill()
+    # Kept under their original names because stage 4 and the dashboard refer to them.
+    if "aud" in config.MACRO_TICKERS:
+        df["aud_ret"] = df["aud_ret"]
+        df["aud_vol_21"] = df["aud_vol_21"]
 
     df = df.dropna(subset=["ret"])
     df.index.name = "date"

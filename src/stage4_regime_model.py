@@ -50,6 +50,19 @@ warnings.filterwarnings("ignore")
 TEXT_FEATURES = ["financial_conditions_concern", "downside_risk_emphasis",
                  "global_risk_salience", "vigilance", "uncertainty_language"]
 
+# YOUR CHOICE: which macro / cross-asset features enter the model, and why.
+# These come from stage1 (see config.MACRO_TICKERS). Leave the list empty to fit a text-only
+# model. Anything you list here must exist as a column in market_data.parquet.
+#
+# WARNING WORTH READING BEFORE YOU FILL THIS IN. Realised volatility features (rv_21, vix,
+# aud_vol_21) are extremely strong predictors of the volatility regime - far stronger than any
+# text construct. Including them will improve fit and will also swamp the text. That is a
+# legitimate model and a legitimate finding, but report the text's contribution WITH and
+# WITHOUT them, or you cannot say what the RBA language added.
+MACRO_FEATURES: list[str] = []
+
+ALL_FEATURES = TEXT_FEATURES + MACRO_FEATURES
+
 NAMES_3 = {0: "low", 1: "medium", 2: "high"}
 
 
@@ -139,19 +152,28 @@ def per_regime_risk(ret: pd.Series, regime: pd.Series, names: dict) -> dict:
 def run() -> pd.DataFrame:
     market = pd.read_parquet(config.DATA_PROCESSED / "market_data.parquet").set_index("date")
     scores = pd.read_parquet(config.DATA_PROCESSED / "riskvoice_scores.parquet")
-    df = align(market, scores).dropna(subset=["ret", "rv_21"] + TEXT_FEATURES)
+    missing = [c for c in MACRO_FEATURES if c not in market.columns]
+    if missing:
+        avail = sorted(c for c in market.columns if c != "close")
+        raise SystemExit(
+            f"\nMACRO_FEATURES names columns stage1 did not produce: {missing}\n"
+            f"Add the series to config.MACRO_TICKERS and re-run stage 1, or remove them here.\n"
+            f"Available: {avail}\n")
+    df = align(market, scores).dropna(subset=["ret", "rv_21"] + ALL_FEATURES)
 
     endog = np.log(df["rv_21"].values) if config.REGIME_ENDOG == "log_rv" else (df["ret"] * 100).values
-    X = df[TEXT_FEATURES].values
+    X = df[ALL_FEATURES].values
 
     print(f"  dependent variable: {config.REGIME_ENDOG}")
+    print(f"  features          : {len(TEXT_FEATURES)} text + {len(MACRO_FEATURES)} macro"
+          f"{' (text only)' if not MACRO_FEATURES else ''}")
     print(f"  publication lag   : {config.PUBLICATION_LAG_DAYS} days "
           f"({'real-time' if config.PUBLICATION_LAG_DAYS else 'RETROSPECTIVE - look-ahead'})")
     print("  regimes.parquet = WITH text; regimes_base.parquet = without")
     base4 = fit(endog, None, 4, "4 regimes, no text")
-    text4 = fit(endog, X, 4, f"4 regimes + {len(TEXT_FEATURES)} text features")
+    text4 = fit(endog, X, 4, f"4 regimes + {len(ALL_FEATURES)} features")
     base3 = fit(endog, None, 3, "3 regimes, no text  (reference comparison)")
-    text3 = fit(endog, X, 3, f"3 regimes + {len(TEXT_FEATURES)} text features")
+    text3 = fit(endog, X, 3, f"3 regimes + {len(ALL_FEATURES)} features")
 
     # The PRIMARY saved output is the model WITH the text features. Saving the no-text fit
     # here would mean the dashboard, the explainability work and the scenarios all ran on a
@@ -168,6 +190,7 @@ def run() -> pd.DataFrame:
     summary = {
         "endog": config.REGIME_ENDOG,
         "text_features": TEXT_FEATURES,
+        "macro_features": MACRO_FEATURES,
         "four_regimes": {"aic_no_text": float(base4.aic), "aic_with_text": float(text4.aic),
                          "text_gain": float(base4.aic - text4.aic), "risk": risk4},
         "three_regimes_for_reference_comparison": {

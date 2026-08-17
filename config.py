@@ -59,6 +59,25 @@ REGIME_NAMES = {0: "regime_0", 1: "regime_1", 2: "regime_2", 3: "regime_3"}
 #               which text cannot do. Text will appear useless. It is not; the spec is.
 REGIME_ENDOG = "log_rv"
 
+# --- Macro / cross-asset series ----------------------------------------------
+# YOURS TO CHOOSE. name -> yfinance ticker. These are downloaded by stage1 and become
+# <name>, <name>_ret and <name>_vol_21. To make one actually enter the model you must also
+# name it in stage4.MACRO_FEATURES.
+#
+# The three below are a starting point, not an answer. Australia is a commodity exporter with
+# a floating currency - argue from that when you decide what to add or drop.
+MACRO_TICKERS = {
+    "aud": "AUDUSD=X",       # trade-weighted proxy; falls when risk appetite falls
+    "vix": "^VIX",           # global risk appetite
+    "iron": "TIO=F",         # iron ore; Australia's largest single export
+}
+
+# Days to lag EVERY macro series, to respect publication timing. Daily market prices (FX,
+# VIX, futures) are known same-day and need 0. An ABS statistic is published weeks after the
+# period it describes, and using it unlagged is look-ahead. If you add a released statistic
+# rather than a market price, raise this and say so in your report.
+MACRO_LAG_DAYS = 0
+
 # Days between a meeting and the publication of its minutes. The RBA releases minutes about
 # a fortnight after the meeting, so a score attached to the meeting date is information
 # nobody had at the time. 14 keeps the model honest for a PREDICTIVE claim; 0 is only
