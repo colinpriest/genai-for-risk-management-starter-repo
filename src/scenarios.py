@@ -81,11 +81,12 @@ def predict_regime_under(feature_values: dict, horizon_days: int = 63) -> dict:
          log realised volatility for each regime.
       3. Propagate today's filtered regime distribution forward `horizon_days` using the
          fitted transition matrix.
-      4. Reweight those regime probabilities by how consistent each regime is with the
-         scenario-implied volatility level, and report the resulting distribution.
+      4. Report the predicted volatility against the same model at average feature values.
 
-    Returns predicted volatility, the regime distribution, and the lift over the unconditional
-    base rate for the most violent regime.
+    The scenario acts on the CONDITIONAL MEAN within each regime, not on the regime
+    probabilities themselves, so the returned regime distribution is the transition matrix
+    propagated forward and is the same for every scenario. Do not present it as a
+    scenario-specific probability - see the note further down.
     """
     import numpy as np
     import pandas as pd
@@ -135,13 +136,26 @@ def predict_regime_under(feature_values: dict, horizon_days: int = 63) -> dict:
         p_h = P @ p_h
     p_h = p_h / p_h.sum()
 
-    # Reweight by how consistent each regime is with the scenario-implied level.
-    y_star = float(np.average(mu, weights=p_h))
-    lik = np.exp(-0.5 * ((y_star - mu) / np.maximum(sigma, 1e-9)) ** 2)
-    post = p_h * lik
-    post = post / post.sum() if post.sum() > 0 else p_h
+    # WHAT NOT TO DO HERE. An earlier version derived a scenario-implied volatility from the
+    # regime means, then reweighted the regimes by how close each mean was to that value. That
+    # is circular - the weights come from the thing they are supposed to explain - and it
+    # produced P(worst regime) of 99-100% for every scenario, which is not a finding, it is an
+    # artefact. If a scenario tool reports near-certainty for everything, suspect the maths.
+    #
+    # What the model can honestly say: the regime distribution comes from the transition
+    # matrix, and the scenario shifts the CONDITIONAL MEAN within each regime. So report the
+    # predicted volatility under the scenario against the same quantity at baseline features,
+    # and leave the regime distribution as the transition matrix gives it.
+    y_star = float(mu @ p_h)
+    mu_base = np.array([pmap.get(f"const[{r}]", pmap.get("const", 0.0))
+                        + np.array([pmap.get(f"x{i+1}[{r}]", 0.0)
+                                    for i in range(len(ALL_FEATURES))]) @ X.mean(axis=0)
+                        for r in range(k)])
+    y_base = float(mu_base @ p_h)
 
     ann_vol = float(np.exp(y_star)) if config.REGIME_ENDOG == "log_rv" else float("nan")
+    ann_vol_base = float(np.exp(y_base)) if config.REGIME_ENDOG == "log_rv" else float("nan")
+    post = p_h
     names = [config.REGIME_NAMES[i] for i in range(k)]
     base_worst = float((df.index.size and
                         (pd.read_parquet(config.DATA_PROCESSED / "regimes.parquet")["regime"]
@@ -150,12 +164,18 @@ def predict_regime_under(feature_values: dict, horizon_days: int = 63) -> dict:
         "horizon_days": horizon_days,
         "feature_values": feature_values,
         "predicted_ann_vol": ann_vol,
-        "regime_probabilities": dict(zip(names, [float(v) for v in post])),
+        "baseline_ann_vol": ann_vol_base,
+        "vol_multiple_vs_baseline": (float(ann_vol / ann_vol_base)
+                                     if ann_vol_base else float("nan")),
+        "regime_probabilities_from_transition_matrix": dict(
+            zip(names, [float(v) for v in post])),
         "p_worst_regime": float(post[-1]),
         "p_worst_unconditional": base_worst,
-        "lift_vs_base": float(post[-1] / max(base_worst, 1e-9)),
-        "note": "Predicted from the fitted model under scenario feature values, not from an "
-                "assumed severity multiplier.",
+        "note": ("Volatility predicted from the fitted model under your scenario's feature "
+                 "values, against the same model at average features. The regime distribution "
+                 "is the transition matrix propagated forward and does NOT depend on the "
+                 "scenario - the scenario acts on the conditional mean, not on the regime "
+                 "probabilities. Do not present it as a scenario-specific probability."),
     }
 
 
