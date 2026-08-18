@@ -103,3 +103,43 @@ def test_scenario_output_filename_is_consistent():
             offenders.append(p.name)
     assert not offenders, (
         f"{offenders} refer to scenarios.json; the agreed filename is scenarios_final.json")
+
+
+def test_rolling_origin_eval_accepts_custom_arms():
+    """rolling_origin_eval must work with ANY arm names, not just the default three.
+
+    THE BUG THIS CATCHES. The summary block counted scored folds with
+    folds["text_and_macro"], an arm name that only exists in the default set. ablation_oos()
+    supplies its own arms ("full", "without_vix", ...), so the KeyError fired AFTER every
+    refit had completed - a forty-minute run destroyed by a dictionary lookup on the last
+    line. Fitting is slow enough that this has to be caught by a test, not by a run.
+
+    Deliberately tiny: two regimes, two folds, one exogenous column, the smallest search
+    budget that fits. This tests the plumbing, not the modelling.
+    """
+    import numpy as np
+    import pandas as pd
+    from src import stage4_regime_model as s4
+
+    rng = np.random.default_rng(0)
+    n = 400
+    # Two-state volatility series with an exogenous column that tracks the state, so the
+    # optimiser has something to find and converges quickly.
+    state = (np.arange(n) // 100) % 2
+    x = state + 0.30 * rng.standard_normal(n)
+    ret = (0.004 + 0.012 * state) * rng.standard_normal(n)
+    df = pd.DataFrame({"ret": ret,
+                       "rv_21": np.exp(-3.4 + 0.9 * state + 0.05 * rng.standard_normal(n)),
+                       "x": x})
+
+    budget = dict(em_starts=[dict(em_iter=5, search_reps=0, maxiter=60)], n_perturbed=0)
+    out = s4.rolling_origin_eval(
+        df, ["x"], k=2, n_folds=2, arms={"full": ["x"], "no_x": None},
+        require_all_arms=False, fit_kwargs=budget)
+
+    assert out["reference_arm"] == "full"
+    assert set(out["mean_score"]) == {"full", "no_x"}
+    assert set(out["per_fold"]) >= {"full", "no_x", "persistence"}
+    assert isinstance(out["n_folds_scored"], int)
+    # Gains are only defined for arms that exist; the default gain labels must not appear.
+    assert "text_gain_conditional_on_macro" not in out["gains"]

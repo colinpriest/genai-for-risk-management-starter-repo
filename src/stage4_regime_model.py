@@ -106,10 +106,15 @@ EM_STARTS = [dict(em_iter=n, search_reps=0, maxiter=m)
 N_PERTURBED_STARTS = 6          # seeded perturbations of the best EM solution
 PERTURB_SCALE = 0.25            # relative sd of the perturbation
 
-# REDUCED budget for the out-of-sample fold fits and the ablation refits. Those run dozens of
-# times and the full budget makes stage 4 take over an hour. The fold fits are shorter
-# samples and start more easily; the cost of the smaller budget is a slightly noisier held-out
-# score, which is visible in per_fold rather than hidden.
+# REDUCED budget for the out-of-sample fold fits and the ablation refits, WITH ESCALATION.
+# Those refits run dozens of times and the full budget makes stage 4 take over an hour, so
+# they start cheap - but a fold is only usable if every arm converges on it, and the first
+# version of this simply lost folds when a cheap fit failed. Losing a quarter of the evidence
+# to save a few minutes is the wrong trade.
+#
+# fit_escalating() therefore tries the cheap budget and, ONLY if it fails, retries that fit at
+# the full budget before giving up. The cost is paid where it is actually needed instead of
+# uniformly.
 OOS_EM_STARTS = EM_STARTS[:3]
 OOS_N_PERTURBED = 3
 
@@ -265,6 +270,27 @@ def fit(y, exog, k, label, require_converged: bool = True,
     res._llf_spread = spread           # how rugged the surface was at this specification
     res._n_converged = len(converged)
     return res
+
+
+def fit_escalating(y, exog, k, label, em_starts=None, n_perturbed=None, **kw):
+    """fit() at the reduced budget, retried at the full budget if nothing converges.
+
+    Used by every routine that refits many times - the out-of-sample folds, the leave-one-out
+    ablation, the permutation baselines. A failure here is not cheap: an arm that does not
+    converge on a fold costs that fold for EVERY arm, because an unpaired fold cannot be
+    compared. Spending the full search budget on the handful of fits that need it is far
+    cheaper than losing a quarter of the folds.
+    """
+    em_starts = OOS_EM_STARTS if em_starts is None else em_starts
+    n_perturbed = OOS_N_PERTURBED if n_perturbed is None else n_perturbed
+    already_full = (em_starts is EM_STARTS or len(em_starts) >= len(EM_STARTS))
+    try:
+        return fit(y, exog, k, label, em_starts=em_starts, n_perturbed=n_perturbed, **kw)
+    except Exception as e:                                   # noqa: BLE001
+        if already_full:
+            raise
+        print(f"      {label}: reduced budget failed ({str(e)[:50]}), retrying at full budget")
+        return fit(y, exog, k, f"{label} [full budget]", **kw)
 
 
 def order_and_label(res, df, k, names):
@@ -482,8 +508,7 @@ def rolling_origin_eval(df: pd.DataFrame, features: list[str], k: int,
         "text_only": text_cols or None,
         "intercept_only": None,
     }
-    fk = dict(em_starts=OOS_EM_STARTS, n_perturbed=OOS_N_PERTURBED)
-    fk.update(fit_kwargs or {})
+    fk = dict(fit_kwargs or {})
     n = len(endog_all)
     start = int(n * min_train)
     edges = np.linspace(start, n, n_folds + 1).astype(int)
@@ -518,8 +543,9 @@ def rolling_origin_eval(df: pd.DataFrame, features: list[str], k: int,
                 # require_converged=True. A non-converged fit has parameters, produces a
                 # score, and that score is not evidence. The previous version explicitly
                 # allowed them, so a fold could be won by an optimiser failure.
-                r = fit(endog_all[:tr_end], None if X is None else X[:tr_end], k,
-                        f"OOS fold {i+1} {label}", require_converged=True, **fk)
+                r = fit_escalating(endog_all[:tr_end], None if X is None else X[:tr_end],
+                                   k, f"OOS fold {i+1} {label}", require_converged=True,
+                                   **fk)
                 n_feat = 0 if X is None else X.shape[1]
                 mu, beta, sig = unscaled_params(r, k, n_feat)
                 if X is not None:
@@ -549,6 +575,8 @@ def rolling_origin_eval(df: pd.DataFrame, features: list[str], k: int,
         for label in ARMS:
             folds[label].append(fold_scores[label] if keep else None)
 
+    ref = next(iter(ARMS))
+
     def _mean(v):
         good = [x for x in v if x is not None]
         return float(np.mean(good)) if good else None
@@ -572,9 +600,11 @@ def rolling_origin_eval(df: pd.DataFrame, features: list[str], k: int,
         "persistence_baseline": _mean(folds["persistence"]),
         "features_in_each_arm": {name: (cols or []) for name, cols in ARMS.items()},
         "n_folds_attempted": n_folds,
-        "n_folds_scored": len([x for x in folds["text_and_macro"] if x is not None]),
-        "n_folds_rejected_not_converged": len([x for x in folds["text_and_macro"]
-                                               if x is None]),
+        # Counted on the FIRST arm, whatever it is called - hardcoding an arm name here
+        # broke every caller that supplies its own arms.
+        "reference_arm": ref,
+        "n_folds_scored": len([x for x in folds[ref] if x is not None]),
+        "n_folds_rejected_not_converged": len([x for x in folds[ref] if x is None]),
         "train_test_gap_days": FOLD_GAP_DAYS,
     }
 
@@ -658,9 +688,8 @@ def permutation_importance(df: pd.DataFrame, features: list[str], k: int,
         if te_end - te_start < 40:
             continue
         try:
-            r = fit(endog_all[:tr_end], X_all[:tr_end], k, f"permutation fold {i+1}",
-                    require_converged=True, em_starts=OOS_EM_STARTS,
-                    n_perturbed=OOS_N_PERTURBED)
+            r = fit_escalating(endog_all[:tr_end], X_all[:tr_end], k,
+                               f"permutation fold {i+1}", require_converged=True)
         except Exception as e:                               # noqa: BLE001
             print(f"      permutation fold {i+1} rejected: {str(e)[:70]}")
             continue
@@ -825,12 +854,24 @@ def ablation_oos(df: pd.DataFrame, features: list[str], k: int,
         arms[f"without_{f}"] = [c for c in features if c != f] or None
 
     print(f"    leave-one-out ablation: {len(features)} features x {n_folds} folds "
-          f"= {len(features) * n_folds} refits")
+          f"= {len(features) * n_folds} refits at the FULL search budget - this is the "
+          f"slowest step in the pipeline")
     # require_all_arms=False: with a dozen arms, insisting that every one converges on every
     # fold would throw away folds wholesale. Pairing is still exact - each feature's cost is
     # averaged only over folds where BOTH that arm and the full model scored.
+    # FULL SEARCH BUDGET, not the reduced one the headline folds use. The reduced budget
+    # produced fits that converged on only one start in six, and the result was incoherent:
+    # on one fold a model with a feature REMOVED reached a higher training log-likelihood
+    # than the full model. For nested models on one sample that is impossible at the optimum,
+    # so it is proof the full model landed in a bad mode - and every ablation cost computed
+    # against it would have been noise with a confident sign.
+    #
+    # Per-feature effects are the smallest quantities in this pipeline. They are exactly where
+    # a cheap optimiser search cannot be afforded.
     ev = rolling_origin_eval(df, features, k, n_folds=n_folds, arms=arms,
-                             require_all_arms=False)
+                             require_all_arms=False,
+                             fit_kwargs=dict(em_starts=EM_STARTS,
+                                             n_perturbed=N_PERTURBED_STARTS))
 
     per_fold = ev["per_fold"]
     full = per_fold["full"]

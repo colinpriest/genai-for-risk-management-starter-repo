@@ -183,6 +183,12 @@ written, your regimes are named, and your blind agreement labels exist.
 
 **Supplied:** `data/raw/rba-minutes/` — 211 RBA minutes, 3 Oct 2006 to 16 Jun 2026.
 
+**Stage 4 takes 40–60 minutes.** No API calls, so it costs nothing, but it fits the regime model
+dozens of times from multiple starting values: the four nested specifications, four arms across
+four out-of-sample folds, and a leave-one-out refit per feature. That search is not optional — the
+likelihood is multimodal, and a single-start fit changes its answer between runs. Run it once and
+leave it; every later stage reads its saved output rather than refitting.
+
 > **Source: Reserve Bank of Australia.** Licensed **CC BY 4.0**. You must attribute the RBA in your
 > report and on any chart built from this corpus — see [DATA-LICENCE.md](DATA-LICENCE.md) for the
 > exact wording and for two exclusions that apply to ABS data and the Cash Rate.
