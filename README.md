@@ -1,217 +1,194 @@
-# RBA Volatility Regime Detection — Starter Repository
+# RISK5110 Group Assignment — starter repository
 
-RISK5110 group assignment. Adapt the US reference implementation to Australian data.
+> **The question:** how should GenAI output be generated, tested, grounded, challenged and
+> overruled in a consequential analytical workflow?
 
-**Reference:** https://github.com/colinpriest/financial-market-volatility-regime-detection
+The case study is Australian monetary policy — can we tell whether the RBA is moving into an
+easing, stable or hardening phase, and what would the Board do about a shock that has never
+happened? **You are marked on what you checked, not on what the models produced.**
 
----
-
-## Why this looks different from the reference
-
-The reference is a single 147 KB Python file. That works for one author and fails badly for a team
-of four — every merge is a conflict and nobody owns anything.
-
-This starter has the **same stage order** as the reference, split into one module per stage so
-each stage has an owner and a defined hand-over.
-
-**The methods are not all unchanged.** Three things differ deliberately, and section 1 of the
-brief explains each: five risk-voice constructs instead of one sentiment score, log realised
-volatility instead of returns as the dependent variable, and a fourth uncertainty layer from
-human agreement. The regime count and the Markov-switching approach itself are unchanged.
-
-| Reference | Here |
-|---|---|
-| `financial_regime_detection.py` (all stages) | `src/stage1..stage5` |
-| `.cache/fomc_minutes_*.txt` | `data/raw/rba-minutes/*.html` |
-| `dashboard.html` | `outputs/dashboard.html` |
-
----
-
-## What is pre-built, and what is yours
-
-The Australian customisations are done for you. Your effort should go into judgement and design,
-not into re-deriving plumbing.
-
-| Pre-built and working | Yours |
-|---|---|
-| ASX 200 + macro download, volatility features (`stage1`) | Which macro series (`config.MACRO_TICKERS`) and **which of them enter the model** (`stage4.MACRO_FEATURES`) |
-| RBA HTML parsing, chunking, retrieval (`stage2`) | **The retrieval query** — which parts of a document matter |
-| Parallel calling, retries, raw saving, averaging (`stage3`) | **The prompts.** All six field descriptions are blank |
-| Best-converged fitting, regime ordering, risk metrics, coefficients, transitions, rolling-origin out-of-sample (`stage4`) | Which features to include; interpreting the dependent-variable comparison |
-| — | **`stage5` is a stub.** All three uncertainty layers are yours: block bootstrap, specification ensemble, LLM spread. Traps 1, 4 and 6 all bite here. |
-| Perturbation + faithfulness harness, patterns verified against the RBA corpus | Running it and interpreting the result |
-
-**Read `TRAPS.md` first.** Six issues that cost hours and teach nothing, with fixes.
-
-## Two decisions already made for you, and why
-
-**Three regimes, the same as the reference.** Three reasons, in order of weight:
-
-1. **Comparability.** Regime shares are not comparable across different regime counts, and
-   section 4 of the brief asks you to compare your results against the reference program's.
-   Holding the count equal removes a confound you would otherwise have to argue around.
-2. **Convergence.** The three-regime model fits reliably from nearly every optimiser start
-   in stage 4. The four-regime model does not, and the starts that do converge land on
-   visibly different optima. You run this once, so a fit that depends on which start it drew
-   is not something you can report.
-3. **Interpretability.** Three states map onto something a risk committee can act on. A fourth
-   tends to split one of them rather than reveal a new one.
-
-A fourth regime fits the training data more closely, and you may fit it as an extension.
-Note that it also *competes* with the text — extra regimes absorb variation the constructs
-would otherwise explain — but that is a consequence of the choice, not the reason for it.
-See `config.py`.
-
-`REGIME_NAMES` ships as neutral placeholders: naming the regimes is your work, done after you
-have fitted and inspected them.
-
-**Reproducibility here is best-effort.** A fixed seed makes a rerun today close, but the
-provider can change model weights or routing without notice, so a rerun months later can differ
-with the same seed. The saved raw responses under `data/processed/llm_raw/<fingerprint>/` are
-the only record that cannot change underneath you — keep them.
-
-**Sampling temperature is 1.0, not 0.** The parallel calls exist to measure how much the model
-disagrees with itself. At temperature 0 they come back identical and that measurement is
-meaningless. Each call uses a different fixed seed, so runs still reproduce.
+Read **the assignment brief on Moodle** first — if you received this repository on its
+own, the relative link that used to sit here does not resolve — then [TRAPS.md](TRAPS.md)
+before you write any code.
 
 ## Setup
 
-**Python 3.12.** Other versions may work; 3.12 is what this was tested on.
-
-**Windows (PowerShell or Git Bash):**
-
 ```bash
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-copy .env.example .env
-python run_pipeline.py --check
+pip install -r requirements.txt -c constraints.txt
 ```
 
-**macOS / Linux:**
-
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
 cp .env.example .env
-python run_pipeline.py --check
 ```
 
-Then put your API key in `.env`. `--check` verifies setup and makes no API calls.
-
-**Your API key goes in `.env`, which is git-ignored. Never commit it.**
-Run `python run_pipeline.py --check` before your first commit — it will tell you if a key is
-about to be exposed.
-
----
-
-## Layout
-
-```
-config.py              Shared settings. Paths, model name, corpus window.
-run_pipeline.py        Phases: --all --core --calibration --scenarios --stakeholders
-                       --dashboard --stage N --check. Start here to see the flow.
-
-src/
-  stage1_market_data.py    ASX 200 + macro indicators        OWNER: ?
-  stage2_documents.py      RBA minutes + retrieval           OWNER: ?
-  stage3_riskvoice.py      10 parallel calls -> 5 constructs OWNER: ?
-  stage4_regime_model.py   3-regime Markov switching          OWNER: ?
-  stage5_uncertainty.py    3 uncertainty layers   *** STUB *** OWNER: ?
-  dashboard.py             Plotly output                     OWNER: ?
-  scenarios.py             Geopolitical scenarios            SHARED
-
-harness/                 SUPPLIED - DO NOT MODIFY
-  perturbation.py          Text perturbation experiments
-  faithfulness.py          Does the model's stated reason drive its behaviour?
-
-contracts/               One file per hand-over between stages
-tests/                   test_contracts.py checks stage outputs match their contracts
-data/raw/rba-minutes/    211 RBA minutes, Oct 2006 - Jun 2026 (supplied)
-data/processed/          Stage outputs. Git-ignored except .gitkeep.
-outputs/                 dashboard.html and figures
-```
-
-**Put your name in the `OWNER:` line at the top of your stage file.** It is the first thing marked.
-
----
-
-## The harness is supplied — run it, do not rebuild it
-
-`harness/` contains the perturbation and faithfulness tools for section 8.3 of the brief. You run
-them and interpret the results. Rebuilding them is not worth marks; interpreting them is.
-
-Both take **your** functions as arguments, so they work with whatever you build in stage 3:
-
-```python
-from harness.perturbation import perturbation_sweep
-from harness.faithfulness import faithfulness_test
-
-from src.stage3_riskvoice import score_field
-
-# score_field averages several calls, which trap 5 requires - a single call is too noisy
-scorer = lambda t: score_field(t, "financial_conditions_concern", n=5)
-
-result = perturbation_sweep(score_fn=scorer, text=doc, edits=DEFAULT_EDITS)
-fx     = faithfulness_test(score_fn=scorer, explain_fn=my_explainer, text=doc)
-```
-
----
-
-## Interface contracts
-
-`contracts/` holds one markdown file per hand-over. Agree them in Week 2 and commit them **before**
-you write the code they describe.
-
-`tests/test_contracts.py` turns each contract into a test. A prose contract gets violated silently;
-a tested one fails at the boundary and names the stage that broke it.
+Two commands prove your environment is correct. Neither needs an API key.
 
 ```bash
-pytest tests/                 # development: missing outputs SKIP
-pytest tests/ --submission    # before you submit: missing outputs FAIL
+python src/cycle_model.py --show
 ```
 
-**Run `pytest tests/ --submission` before you hand in.** In development mode a missing stage
-output is skipped, so an almost-empty repository reports "all tests passed". Submission mode
-turns every missing required artefact into a failure, and also checks that your prompts are
-written, your regimes are named, and your blind agreement labels exist.
+That opens the supplied model card. It should print a label-embargoed accuracy of **0.570**
+against a `current_decision` baseline of **0.656** — and say, in as many words, that the model
+does not beat it. That is not a broken install. **It is the Cycle stage's subject matter**, and
+the same summary prints the leaky 0.805 the model scores when the embargo is removed, so you
+can see exactly what the difference is made of. It reads artefacts that ship with this
+repository, so it works before you have built anything.
 
----
+```bash
+python src/data_panel.py
+```
+
+That should print 211 meetings and both target distributions, and takes about ten seconds.
+If it does, every data-plumbing problem in this assignment is already solved for you.
+
+Then run the contract tests:
+
+```bash
+python -m pytest tests/ -q
+```
+
+There is also a slower end-to-end check that copies the repository somewhere clean and runs
+it from scratch. Worth running once before you submit:
+
+```bash
+python -m pytest tests/test_clean_checkout.py -q -m clean_install
+```
+
+That suite **passes on this untouched starter by design** — it proves the environment, not
+your work. The repository-and-pipeline completeness check — run it before you submit; it
+verifies everything that lives in the repository, and only that (the transcript, AI-use
+log, presentation and peer form are submitted separately):
+
+```bash
+python -m pytest tests/test_submission.py -q -m submission
+```
+
+Every failure names a missing piece; it needs no API key, because the committed caches and
+artefacts are the submission.
+
+## What is already built
+
+| File | What it gives you |
+|---|---|
+| `src/data_rates.py` | RBA A2/F1/F2 — the decision series and the daily rates panel |
+| `src/data_macro.py` | CPI, expectations, labour, GDP, activity, geopolitical risk — publication-lagged |
+| `src/data_panel.py` | Meeting calendar, both targets, the tiered panel |
+| `src/model_card.py` | The frozen cycle model: importances with intervals, partial dependences (tables **and** plots), regime probabilities, plus the construct-free model Shock loads |
+| `src/evaluation.py` | Rolling origin **with a label-availability embargo**, scoring, four baselines |
+| `src/attribution.py` | Permutation importance on held-out data, staleness-cost refit |
+| `src/causal_tests.py` | Lead–lag, reverse regression, conditioning, sub-period stability |
+| `src/nshot.py` | Four shot-selection strategies, with three leakage checks that raise |
+| `src/context_docs.py` | Loads the Shock context documents you download; retrieves passages with page citations |
+| `src/channels.py` | Nine-channel taxonomy and the measured shock calibration table |
+| `src/scenario_engine.py` | `Branch`/`Tree` records, shock adjudication, support checking, sensitivity |
+
+Rewriting these earns no marks.
+
+## What you write
+
+**Across the whole assignment you supply four kinds of thing: LLM prompts, model and
+strategy choices, adjudications, and interpretation.** Everything else is built.
+
+| File | Stage | What is blank |
+|---|---|---|
+| `src/cycle_model.py` | Cycle | The causal claims and your verdicts |
+| `src/text_features.py` | Words | The system prompt and **four of the seven** construct rubrics |
+| `src/decision_replay.py` | Replay | The two prompts, the meeting, k, the strategy, **`CLAIM_REVIEWS`** and `run()` |
+| `src/scenarios.py` | Shock | The four prompts, `PROXY_JUDGEMENTS`, `COHERENCE`, `PATHWAY_ADJUDICATIONS`, **`CHANNEL_REVIEWS`** (see below), **`DIRECTION_WEIGHTS`** and their reasons, **`ADVERSARIAL_RESPONSES`**, `EXPECTED_PROFILES` and `run()` |
+
+Stubs raise `NotImplementedError`. `text_features.py` and `scenarios.py` additionally refuse
+to run until their prompts are written, so you cannot spend API credit on placeholders.
+
+Three of the seven Words rubrics are **supplied as locked exemplars**, one per scale type.
+They are hash-checked and the run aborts if they are edited. If you believe one is genuinely
+defective on your data, report it — a versioned replacement will be issued.
+
+## Before Shock
+
+`data/raw/context/` is **empty and you fill it** — several Shock sources are free to read but
+not redistributable, so the course cannot ship them. Download at least three, from at least
+three organisations, then:
+
+```bash
+python src/context_docs.py
+```
+
+The code does not look for particular filenames. It reads whatever supported files are in the
+folder, and tags every retrieved passage with its source file and page so your citations can
+be checked. See [`data/raw/context/README.md`](data/raw/context/README.md).
+
+## The channel review, which is most of the Shock stage
+
+A channel makes two claims and they are evidenced differently. The **global** leg — the
+scenario causes some world effect — can rest on a retrieved passage. The **Australian** leg —
+that world effect reaches an Australian proxy and then the Board — cannot: these are global
+risk reports and they contain almost nothing about Australian monetary transmission. **Both
+legs are required before a channel may move a number**, and where the scenario narrative
+itself stipulates the world effect you record `global_verdict: "scenario_fact"` rather than
+inventing a citation for a premise you were handed.
+
+You review **mechanism groups**, keyed `channel_type | direction | horizon | proxy`, not
+individual branches — and each verdict names the ONE **canonical** branch it binds; the
+code bars the rest as restatements. Where the scenario narrative itself stipulates the
+world effect, cite a **registered fact id** from `SCENARIO_FACTS` — verified verbatim
+against the narrative, so the fact is always real — **and write its `fact_link_reason`**,
+your signed sentence on why that fact supports this claim; the machine checks provenance,
+a person signs entailment, and the run blocks without both. To find the groups
+for the ASSESSED scenarios:
+
+```bash
+python src/scenarios.py --discover
+```
+
+It runs both assessed scenarios with the review requirements off, stops before any number,
+prints every group key and the required pruning audit, and writes
+`outputs/channel_reviews.template.json` with each member branch's citation and quotation
+inline. (`--worked` demonstrates the same workflow on the unassessed migration scenario —
+it cannot produce the assessed keys.) Read the pages the branches cite, then enter the
+completed records — the recommended route is the JSON files (copy the template to
+`data/processed/channel_reviews.json` and fill it in place; pruning audits go in
+`data/processed/pruning_reviews.json`), with the `CHANNEL_REVIEWS`/`PRUNING_REVIEWS`
+Python dicts as a supported alternative — and rerun. The full field list and a
+complete example sit above the SUPPLIED line in `src/scenarios.py`.
+
+## Four rules
+
+**1. Every accuracy claim must come through `evaluation.rolling_origin()`.** A random split
+or k-fold leaks the future into the past on this data, and costs **20 marks**.
+
+The model card and the Shock model are both fitted on the **129 meetings whose labels had
+resolved by 2018-12-31**, not on the full sample — a partial dependence has no out-of-sample
+analogue, and a scenario has no date to roll forward from, so neither is a rolling-origin
+object. Using them as designed is correct. Quoting either *as evidence of predictive skill*
+is what the gate is for.
+
+**2. Never shock a policy-outcome variable.** The cash rate, the decision and the trailing
+rate-change measures *are* the policy stance. A channel whose proxy is `cash_rate` asserts
+its own conclusion, and the model will agree with it. `scenario_engine` refuses them.
+
+**3. Say which starting state you shocked.** The model's unshocked probability at the last
+meeting is 0.93 on easing, which leaves 0.07 for any shock to move. `BASE_ROWS` ships with two
+declared starting states and every scenario is reported from both — a shock that looks
+negligible from one can move the model two-thirds of the way across the space from the other.
+
+**4. Out of support, the model says nothing at all — and "in support" is calibrated.** Support
+is judged against the 129 meetings the model was fitted on, at the 99th percentile of how
+unusual a REAL unseen meeting is on both a marginal and a joint test. An absolute "any variable
+outside its range" rule would fail all 82 held-out meetings, so it measures nothing. When a
+shocked row leaves the range the
+model was fitted on, `run_scenario()` returns `model_verdict = "out_of_support"` with **no
+probability and no direction** — the argmax of an extrapolated distribution is not a verdict
+either. What remains sayable comes from `channel_direction()`, which tallies your own
+adjudicated channels and is labelled as such wherever it appears. Nothing is clipped to make
+it quotable; clipping would hide the one fact that matters.
+
+"The model cannot speak here, and here is why" is a complete answer and is marked as one — as
+is "the model moved, but only these channels could have moved it", which `responsiveness()`
+tells you.
 
 ## Data
 
-**Supplied:** `data/raw/rba-minutes/` — 211 RBA minutes, 3 Oct 2006 to 16 Jun 2026.
-
-**Stage 4 takes 40–60 minutes.** No API calls, so it costs nothing, but it fits the regime model
-dozens of times from multiple starting values: the four nested specifications, four arms across
-four out-of-sample folds, and a leave-one-out refit per feature. That search is not optional — the
-likelihood is multimodal, and a single-start fit changes its answer between runs. Run it once and
-leave it; every later stage reads its saved output rather than refitting.
-
-> **Source: Reserve Bank of Australia.** Licensed **CC BY 4.0**. You must attribute the RBA in your
-> report and on any chart built from this corpus — see [DATA-LICENCE.md](DATA-LICENCE.md) for the
-> exact wording and for two exclusions that apply to ABS data and the Cash Rate.
-
-**Supplied:** `data/raw/geopolitical/` — GPR index (Caldara & Iacoviello).
-
-**You collect:** ASX 200 via yfinance, and Australian macro indicators of your choosing.
-
----
-
-## Before you commit
-
-- [ ] `.env` is not staged — `python run_pipeline.py --check` verifies this properly
-- [ ] Raw API responses saved under `data/processed/llm_raw/<prompt-fingerprint>/`
-- [ ] Temperature and seed recorded in `config.py`
-- [ ] `pytest tests/` passes
-- [ ] Your name is in the `OWNER:` line of your stage
-
-## Before you SUBMIT
-
-- [ ] `pytest tests/ --submission` passes
-- [ ] Regimes renamed from `regime_0` … in `config.py`
-- [ ] Fixed market-data copy committed under `data/snapshot/`
-- [ ] Blind agreement labels committed under `data/processed/agreement/`
-- [ ] You have said whether your model is retrospective or predictive
-      (`config.PUBLICATION_LAG_DAYS`)
+Reserve Bank of Australia statistical tables (CC BY 4.0) in `data/raw/`, 211 parsed RBA
+minutes, and the Caldara–Iacoviello geopolitical risk index. Attribute RBA material as
+*Source: Reserve Bank of Australia [year]*. Everything the pipeline needs is vendored here —
+no external paths, no sibling directories.

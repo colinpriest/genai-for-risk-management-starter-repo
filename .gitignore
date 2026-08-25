@@ -1,35 +1,43 @@
 .env
-.venv/
 __pycache__/
 *.pyc
-.ipynb_checkpoints/
-
-# Stage outputs are regenerated; do not commit them
-data/interim/*
-data/processed/*
-!data/**/.gitkeep
-
-# EXCEPTION: raw LLM responses MUST be committed for reproducibility
-!data/processed/llm_raw/
-!data/processed/llm_raw/**
-
-# EXCEPTION: the human agreement labels are EVIDENCE, not regenerable output. The blind
-# labels and their commit timestamps are what prove the labelling was done before anyone saw
-# the model's scores - section 8.2 Part B. Without this exception the rule above silently
-# ignores them, `git add` reports nothing, and the evidence never reaches the repository.
-!data/processed/agreement/
-!data/processed/agreement/**
-
-outputs/figures/*
-!outputs/figures/.gitkeep
-
-# The brief requires a FIXED copy of your market data so results reproduce. data/processed/ is
-# ignored, so the snapshot lives here and IS tracked.
-!data/snapshot/
-!data/snapshot/**
-
-# Windows Explorer / macOS / pytest droppings - never part of a submission
-desktop.ini
-.DS_Store
-Thumbs.db
 .pytest_cache/
+desktop.ini
+
+# Derived intermediates — rebuilt by `python src/data_panel.py`
+data/processed/decisions.parquet
+data/processed/macro_asof.parquet
+data/processed/rates_daily.parquet
+data/processed/panel.parquet
+data/processed/tiers.json
+
+# Shock context documents: each team downloads its own; not redistributable. The
+# MANIFEST you write about them is required evidence and MUST be committed - an earlier
+# rule ignored the whole folder, so a team could pass the submission check locally and
+# push a repository with sources.json silently missing.
+data/raw/context/*
+!data/raw/context/README.md
+!data/raw/context/sources.json.template
+!data/raw/context/sources.json
+
+# Everything below is REQUIRED and must be committed.
+# The supplied frozen Cycle model card:
+!data/processed/panel_frozen.parquet
+!data/processed/tiers_frozen.json
+!outputs/model_card/**
+# Your own submitted evidence. The three raw-call directories are where every API
+# response is cached, so a marker can reproduce your numbers without a key:
+!data/processed/llm_raw/**
+# Envelopes from superseded prompt versions: provenance only, not the run the
+# report describes. Keep them locally, do not ship them.
+data/processed/llm_raw/_superseded/**
+!data/processed/construct_scores.parquet
+!outputs/cycle.json
+!outputs/words_audit.json
+!outputs/words_validation.json
+!outputs/replay.json
+!data/processed/replay_raw/**
+!outputs/shock.json
+!outputs/tot_trees.json
+!data/processed/shock_raw/**
+!outputs/reaction_profiles.json

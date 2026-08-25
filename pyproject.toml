@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "risk5110-assignment"
+version = "2.0.0"
+requires-python = ">=3.11"
+
+# `src` is a flat module directory rather than a package: every module is imported by bare
+# name (`import config`), which works because each entry point inserts its own directory on
+# sys.path. Running `pip install -e .` is not required.
+[tool.setuptools]
+py-modules = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "clean_install: proves the ENVIRONMENT and supplied pipeline run from a fresh checkout; run with -m clean_install. It passes on the untouched starter by design",
+    "submission: the repository-and-pipeline completeness check; run with -m submission before submitting. It fails on the untouched starter by design",
+    "release_audit: cross-repository release audit (worked solution only); run with -m release_audit",
+]
+addopts = "-m 'not clean_install and not submission and not release_audit'"

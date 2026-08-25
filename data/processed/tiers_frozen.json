@@ -1,0 +1,55 @@
+{
+ "persistence": [
+  "trailing_change_182d",
+  "meetings_since_change",
+  "last_change_sign",
+  "decision"
+ ],
+ "macro": [
+  "business_conditions",
+  "consumer_sentiment",
+  "cpi_qoq",
+  "cpi_yoy",
+  "dwelling_approvals",
+  "employment_yoy",
+  "gdp_growth_yoy",
+  "gpr_acts",
+  "gpr_index",
+  "gpr_threats",
+  "infexp_business_3m",
+  "infexp_economists_1y",
+  "infexp_union_1y",
+  "participation_rate",
+  "real_gdp_yoy",
+  "terms_of_trade",
+  "trimmed_mean_qoq",
+  "trimmed_mean_yoy",
+  "unemployment_rate",
+  "weighted_median_yoy"
+ ],
+ "market": [
+  "rv_5",
+  "rv_21",
+  "rv_63",
+  "parkinson_21",
+  "downside_21",
+  "aud_vol_21",
+  "aud_ret",
+  "vix",
+  "cash_rate",
+  "bab_spread",
+  "slope_cash3y",
+  "slope_3y10y",
+  "bond_3y",
+  "bond_10y"
+ ],
+ "text": [
+  "policy_stance",
+  "inflation_concern",
+  "downside_risk_emphasis",
+  "financial_conditions_concern",
+  "uncertainty_language",
+  "vigilance",
+  "global_risk_salience"
+ ]
+}

@@ -1,0 +1,9 @@
+[
+  {
+    "file": "REPLACE-with-your-filename.pdf",
+    "organisation": "The organisation that PUBLISHED it, not the filename",
+    "title": "Full title as printed on the document",
+    "url": "https://\u2026  where you downloaded it from",
+    "retrieved": "YYYY-MM-DD"
+  }
+]

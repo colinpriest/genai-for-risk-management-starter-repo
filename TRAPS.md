@@ -1,144 +1,114 @@
-# Known traps — read before you start
+# TRAPS
 
-Seven things that cost hours and teach nothing. They are not part of the assessment, and fixes
-are given for all of them.
-
-**Three are already fixed in the code you are given. The rest are live in the code you write.**
-
-| # | Trap | Status |
-|---|---|---|
-| 1 | `statsmodels` params are an unnamed array | **Live** — bites in your `stage5` bootstrap |
-| 2 | `yfinance` MultiIndex columns | Fixed in `stage1`; live if you add your own tickers |
-| 3 | `.where().rolling().std()` returns all-NaN | Fixed for realised volatility; live for features you add |
-| 4 | Regime labels arbitrary between fits | Fixed in `stage4`. **Live in your bootstrap** — every draw is a fresh fit |
-| 5 | Perturbation effect smaller than sampling noise | Half fixed: `score_field()` gives you the averaging; using it is yours |
-| 6 | Bootstrap is CPU-bound | **Live** — `stage5` is a stub |
-| 7 | Missing data hides in plain sight | A habit to build, not a bug to fix |
-
-**Traps 1, 4 and 6 all land in `src/stage5_uncertainty.py`**, which ships as a stub. Trap 4 is
-the dangerous one there: it is silent. Pooling bootstrap draws without re-ordering each fit's
-regimes yields a tidy, plausible interval that has quietly mixed different regimes together, and
-nothing in your output looks wrong.
+Nine issues that cost hours and teach nothing. **Three are already fixed in the code you are
+given. Six are live in the code and the judgements you supply.**
 
 ---
 
-## 1. `statsmodels` results params are a numpy array, not a named Series
+## Already fixed — do not re-break them
 
-**This is the single most likely place to lose an afternoon.**
+### 1. The hold observations do not exist in any source file
 
-```python
-res = mod.fit()
-res.params["sigma2[0]"]        # IndexError - and this is the obvious thing to try
-```
+RBA table A2 lists only the meetings that **moved**. The 156 holds are created in
+`data_panel.attach_decisions()` by joining A2 onto the meeting calendar and defaulting the
+remainder to zero. It is done once, explicitly, and it warns if any announced change fails
+to match a meeting.
 
-`res.params` is a bare numpy array. The names live separately.
+**If you rebuild this join yourself with a plain merge, a failed join and a genuine hold
+look identical** — and you will not find out.
 
-```python
-import numpy as np
-pmap = dict(zip(res.model.param_names, np.asarray(res.params)))
-sigmas = np.sqrt([pmap[f"sigma2[{i}]"] for i in range(config.N_REGIMES)])
-```
+### 2. Publication lags
 
----
+Every macro series is stamped with the date it became **known**, not the period it
+describes, and joined backward as-of in `data_macro.as_of()`. At a typical meeting the
+newest CPI print is 64 days old and GDP is 122 days old.
 
-## 2. `yfinance` returns MultiIndex columns even for a single ticker
+Changing `direction="backward"` to `"nearest"` or `"forward"` will improve every number in
+your report and invalidate all of them.
 
-`df["Close"]` gives you a DataFrame, not a Series, and the shape error surfaces far from
-the cause.
+### 3. Text from the meeting you are predicting — FIXED FOR YOU
 
-```python
-df = yf.download("^AXJO", start="2006-01-01", progress=False, auto_adjust=True)
-if isinstance(df.columns, pd.MultiIndex):
-    df.columns = df.columns.droplevel(1)
-```
+Minutes for meeting *T* publish about 14 days after *T*, **and they state the decision taken
+at T**. Scoring them in full is fine — both targets look forward and the panel carries
+`decision` as a number anyway — but using a meeting's own minutes to say something about that
+same meeting is not.
 
----
+The fix is a single lag: `data_panel` shifts the **whole text tier by one meeting**, so the
+construct values on row *M* come from the minutes of *M−1*. Those published about a fortnight
+after *M−1*, and meetings are roughly five weeks apart, so they were public before *M*.
+`data_panel._assert_text_available()` fails the build if any meeting gap is short enough to
+break that.
 
-## 3. `.where().rolling().std()` silently returns an all-NaN column
-
-```python
-df["downside_vol"] = df["ret"].where(df["ret"] < 0).rolling(21).std()   # every value NaN
-```
-
-`.where()` leaves roughly half the window as NaN, and `rolling().std()` requires a full
-window by default. **No error is raised.** You will feed an empty column into your model.
-
-```python
-df["downside_vol"] = (df["ret"].where(df["ret"] < 0)
-                      .rolling(21, min_periods=5).std() * np.sqrt(252))
-```
-
-**Habit worth forming:** print `df.isna().sum()` after building features, every time.
+Because the lag already does the work, `decision_replay.load_as_at()` **keeps** the construct
+values on the target row and blanks only the decision, the rate change and the targets. An
+earlier version blanked the constructs too, which sounded cautious and was actually a bug: it
+showed the model seven construct values for every historical example and none for the meeting
+it was being asked to judge.
 
 ---
 
-## 4. Markov switching regime labels are arbitrary between runs
+## Live in the code and the judgements you supply
 
-> **This is the trap that will cost you marks rather than time.** `stage4` handles it for the
-> main fit. Your bootstrap in `stage5` refits the model on every draw, and each of those fits
-> labels its regimes independently. Re-order **inside the loop**, before pooling. And do not
-> order on `sigma2`: with `endog = log_rv` that is the variance of *log* volatility, not
-> volatility. Order on empirical realised volatility per assigned regime, as `stage4` does.
+### 4. Rolling origin, or nothing
 
-Regime "0" in one fit is not regime "0" in the next. Sort by fitted volatility so labels
-mean something and are stable.
+`sklearn.model_selection.cross_val_score` and `train_test_split` both leak here. Policy is
+strongly autocorrelated, so a randomly chosen test meeting usually sits between two training
+meetings that between them nearly give the answer away. Your numbers will look excellent.
 
-```python
-order = np.argsort(sigmas)                      # low -> high volatility
-remap = {int(old): int(new) for new, old in enumerate(order)}
-probs.columns = [remap[c] for c in probs.columns]
-```
+Use `evaluation.rolling_origin()`. **This is the rubric's −20 mark validity gate.**
 
----
+### 5. The scaler must be refitted inside the window
 
-## 5. The perturbation effect is smaller than the sampling noise
+`StandardScaler().fit(X)` before the loop leaks the future's mean and variance into every
+training set. `evaluation.default_classifier()` returns a `Pipeline`, and `rolling_origin()`
+clones and refits it at each step. If you write your own classifier, wrap the scaler in the
+pipeline — do not scale up front.
 
-**Read this before section 8.3.**
+### 6. N-shot examples must predate the target — in three different senses
 
-One scoring call at temperature 1.0 has a standard deviation of roughly **0.05 to 0.10**.
-The effect of changing one phrase in a document is about **the same size**. Measured naively,
-you get noise:
+`nshot` enforces all three, and each raises rather than warning.
 
-| | Mean absolute change |
-|---|---|
-| Signal edits (meaning reversed) | 0.000 |
-| Control edits (meaning preserved) | 0.050 |
+**Dates.** `select_shots()` rejects any example dated on or after your Replay meeting.
 
-The controls moved *more* than the signal. That is not a finding, it is a failed measurement.
+**Labels.** The `regimes` strategy selects on `y_cycle`, which is defined by what the cash
+rate does over the *following* 182 days. A meeting two months before your target has a
+`y_cycle` that nobody could have known at your target. `_label_known_by()` drops those.
+Without it the strategy quietly selects on the future and looks unbeatable.
 
-**Two changes make the experiment work, and you need both:**
+**The question block.** `build_prompt_block()` refuses a target row that still carries a
+decision, so you cannot build the question from the raw panel by accident. Pass
+`as_at=load_as_at(meeting)`.
 
-1. **Average several calls per score.** `score_field(text, n=5)` in `stage3_riskvoice.py`
-   does this. Noise falls with the square root of the call count.
-2. **Perturb the retrieved passage, not the full document.** One phrase changed in 20,000
-   characters is diluted to nothing. In ~2,700 characters it is detectable.
+### 7. Do not choose your strategy on the meetings you then report
 
-Even done properly the effect is modest. Report what you measure.
+Four strategies, and the best of four always looks better than it is. Iterate on
+`dev_sample()`; run `holdout_sample()` **once** and report what it gives you. Our own worked
+solution found all four strategies tied at 0.778 on dev — a four-way tie is a result, and
+reporting the "winner" would have been reporting a coin toss.
 
----
+### 8. Never shock a policy-outcome variable
 
-## 6. Bootstrap is CPU-bound — parallelise it
+The cash rate, the decision and the trailing rate-change measures **are** the policy stance. A
+Shock channel whose proxy is `cash_rate` says "the RBA tightens, therefore the model predicts
+tightening" — it asserts its own conclusion and the model faithfully agrees.
+`scenario_engine` refuses them and marks the channel unmodellable, keeping its reasoning as
+text. Shock the *economy*; let the model say what policy does about it.
 
-Each Markov switching refit takes about **6 seconds** regardless of settings. Reducing
-iterations does not help; it just stops the model converging.
+### 9. A probability from outside the model's support is not a forecast
 
-40 draws sequentially is **four minutes**. The draws are independent, so run them across
-processes:
+A gradient-boosted tree splits on thresholds it saw in training. Push an input past the
+observed range and every split has already fired: the prediction freezes at the edge value
+and stops responding, however much further you push. The number that comes back is confident
+and computed from nothing.
 
-```python
-from concurrent.futures import ProcessPoolExecutor
-with ProcessPoolExecutor(max_workers=os.cpu_count() - 2) as ex:
-    results = list(ex.map(one_bootstrap_draw, range(n_draws)))
-```
+`support_check()` tests every shocked variable against the rows the model was actually
+FITTED ON, and adds a joint nearest-neighbour check. When either fails, `run_scenario()`
+returns `model_verdict = "out_of_support"` with **no probability AND no direction**. The
+argmax of an extrapolated distribution is the same claim as the distribution, so suppressing
+one and publishing the other is not a safeguard.
 
-**`stage5_uncertainty.py` does NOT do this — it is a stub, and writing the bootstrap is your
-job.** 40–60 draws is enough for a 90% interval; you do not need 1,000. Report how many draws
-converged against how many you requested, because a quietly-dropped third of them is itself a
-finding about model stability.
-
----
-
-## 7. Ask for `df.isna().sum()` habitually
-
-Three of the traps above produce silent NaN or silently wrong values. None of them raise.
-The cheapest defence is printing missingness after every stage, which the supplied stages do.
+What remains sayable is `channel_direction()`: a tally of YOUR adjudicated channels,
+aggregated by mechanism, carrying no probability and labelled as human reasoning wherever it
+appears. Both worked scenarios land out of support, and "the model cannot speak here,
+here is why, and here is what our channels say instead" is the complete answer. Quoting a
+model probability or a model direction anyway is an 8-mark gate.

@@ -1,0 +1,173 @@
+{
+  "model_embargoed": {
+    "n": 128,
+    "accuracy": 0.5703125,
+    "balanced_accuracy": 0.5618113912231559,
+    "log_loss": 2.634668408822993,
+    "confusion": [
+      [
+        28,
+        5,
+        1
+      ],
+      [
+        27,
+        37,
+        6
+      ],
+      [
+        5,
+        11,
+        8
+      ]
+    ]
+  },
+  "model_no_embargo": {
+    "n": 128,
+    "accuracy": 0.8046875,
+    "balanced_accuracy": 0.8151493930905694,
+    "log_loss": 1.0381716315483174,
+    "confusion": [
+      [
+        30,
+        4,
+        0
+      ],
+      [
+        13,
+        54,
+        3
+      ],
+      [
+        2,
+        3,
+        19
+      ]
+    ]
+  },
+  "embargo_cost_accuracy": 0.2344,
+  "baselines": {
+    "majority": {
+      "accuracy": 0.265625,
+      "balanced_accuracy": 0.3333333333333333
+    },
+    "persistence": {
+      "accuracy": 0.375,
+      "balanced_accuracy": 0.5400326797385621
+    },
+    "current_decision": {
+      "accuracy": 0.65625,
+      "balanced_accuracy": 0.549859943977591
+    },
+    "market_implied": {
+      "accuracy": 0.2578125,
+      "balanced_accuracy": 0.361764705882353
+    }
+  },
+  "baseline_dates": [
+    "2014-02-04",
+    "2026-02-03"
+  ],
+  "beats_current_decision": false,
+  "n_features": 45,
+  "n_meetings_labelled": 208,
+  "train_end": "2018-12-31",
+  "n_train": 129,
+  "n_holdout": 73,
+  "holdout": {
+    "n": 73,
+    "accuracy": 0.3972602739726027,
+    "balanced_accuracy": 0.40019157088122603,
+    "log_loss": 3.2266912572919666,
+    "confusion": [
+      [
+        12,
+        8,
+        0
+      ],
+      [
+        14,
+        15,
+        0
+      ],
+      [
+        8,
+        14,
+        2
+      ]
+    ]
+  },
+  "n_features_negative": 11,
+  "n_features_significant": 14,
+  "regime_probability_populations": {
+    "rows_described": 211,
+    "in_training_set_in_sample": 129,
+    "outside_training_set": 82,
+    "labels_resolved": 208,
+    "rolling_origin_predictions": 128
+  },
+  "shock_model": {
+    "family": "HistGradientBoostingClassifier",
+    "n_training_rows_exported": 129,
+    "n_features": 38,
+    "tiers": [
+      "persistence",
+      "macro",
+      "market"
+    ],
+    "n_train": 129
+  },
+  "support_calibration": {
+    "n_training": 129,
+    "n_heldout": 82,
+    "columns": [
+      "trailing_change_182d",
+      "meetings_since_change",
+      "last_change_sign",
+      "decision",
+      "business_conditions",
+      "consumer_sentiment",
+      "cpi_qoq",
+      "cpi_yoy",
+      "dwelling_approvals",
+      "employment_yoy",
+      "gdp_growth_yoy",
+      "gpr_acts",
+      "gpr_index",
+      "gpr_threats",
+      "infexp_business_3m",
+      "infexp_economists_1y",
+      "infexp_union_1y",
+      "participation_rate",
+      "real_gdp_yoy",
+      "terms_of_trade",
+      "trimmed_mean_qoq",
+      "trimmed_mean_yoy",
+      "unemployment_rate",
+      "weighted_median_yoy",
+      "rv_5",
+      "rv_21",
+      "rv_63",
+      "parkinson_21",
+      "downside_21",
+      "aud_vol_21",
+      "aud_ret",
+      "vix",
+      "cash_rate",
+      "bab_spread",
+      "slope_cash3y",
+      "slope_3y10y",
+      "bond_3y",
+      "bond_10y"
+    ],
+    "joint_heldout_p50": 8.753,
+    "joint_heldout_p95": 15.027,
+    "joint_heldout_p99": 17.593,
+    "joint_heldout_max": 20.29,
+    "marginal_breaches_p50": 6,
+    "marginal_breaches_p95": 15,
+    "marginal_breaches_p99": 16,
+    "marginal_breaches_max": 16,
+    "note": "thresholds are the 99th percentile of how unusual a REAL unseen meeting is, measured against the rows the model was fitted on"
+  }
+}
