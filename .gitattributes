@@ -1,0 +1,29 @@
+# NO LINE-ENDING TRANSLATION, ANYWHERE IN THIS REPOSITORY.
+#
+# Several things here are identified by the SHA-256 of their exact bytes:
+#
+#   * the vendored RBA inputs under data/raw/, checked by
+#     tests/test_submission.py::test_the_frozen_structured_inputs_match_their_pinned_hashes
+#     against data/raw/checksums.json;
+#   * the minutes corpus, whose fingerprint is part of `call_config_hash()` - so a
+#     changed byte moves the Words cache directory and discards every committed envelope;
+#   * the frozen panel and tier files, fingerprinted into the Shock stage hash.
+#
+# Git's default on Windows (`core.autocrlf=true`) rewrites LF to CRLF on checkout. The
+# blob is unchanged, so the repository looks fine, but the file on disk is not the file
+# that was hashed: a student cloning on Windows failed the frozen-input check on a clean
+# clone, having done nothing wrong. `-text` tells Git to hand over the bytes it stored.
+#
+# This applies to EVERY file rather than only the hashed ones, because the set of hashed
+# files has grown twice and a list is one more thing to forget to update.
+* -text
+
+# And the genuinely binary formats, stated explicitly so no future setting re-enables
+# translation or attempts a textual diff on them.
+*.parquet binary
+*.joblib binary
+*.png binary
+*.pdf binary
+*.zip binary
+*.docx binary
+*.m4a binary
