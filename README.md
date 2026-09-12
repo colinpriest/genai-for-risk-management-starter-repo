@@ -75,8 +75,9 @@ python -m pytest tests/test_dependencies.py -q -m slow_install
 
 That suite **passes on this untouched starter by design** — it proves the environment, not
 your work. The repository-and-pipeline completeness check — run it before you submit; it
-verifies everything that lives in the repository, and only that (the transcript, AI-use
-log, presentation and peer form are submitted separately):
+verifies everything that lives in the repository, and only that. The Cycle transcript IS
+one of those repository files - `docs/cycle-transcript.md`, holding the export or the share
+link - while the AI-use log, presentation and peer form are submitted on Moodle:
 
 ```bash
 python -m pytest tests/test_submission.py -q -m submission

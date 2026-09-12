@@ -331,6 +331,10 @@ def test_the_cycle_transcript_is_in_the_repository():
 #: An EXPLICIT route declaration, on its own line, rather than a keyword hunt through
 #: prose. "SUBMISSION ROUTE: Moodle" is a statement a team makes on purpose; the word
 #: "Moodle" appearing in a sentence is not.
+#: The first line of the signpost this repository SHIPS in docs/meetings/. While it is
+#: still there, the file is the template rather than a team's statement.
+_SHIPPED_SIGNPOST = "# Meeting records go here"
+
 _ROUTE_RE = re.compile(
     r"^\s*(?:submission[ _-]?)?route\s*[:=]\s*(moodle|repository|repo)\b",
     re.I | re.M)
@@ -350,6 +354,12 @@ def _declared_route(declaration) -> str | None:
     m = _ROUTE_RE.search(text)
     if m:
         return "moodle" if m.group(1).lower() == "moodle" else "repository"
+    # THE SHIPPED SIGNPOST DECLARES NOTHING. It explains both routes, so it necessarily
+    # mentions Moodle, transcripts and minutes - and the prose fallback below read that as
+    # a team choosing the Moodle route, which let an untouched starter pass the meeting
+    # gate by doing nothing at all. A template is not a declaration.
+    if _SHIPPED_SIGNPOST in text:
+        return None
     low = text.lower()
     if "moodle" in low and any(w in low for w in ("transcript", "minutes", "records")):
         return "moodle"
@@ -807,20 +817,35 @@ def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposur
             f"the log records {len(opened)} holdout exposure(s) but the freeze authorises "
             f"{authorised}. A further look has to be declared with --revalidate.")
 
+    # ---- the status comes from ONE classifier, and this check reads it -------------
+    # It used to re-derive the rule here, and the two derivations disagreed: a team that
+    # declared a genuine pre-log exposure AND then ran a declared second one was required
+    # to report `previously_exposed` (for the declaration) and `retrospective` (for the
+    # two logged exposures) at the same time. No value satisfied both, so a legitimate
+    # submission could not pass. The producer computes it; this check confirms the
+    # artefact agrees with the module rather than inventing a second opinion.
+    import decision_replay as dr
     status = exposure.get("evidence_status")
-    assert status in ("prospective", "retrospective", "previously_exposed"), (
-        "replay.json does not classify how its holdout evidence stands in relation to "
-        "the selection")
-    if declared_prior:
-        assert status == "previously_exposed", (
-            f"the selection declares a prior exposure but the artefact reports "
-            f"{status!r} - regenerate the Replay stage so the two agree")
+    assert status in dr.EVIDENCE_STATUSES, (
+        f"replay.json classifies its holdout evidence as {status!r}, which is not one of "
+        f"{list(dr.EVIDENCE_STATUSES)}")
+    flags = exposure.get("evidence_flags")
+    assert isinstance(flags, dict) and flags.get("status"), (
+        "replay.json carries no evidence_flags - regenerate the Replay stage")
+    assert flags["status"] == status, (
+        f"replay.json's evidence_status ({status!r}) disagrees with its own flags "
+        f"({flags['status']!r})")
+    assert dr._classify_evidence(
+        flags["logged_exposures"], flags["exposures_under_this_freeze"],
+        flags["prior_exposure_declared"], flags["revalidated"], True) == status, (
+        f"the recorded facts {flags} do not classify as {status!r} under this "
+        f"repository's rule - regenerate the Replay stage")
+
+    # ---- and the DECLARATIONS each qualification requires must be present -----------
+    if flags["prior_exposure_declared"]:
         assert str(selection.get("note", "")).strip(), (
             "a declared prior exposure must say what happened, in words a marker reads")
-    if len(opened) > 1:
-        assert status == "retrospective", (
-            f"{len(opened)} holdout exposures are recorded, so the evidence is "
-            f"retrospective; the artefact says {status!r}")
+    if flags["logged_exposures"] > 1 or flags["revalidated"]:
         assert str(selection.get("authorisation", "")).strip(), (
             "a second exposure must carry the declared reason it was authorised for")
 

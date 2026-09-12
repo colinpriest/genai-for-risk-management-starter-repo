@@ -1581,28 +1581,82 @@ def test_discovery_template_covers_the_assessed_scenarios():
                         "quote_verified"} <= set(m)
 
 
-def test_shock_envelopes_declare_their_provenance_fields():
+def test_shock_envelopes_declare_their_provenance_fields(tmp_path, monkeypatch):
     """Model, call index, temperature, prompt hash, request id, usage, attempt, AND the
     request actually sent - as documented. `request` is the one that matters since the
     move to the course proxy: the call sites name parameters the API never receives
     (`seed` is gone from this model family), so an envelope that reports only what the
-    code intended to send is not an audit record."""
-    import inspect
+    code intended to send is not an audit record.
 
-    import scenarios as sc
-    src = inspect.getsource(sc.llm_parsed)
-    for field in ('"temperature"', '"prompt_sha"', '"request_id"', '"usage"',
-                  '"attempt"', '"model"', '"call_index"', '"request"'):
-        assert field in src, f"llm_parsed envelopes omit {field}"
+    THIS READS THE EMITTED ENVELOPE, not the source text. It used to grep the writer for
+    field-name literals, which stopped meaning anything the moment the three stages moved
+    onto one shared builder: the names are no longer written at the call site, and a text
+    test would have failed on a refactor that made the guarantee stronger. What matters is
+    what lands on disk.
+    """
+    import types
+
+    import courseapi
     import decision_replay as dr
-    src2 = inspect.getsource(dr._cached_call)
-    for field in ('"temperature"', '"prompt_sha"', '"request_id"', '"request"',
-                  '"call_index"'):
-        assert field in src2, f"replay envelopes omit {field}"
+    import scenarios as sc
     import text_features as tf
-    src3 = inspect.getsource(tf.score_once)
-    for field in ('"model"', '"call_index"', '"request"', '"usage"'):
-        assert field in src3, f"words envelopes omit {field}"
+    from pydantic import BaseModel
+
+    class _Payload(BaseModel):
+        ok: bool = True
+
+    request = courseapi.effective_request(
+        model=config.MODEL, temperature=config.SAMPLING_TEMPERATURE,
+        max_tokens=config.MAX_OUTPUT_TOKENS)
+    usage = {"input_tokens": 5, "output_tokens": 15, "total_tokens": 20,
+             "prompt_tokens": 5, "completion_tokens": 15}
+    response = types.SimpleNamespace(
+        choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(parsed=_Payload(), content="text"))],
+        request=request, model=config.MODEL, id="resp_synthetic",
+        usage=dict(usage),
+        call_usage=dict(usage, attempts_counted=1, attempts_unknown=0,
+                        tokens_known=True, is_complete=True),
+        provenance={"envelope_version": courseapi.ENVELOPE_VERSION,
+                    "response_status": "completed",
+                    "model_requested": config.MODEL, "model_served": config.MODEL,
+                    "input_sha256_16": "0123456789abcdef",
+                    "transport_requests": 1})
+    client = types.SimpleNamespace(beta=types.SimpleNamespace(
+        chat=types.SimpleNamespace(completions=types.SimpleNamespace(
+            parse=lambda **kw: response))))
+
+    common = ("model", "call_index", "temperature", "request", "usage", "request_id",
+              "config_hash", "envelope_version", "transport_requests", "model_served",
+              "provenance", "timestamp")
+
+    monkeypatch.setattr(sc, "RAW_DIR", tmp_path / "shock")
+    (tmp_path / "shock").mkdir()
+    monkeypatch.setattr(sc, "client_", lambda: client)
+    sc.llm_parsed("system", "user", _Payload)
+    shock = json.loads(next((tmp_path / "shock").glob("*.json")).read_text())
+    for field in common + ("prompt_sha", "attempt", "payload"):
+        assert shock.get(field) is not None, f"shock envelopes omit {field!r}"
+
+    monkeypatch.setattr(dr, "RAW_DIR", tmp_path / "replay")
+    (tmp_path / "replay").mkdir()
+    monkeypatch.setattr(dr, "client_", lambda: client)
+    dr._cached_call("probe", "system", "user", schema=_Payload)
+    replay = json.loads(next((tmp_path / "replay").glob("*.json")).read_text())
+    for field in common + ("prompt_sha", "attempt", "payload", "kind"):
+        assert replay.get(field) is not None, f"replay envelopes omit {field!r}"
+
+    monkeypatch.setattr(tf, "client_", lambda: client)
+    monkeypatch.setattr(tf, "_schema_model", lambda: _Payload)
+    words = tf.score_once("synthetic", config.CALL_INDEX_BASE)
+    for field in common + ("prompt_hash", "parsed", "attempt"):
+        assert words.get(field) is not None, f"words envelopes omit {field!r}"
+
+    # AND every one of them satisfies the shared contract when read back.
+    for name, rec in (("shock", shock), ("replay", replay), ("words", words)):
+        assert not courseapi.envelope_contradictions(rec), (
+            f"{name} emitted a record that fails the contract it declares: "
+            f"{courseapi.envelope_contradictions(rec)}")
 
 
 def test_no_envelope_records_a_seed_the_api_never_received():

@@ -564,6 +564,10 @@ def _cached_call(kind: str, system: str, user: str,
     request = courseapi.effective_request(
         model=config.MODEL, temperature=config.SAMPLING_TEMPERATURE,
         max_tokens=config.MAX_OUTPUT_TOKENS)
+    # ACCUMULATED ACROSS THE WHOLE STAGE LOOP. A 500 followed by success cost two HTTP
+    # requests, and the persisted record said one: the outer loop discarded the first
+    # attempt's cost entirely, so a run could not be reconciled against the class budget.
+    spent, spent_usage, _last_exception = 0, None, None
     for attempt in range(config.MAX_RETRIES):
         try:
             if schema is not None:
@@ -582,35 +586,28 @@ def _cached_call(kind: str, system: str, user: str,
                     messages=[{"role": "system", "content": system},
                               {"role": "user", "content": user}])
                 payload = {"text": r.choices[0].message.content.strip()}
-            rec = {"ok": True, "kind": kind, "payload": payload,
-                   "model": config.MODEL, "temperature": config.SAMPLING_TEMPERATURE,
-                   "call_index": config.CALL_INDEX_BASE + seed_offset,
-                   "request": getattr(r, "request", None),
-                   "provenance": getattr(r, "provenance", None),
-                   "model_served": getattr(r, "model", None), "attempt": attempt + 1,
-                   "prompt_sha": key, "request_id": getattr(r, "id", None),
-                   # THE WHOLE CALL'S BILL, not just the last response's - and the
-                   # version marker, absent from this writer while Words carried one, so
-                   # evidence written a minute ago classified itself as "legacy".
-                   "usage": getattr(r, "call_usage", None) or getattr(r, "usage", None),
-                   "usage_final_response": getattr(r, "usage", None),
-                   "transport_requests": (getattr(r, "provenance", None) or {}
-                                          ).get("transport_requests"),
-                   "config_hash": config_hash(),
-                   "envelope_version": courseapi.ENVELOPE_VERSION,
-                   "timestamp": datetime.now(timezone.utc).isoformat()}
+            rec = courseapi.success_envelope(
+                r, request=request, config_hash=config_hash(),
+                call_index=config.CALL_INDEX_BASE + seed_offset,
+                transport=spent, usage=spent_usage,
+                kind=kind, payload=payload, prompt_sha=key, attempt=attempt + 1)
             path.write_text(json.dumps(rec, indent=1))
             config.ledger_add("replay", path)
             return rec
         except Exception as e:  # noqa: BLE001
             last = f"{type(e).__name__}: {str(e)[:140]}"
             failure = courseapi.describe_failure(e, request=request)
+            _last_exception = e
+            attempted = courseapi.transport_attempts(e)
+            spent += attempted if isinstance(attempted, int) else 1
+            spent_usage = courseapi.merge_usage(
+                spent_usage, courseapi.failed_attempt_usage(e))
             if type(e).__name__ in _NON_TRANSIENT:
-                path.write_text(json.dumps(
-                    {"ok": False, "kind": kind, "error": last, "failure": failure,
-                     "prompt_sha": key, "request": dict(request),
-                     "envelope_version": courseapi.ENVELOPE_VERSION,
-                     "timestamp": datetime.now(timezone.utc).isoformat()}, indent=1))
+                path.write_text(json.dumps(courseapi.failure_envelope(
+                    e, request=request, config_hash=config_hash(),
+                    call_index=config.CALL_INDEX_BASE + seed_offset,
+                    transport=spent, usage=spent_usage,
+                    kind=kind, prompt_sha=key), indent=1))
                 raise LLMCallError(
                     f"{kind} call failed with a non-transient error ({last}); retrying "
                     f"cannot fix this, so the run stops here. The failure envelope is "
@@ -621,10 +618,10 @@ def _cached_call(kind: str, system: str, user: str,
                 break
             if attempt < config.MAX_RETRIES - 1:
                 time.sleep(config.RETRY_BASE_SECONDS * (2 ** attempt) + random.uniform(0, .5))
-    rec = {"ok": False, "kind": kind, "error": last, "failure": failure,
-           "prompt_sha": key, "request": dict(request),
-           "envelope_version": courseapi.ENVELOPE_VERSION,
-           "timestamp": datetime.now(timezone.utc).isoformat()}
+    rec = courseapi.failure_envelope(
+        _last_exception or RuntimeError(last or "call failed"), request=request,
+        config_hash=config_hash(), call_index=config.CALL_INDEX_BASE + seed_offset,
+        transport=spent, usage=spent_usage, kind=kind, prompt_sha=key)
     path.write_text(json.dumps(rec, indent=1))
     # a TOLERATED failure is still part of what the artefact rests on: it shaped the
     # usable-call denominator, the reported reliability, and possibly the chosen
@@ -978,20 +975,29 @@ def evaluate_all(k: int | None = None, strategies: list[str] | None = None,
     print("  INSUFFICIENT EVIDENCE TO DISTINGUISH them on this sample - which is what to")
     print("  write, and what the rubric credits.")
 
-    # The benchmark finished, so this exposure is closed: a later resume is a NEW
-    # question and needs its own authority, while an interrupted run can be resumed
-    # inside the exposure it already recorded.
-    if _EXPOSURE_EVENT is not None:
-        close_holdout_exposure(_EXPOSURE_EVENT.get("event_id"),
-                               f"{sample} benchmark completed on {n_meetings} meetings")
+    # THE BENCHMARK FINISHED, SO ITS EXPOSURE IS CLOSED - and that is true whether this
+    # run made the calls or replayed them. Closing only when THIS run made a fresh call
+    # left a permanent hole: a run interrupted after its last cache write but before the
+    # close, then re-run from cache, kept the event open forever. The submission check
+    # rightly rejected an unclosed exposure and advised a re-run, which could not repair
+    # it because the re-run made no fresh call either.
+    #
+    # A later resume is still a NEW question needing its own authority; what changed is
+    # that "completed" is a property of the benchmark, not of who paid for it.
     _CURRENT_SAMPLE = None
-    # A CACHE-ONLY REPLAY ASKS THE HOLDOUT NOTHING, and therefore records no new event -
-    # but the result it reports still BELONGS to the exposure that produced the
-    # envelopes, and writing `null` there severed the report from its own evidence.
-    # Re-running the stage from committed caches must keep naming that exposure.
     event_id = (_EXPOSURE_EVENT or {}).get("event_id")
     if event_id is None and sample == "holdout":
+        # A CACHE-ONLY REPLAY ASKS THE HOLDOUT NOTHING, and therefore records no new
+        # event - but the result it reports still BELONGS to the exposure that produced
+        # the envelopes, and writing `null` there severed the report from its evidence.
         event_id = originating_exposure_id()
+    if sample == "holdout" and event_id:
+        close_holdout_exposure(
+            event_id, f"{sample} benchmark completed on {n_meetings} meetings"
+            + ("" if _EXPOSURE_EVENT is not None else " (replayed from committed cache)"))
+    elif _EXPOSURE_EVENT is not None:
+        close_holdout_exposure(_EXPOSURE_EVENT.get("event_id"),
+                               f"{sample} benchmark completed on {n_meetings} meetings")
     df.attrs["exposure_event_id"] = event_id
     df.attrs["exposure_was_fresh"] = _EXPOSURE_EVENT is not None
     df.attrs["evidence_status"] = evidence_status()
@@ -1382,11 +1388,33 @@ def log_damage(events: list[dict] | None = None) -> list[str]:
 
 
 def require_readable_log() -> None:
-    """Refuse to derive an exposure COUNT from a history that does not parse.
+    """Refuse to derive an exposure COUNT from a history that cannot be trusted.
 
-    The count is what authorises another look at the holdout. A damaged log whose
-    damage is ignored answers "zero exposures so far" to a question it cannot answer.
+    The count is what authorises another look at the holdout. A damaged log whose damage
+    is ignored answers "zero exposures so far" to a question it cannot answer - and so
+    does a log that has been DELETED.
+
+    THE FREEZE REMEMBERS WHAT THE LOG SHOULD CONTAIN. `freeze_selection()` stamps the
+    event ids it saw, so a missing or shortened log is detectable rather than simply
+    believed: without this, removing the file reset the count to zero and the runtime
+    handed out exposure number 1 again. The submission check caught it afterwards, but by
+    then the holdout had already been asked.
     """
+    rec = _read_selection()
+    known = [e for e in (rec.get("exposure_event_ids") or []) if e]
+    if known:
+        present = {e.get("event_id") for e in exposures_recorded()}
+        lost = [e for e in known if e not in present]
+        if lost:
+            raise RuntimeError(
+                f"the frozen selection records {len(known)} holdout exposure(s) but "
+                f"{EXPOSURE_LOG.name} no longer contains {lost}.\n"
+                f"That file is append-only evidence and the count in it decides whether "
+                f"the held-out sample may be asked anything more, so a shorter log is "
+                f"not a clean slate. Restore it from version control. If it is genuinely "
+                f"unrecoverable, say so in the report and re-freeze with "
+                f'--revalidate --note="..." - which declares the second exposure rather '
+                f"than hiding it.")
     damage = log_damage()
     if damage:
         raise RuntimeError(
@@ -1564,27 +1592,60 @@ def freeze_selection(note: str = "", revalidate: bool = False,
     return rec
 
 
-def evidence_status() -> str:
-    """How the reported holdout evidence stands in relation to the selection.
+#: THE ONE PLACE THE STATUS IS DECIDED. Two callers deciding it independently is how the
+#: producer and the submission check came to disagree: a team that declared a genuine
+#: pre-log exposure AND then ran a declared second one was reported as
+#: `previously_exposed` by this module while the validator demanded `previously_exposed`
+#: for the declaration and `retrospective` for the two logged exposures at the same time.
+#: No value satisfied both, so a legitimate submission could not pass.
+#:
+#: The two facts are INDEPENDENT and both matter, so they are both reported. The single
+#: status names the strongest qualification on the evidence; `evidence_flags()` carries
+#: the whole picture, and the validator reads the flags rather than re-deriving them.
+EVIDENCE_STATUSES = ("unexposed", "prospective", "retrospective", "previously_exposed")
 
-    prospective          - frozen first, exposed once, and not re-frozen since.
-    previously_exposed   - the holdout had been run before the freeze that governs it.
-    retrospective        - the selection was re-frozen after the holdout was exposed.
-    unexposed            - nothing has been asked of the holdout yet.
-    """
+
+def evidence_flags() -> dict:
+    """Every fact about how the reported holdout evidence stands. Computed once, here."""
     rec = _read_selection()
     events = exposures_recorded()
-    if not rec:
-        return "unexposed" if not events else "previously_exposed"
-    mine = [e for e in events if e.get("freeze_id") == rec.get("freeze_id")]
-    if not events:
-        # An empty log is only "unexposed" if nobody has declared otherwise.
-        return "previously_exposed" if rec.get("prior_exposure_declared") else "unexposed"
-    if not mine or rec.get("prior_exposure_declared"):
+    freeze_id = rec.get("freeze_id") if rec else None
+    mine = [e for e in events if e.get("freeze_id") == freeze_id] if freeze_id else []
+    declared_prior = bool(rec.get("prior_exposure_declared")) if rec else False
+    return {
+        "logged_exposures": len(events),
+        "exposures_under_this_freeze": len(mine),
+        "exposures_under_earlier_freezes": len(events) - len(mine),
+        "prior_exposure_declared": declared_prior,
+        "revalidated": bool(rec.get("revalidated")) if rec else False,
+        "status": _classify_evidence(len(events), len(mine), declared_prior,
+                                     bool(rec.get("revalidated")) if rec else False,
+                                     bool(rec)),
+    }
+
+
+def _classify_evidence(logged, mine, declared_prior, revalidated, have_freeze) -> str:
+    """The strongest qualification on the evidence, as one word.
+
+    `previously_exposed` outranks `retrospective`: a team that ran the holdout before any
+    record existed has the weaker claim of the two, and saying so is the honest headline
+    even when a later declared exposure is also on the log. The other facts do not
+    disappear - they are in `evidence_flags()` and the report must state them.
+    """
+    if not have_freeze:
+        return "unexposed" if not logged else "previously_exposed"
+    if declared_prior or (logged and not mine):
         return "previously_exposed"
-    if len(events) > len(mine) or rec.get("revalidated"):
+    if not logged:
+        return "unexposed"
+    if logged > mine or revalidated or mine > 1:
         return "retrospective"
-    return "prospective" if len(mine) == 1 else "retrospective"
+    return "prospective"
+
+
+def evidence_status() -> str:
+    """The single-word status. See `evidence_flags()` for the facts behind it."""
+    return evidence_flags()["status"]
 
 
 def record_holdout_exposure(reason: str = "fresh holdout draw") -> dict:
@@ -1837,7 +1898,12 @@ def run() -> dict:
             "events": exposure_events(),
             "recorded": len(exposures_recorded()),
             "evidence_status": evidence_status(),
+            # THE FACTS, not just the headline word. A declared pre-log exposure and a
+            # later declared re-exposure are independent and can both be true; reporting
+            # only one word made the producer and the validator contradict each other.
+            "evidence_flags": evidence_flags(),
             "holdout_event_id": hold.attrs.get("exposure_event_id"),
+            "holdout_exposure_was_fresh": hold.attrs.get("exposure_was_fresh"),
             "selection_config_hash": selection_config_hash(),
         },
         "benchmark_summary": {

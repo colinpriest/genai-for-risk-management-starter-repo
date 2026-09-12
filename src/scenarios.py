@@ -493,11 +493,15 @@ CLAIMED_ANALOGUES: dict[str, str] = {}
 # run the comparison; `reaction_profiles()` validates that both scenarios and all seven
 # constructs are present. This is where Words feeds Shock.
 #
+# The shape, on the UNASSESSED demonstration scenario from docs/worked-example-tree.md.
+# The keys are the seven construct names exactly as Words defines them; the values are
+# your percentiles, and nothing here is a hint about either assessed scenario:
+#
 # EXPECTED_PROFILES = {
-#     "A. Taiwan Strait blockade": {
-#         "policy_stance": 0.30, "inflation_concern": 0.60, "downside_risk_emphasis": 0.85,
-#         "financial_conditions_concern": 0.65, "uncertainty_language": 0.90,
-#         "vigilance": 0.85, "global_risk_salience": 0.95},
+#     "Sharp cut to net overseas migration": {
+#         "policy_stance": ..., "inflation_concern": ..., "downside_risk_emphasis": ...,
+#         "financial_conditions_concern": ..., "uncertainty_language": ...,
+#         "vigilance": ..., "global_risk_salience": ...},
 #     ...
 # }
 EXPECTED_PROFILES: dict[str, dict[str, float]] = {}
@@ -797,6 +801,8 @@ def llm_parsed(system: str, user: str, schema, seed_offset: int = 0) -> dict:
     request = courseapi.effective_request(
         model=config.MODEL, temperature=config.SAMPLING_TEMPERATURE,
         max_tokens=config.MAX_OUTPUT_TOKENS)
+    # Accumulated across the whole stage loop: see the note in decision_replay.
+    spent, spent_usage, _last_exception = 0, None, None
     for attempt in range(config.MAX_RETRIES):
         try:
             r = client_().beta.chat.completions.parse(
@@ -806,40 +812,31 @@ def llm_parsed(system: str, user: str, schema, seed_offset: int = 0) -> dict:
                 messages=[{"role": "system", "content": system},
                           {"role": "user", "content": user}])
             payload = r.choices[0].message.parsed.model_dump()
-            path.write_text(json.dumps(
-                {"ok": True, "payload": payload, "attempt": attempt + 1,
-                 "model": config.MODEL,
-                 "call_index": config.CALL_INDEX_BASE + seed_offset,
-                 "temperature": config.SAMPLING_TEMPERATURE,
-                 "request": getattr(r, "request", None),
-                 "provenance": getattr(r, "provenance", None),
-                 "model_served": getattr(r, "model", None),
-                 "prompt_sha": key,
-                 "request_id": getattr(r, "id", None),
-                 "usage": getattr(r, "call_usage", None) or getattr(r, "usage", None),
-                 "usage_final_response": getattr(r, "usage", None),
-                 "transport_requests": (getattr(r, "provenance", None) or {}
-                                        ).get("transport_requests"),
-                 "config_hash": config_hash(),
-                 "envelope_version": courseapi.ENVELOPE_VERSION,
-                 "timestamp": datetime.now(timezone.utc).isoformat()}, indent=1))
+            path.write_text(json.dumps(courseapi.success_envelope(
+                r, request=request, config_hash=config_hash(),
+                call_index=config.CALL_INDEX_BASE + seed_offset,
+                transport=spent, usage=spent_usage,
+                payload=payload, prompt_sha=key, attempt=attempt + 1), indent=1))
             config.ledger_add("shock", path)
             return payload
         except Exception as e:  # noqa: BLE001
             last = f"{type(e).__name__}: {str(e)[:140]}"
             failure = courseapi.describe_failure(e, request=request)
+            _last_exception = e
+            attempted = courseapi.transport_attempts(e)
+            spent += attempted if isinstance(attempted, int) else 1
+            spent_usage = courseapi.merge_usage(
+                spent_usage, courseapi.failed_attempt_usage(e))
             # One transport budget per logical call: the adapter says when it is spent.
             if courseapi.transport_budget_spent(e):
                 break
             if attempt < config.MAX_RETRIES - 1:
                 time.sleep(config.RETRY_BASE_SECONDS * (2 ** attempt) + random.uniform(0, .5))
-    path.write_text(json.dumps(
-        {"ok": False, "error": last, "failure": failure, "schema": schema.__name__,
-         "model": config.MODEL, "request": dict(request),
-         "call_index": config.CALL_INDEX_BASE + seed_offset,
-         "prompt_sha": key,
-         "envelope_version": courseapi.ENVELOPE_VERSION,
-         "timestamp": datetime.now(timezone.utc).isoformat()}, indent=1))
+    path.write_text(json.dumps(courseapi.failure_envelope(
+        _last_exception or RuntimeError(last or "call failed"), request=request,
+        config_hash=config_hash(), call_index=config.CALL_INDEX_BASE + seed_offset,
+        transport=spent, usage=spent_usage,
+        schema=schema.__name__, prompt_sha=key), indent=1))
     raise LLMCallError(
         f"{schema.__name__} call failed ({last}). Nothing reportable can be built from a "
         f"failed call, so the run stops here; the failure envelope is {path.name}. Fix the "

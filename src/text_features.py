@@ -418,6 +418,7 @@ def score_once(text: str, call_index: int) -> dict:
     failure = None
     spent_usage = None
     transport = 0
+    _last_exception = None
     for attempt in range(config.MAX_RETRIES):
         try:
             r = client_().beta.chat.completions.parse(
@@ -453,6 +454,7 @@ def score_once(text: str, call_index: int) -> dict:
             }
         except Exception as e:  # noqa: BLE001
             failure = courseapi.describe_failure(e, request=request)
+            _last_exception = e
             # ACCUMULATED ACROSS OUTER ATTEMPTS, and `0` is a real answer: a failure
             # raised before any request left cost no requests, and `or 1` said it cost one.
             attempted = courseapi.transport_attempts(e)
@@ -480,24 +482,15 @@ def score_once(text: str, call_index: int) -> dict:
             if attempt < config.MAX_RETRIES - 1:
                 time.sleep(config.RETRY_BASE_SECONDS * (2 ** attempt)
                            + random.uniform(0, 0.5))
-    return {"ok": False,
-            "error": f"{failure['error_type']}: {failure['message']}",
-            # THE CLASSIFIED REASON, not an exception name to be substring-matched.
-            # `truncated`, `refusal` and `nonterminal` all used to arrive as
-            # "IncompleteResponseError" and were treated identically.
-            "failure": failure,
-            "call_index": call_index,
-            "config_hash": call_config_hash(),
-            # The ceiling and model this attempt actually ran under. Present on FAILED
-            # envelopes as well as successful ones - that is the whole point.
-            "request": dict(request),
-            "model": config.MODEL,
-            "temperature": config.SAMPLING_TEMPERATURE,
-            # A truncated answer is billed. Dropping its usage understates the run.
-            "usage": spent_usage,
-            "transport_requests": transport or None,
-            "envelope_version": courseapi.ENVELOPE_VERSION,
-            "timestamp": datetime.now(timezone.utc).isoformat()}
+    # THE SHARED BUILDER, so this stage cannot drift from the other two. It records the
+    # classified reason - `truncated`, `refusal` and `nonterminal` all used to arrive as
+    # "IncompleteResponseError" and were treated identically - the ceiling and model the
+    # attempts actually ran under, and the accumulated bill: a truncated answer is billed,
+    # and dropping its usage understates the run against a shared allowance.
+    return courseapi.failure_envelope(
+        _last_exception, request=request, config_hash=call_config_hash(),
+        call_index=call_index, transport=transport, usage=spent_usage,
+        prompt_hash=_prompt_hash())
 
 
 # Errors that retrying cannot fix: bad credentials, malformed requests (including a schema
@@ -886,24 +879,50 @@ def aggregate(records: list[dict], docs: pd.DataFrame) -> tuple[pd.DataFrame, di
                 cat = (failure_category(call)
                        or _error_name(call) or "unrecorded")
                 reasons[cat] = reasons.get(cat, 0) + 1
-            blocked = reasons.get("content_filter", 0)
-            if blocked and blocked + len(ok) >= config.N_PARALLEL_CALLS - len(ok):
-                advice = (
-                    f"{blocked} draw(s) were stopped by the content filter, which is "
-                    f"deterministic: re-running the same document at the same settings "
-                    f"makes no new calls and will not clear it. DO NOT edit the corpus - "
-                    f"it is hash-checked and editing it invalidates the run. This is an "
-                    f"approved-service failure: report the blocked document and the "
-                    f"filter's reason in your Words write-up, email the lecturer before "
-                    f"the deadline (brief S6 step 3), and see the rubric's "
-                    f"approved-service table for what is waived.")
-            elif reasons.get("truncated"):
-                advice = (f"{reasons['truncated']} draw(s) hit the output ceiling. Raise "
-                          f"config.MAX_OUTPUT_TOKENS and re-run - only the truncated "
-                          f"draws are re-asked.")
+            # CAN THIS DOCUMENT STILL REACH THE MINIMUM? That is the only question that
+            # decides between "here is how to recover it" and "this one is genuinely
+            # blocked". The previous condition compared the filtered count against
+            # `N_PARALLEL_CALLS - len(ok)`, which double-counts the valid draws, so two
+            # valid draws plus one filtered plus two TRUNCATED ones - recoverable by
+            # raising the ceiling - were declared blocked and sent to the waiver.
+            by_ceiling = reasons.get("truncated", 0)
+            by_retry = sum(reasons.get(c, 0) for c in
+                           ("transport", "rate_limit", "nonterminal", "unrecorded"))
+            missing = config.N_PARALLEL_CALLS - len(rec["calls"])
+            unrecoverable = sum(reasons.get(c, 0) for c in
+                                ("content_filter", "refusal", "request_rejected",
+                                 "schema"))
+            reachable = len(ok) + by_ceiling + by_retry + missing
+
+            if reachable >= config.MIN_VALID_CALLS:
+                steps = []
+                if by_ceiling:
+                    steps.append(
+                        f"{by_ceiling} draw(s) hit the output ceiling - raise "
+                        f"config.MAX_OUTPUT_TOKENS and re-run; only those draws are "
+                        f"re-asked")
+                if by_retry:
+                    steps.append(
+                        f"{by_retry} draw(s) failed in transit - re-run to retry them")
+                if missing:
+                    steps.append(f"{missing} draw(s) were never made - re-run")
+                if unrecoverable:
+                    steps.append(
+                        f"the {unrecoverable} settled draw(s) stay settled and are NOT "
+                        f"re-asked, which is correct - report them")
+                advice = ("This document can still reach the minimum: "
+                          + "; ".join(steps) + ".")
             else:
-                advice = ("Re-run to fill the missing draws; do not proceed on partial "
-                          "data.")
+                advice = (
+                    f"Only {reachable} of the {config.MIN_VALID_CALLS} required draws "
+                    f"are reachable: {unrecoverable} are settled and deterministic, so "
+                    f"re-running the same document at the same settings makes no new "
+                    f"calls and will not clear them. DO NOT edit the corpus - it is "
+                    f"hash-checked and editing it invalidates the run. This is an "
+                    f"approved-service failure: report the blocked document and the "
+                    f"service's own reason in your Words write-up, email the lecturer "
+                    f"before the deadline (brief S6 step 3), and see the rubric's "
+                    f"approved-service table for what is waived.")
             raise RuntimeError(
                 f"{rec['meeting_date']}: only {len(ok)} valid calls, minimum is "
                 f"{config.MIN_VALID_CALLS}. Failed draws: "

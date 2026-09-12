@@ -359,6 +359,14 @@ ENVELOPE_CONTRACT = {
         "required": ("envelope_version", "ok", "call_index", "config_hash", "request",
                      "model", "temperature", "provenance", "model_served", "usage",
                      "transport_requests", "timestamp"),
+        # WHAT THOSE BLOCKS MUST ACTUALLY CONTAIN. A `provenance: {}` satisfies a
+        # presence check and records nothing; a `request` holding only the output ceiling
+        # cannot say which model or temperature produced the answer.
+        "nested": {
+            "provenance": ("response_status", "model_requested", "model_served",
+                           "input_sha256_16", "transport_requests"),
+            "request": ("model", "max_output_tokens"),
+        },
         "forbidden": ("failure",),
     },
     "response_failure": {
@@ -380,6 +388,78 @@ PRETRANSPORT_CATEGORIES = (
     "credentials", "deployment", "run_configuration", "unreachable", "transport",
     "rate_limit", "daily_quota", "request_rejected", "programming", "unknown",
 )
+
+
+def failure_envelope(exc: BaseException, *, request: dict, config_hash: str,
+                     call_index: int | None = None, transport: int = 0,
+                     usage: dict | None = None, **extra) -> dict:
+    """THE failure envelope. One builder, so no stage can emit an invalid one.
+
+    Replay and Shock each hand-assembled their own and each omitted different required
+    fields - Replay had no call index, config hash, model, temperature or transport
+    count; Shock had no config hash, temperature or transport count - while both declared
+    `envelope_version: 2`. A version marker on a record that does not keep the contract is
+    worse than no marker, because a loader believes it.
+    """
+    #: `transport` and `usage` are the COMPLETE totals for this logical call, current
+    #: attempt included. The builder adds nothing: it used to add the exception's own
+    #: attempts on top of a caller that had already accumulated them, which double-counted
+    #: every stage retry - a persistent 429 read as ten requests where five were made.
+    failure = describe_failure(exc, request=request)
+    envelope = {
+        "ok": False,
+        "error": f"{failure['error_type']}: {failure['message']}",
+        "failure": failure,
+        "config_hash": config_hash,
+        "request": dict(request),
+        "model": request.get("model", config.MODEL),
+        "temperature": request.get("temperature", config.SAMPLING_TEMPERATURE),
+        "usage": usage,
+        "transport_requests": transport or None,
+        "envelope_version": ENVELOPE_VERSION,
+        "timestamp": _now(),
+    }
+    if call_index is not None:
+        envelope["call_index"] = call_index
+    envelope.update(extra)
+    return envelope
+
+
+def success_envelope(response: Any, *, request: dict, config_hash: str,
+                     call_index: int | None = None, transport: int = 0,
+                     usage: dict | None = None, **extra) -> dict:
+    """THE success envelope, for the fields every stage promises.
+
+    `transport` and `usage` are what the STAGE has already spent on earlier attempts of
+    this same logical call; the response carries what the adapter spent on the last one.
+    A stage retry loop that reported only the final attempt undercounted both.
+    """
+    provenance = getattr(response, "provenance", None) or {}
+    envelope = {
+        "ok": True,
+        "config_hash": config_hash,
+        "request": getattr(response, "request", None) or dict(request),
+        "model": request.get("model", config.MODEL),
+        "temperature": request.get("temperature", config.SAMPLING_TEMPERATURE),
+        "model_served": getattr(response, "model", None),
+        "provenance": provenance,
+        "request_id": getattr(response, "id", None),
+        "usage": merge_usage(usage, getattr(response, "call_usage", None)
+                             or normalise_usage(getattr(response, "usage", None))),
+        "usage_final_response": normalise_usage(getattr(response, "usage", None)),
+        "transport_requests": transport + (provenance.get("transport_requests") or 0),
+        "envelope_version": ENVELOPE_VERSION,
+        "timestamp": _now(),
+    }
+    if call_index is not None:
+        envelope["call_index"] = call_index
+    envelope.update(extra)
+    return envelope
+
+
+def _now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
 
 
 def envelope_case(call: dict) -> str:
@@ -454,13 +534,56 @@ def envelope_contradictions(call: dict, *, config_hash: str | None = None,
     if envelope_generation(call) == "current" and not bad:
         case = envelope_case(call)
         spec = ENVELOPE_CONTRACT[case]
-        missing = [f for f in spec["required"] if call.get(f) is None]
+        # PRESENT-BUT-EMPTY IS NOT PRESENT. `provenance: {}` and `usage: {}` passed a
+        # `is None` test and so satisfied the contract while carrying nothing, which is
+        # how a version-2 success with no response-side provenance at all was accepted by
+        # all three loaders.
+        missing = [f for f in spec["required"]
+                   if call.get(f) is None
+                   or (isinstance(call.get(f), (dict, list, str))
+                       and len(call.get(f)) == 0)]
         if missing:
             bad.append(f"declares envelope_version {version} as a {case} record but is "
-                       f"missing {missing}")
+                       f"missing or empty: {missing}")
         present = [f for f in spec["forbidden"] if call.get(f) is not None]
         if present:
             bad.append(f"a {case} record must not carry {present}")
+        # NESTED REQUIREMENTS TOO. The top-level field can be a dict that omits exactly
+        # the thing it exists to record: a `provenance` without a response status, or a
+        # `request` carrying only the output ceiling, told a reader nothing while passing
+        # a presence check.
+        for parent, children in spec.get("nested", {}).items():
+            block = call.get(parent)
+            if not isinstance(block, dict):
+                continue
+            gaps = [c for c in children
+                    if block.get(c) is None
+                    or (isinstance(block.get(c), (dict, list, str))
+                        and len(block.get(c)) == 0)]
+            if gaps:
+                bad.append(f"{parent} is missing or empty: {gaps}")
+
+        # EVERY REPRESENTATION OF THE MODEL MUST AGREE WITH THE CONFIGURED ONE, not just
+        # with whichever other copy `or` happened to pick first. Changing the top-level
+        # served model AND the nested requested model to the same wrong value used to
+        # pass, because the two were compared to each other and one of them supplied the
+        # expectation.
+        prov_block = call.get("provenance") or {}
+        for field, value in (("model", call.get("model")),
+                             ("model_served", call.get("model_served")),
+                             ("provenance.model_served", prov_block.get("model_served")),
+                             ("provenance.model_requested",
+                              prov_block.get("model_requested")),
+                             ("request.model", (call.get("request") or {}).get("model"))):
+            if value is not None and value != config.MODEL:
+                bad.append(f"{field}={value!r}, but this run is configured for "
+                           f"{config.MODEL!r}")
+        for field, value in (("temperature", call.get("temperature")),
+                             ("request.temperature",
+                              (call.get("request") or {}).get("temperature"))):
+            if value is not None and value != config.SAMPLING_TEMPERATURE:
+                bad.append(f"{field}={value!r}, but this run is configured for "
+                           f"{config.SAMPLING_TEMPERATURE!r}")
     return bad
 
 

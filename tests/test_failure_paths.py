@@ -68,6 +68,7 @@ def _response(parsed=None, text=None):
         provenance={"transmitted": {"max_output_tokens": config.MAX_OUTPUT_TOKENS},
                     "model_requested": config.MODEL, "model_served": config.MODEL,
                     "response_status": "completed", "transport_requests": 1,
+                    "input_sha256_16": "0123456789abcdef",
                     "envelope_version": 2},
         model=config.MODEL)
 
@@ -1235,6 +1236,7 @@ def _ok_draw(idx, **over):
            "provenance": {"response_status": "completed",
                           "model_requested": config.MODEL,
                           "model_served": config.MODEL,
+                          "input_sha256_16": "0123456789abcdef",
                           "transport_requests": 1},
            "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11,
                      "attempts_counted": 1, "attempts_unknown": 0,
@@ -1885,6 +1887,7 @@ def _contract_response():
                         tokens_known=True, is_complete=True),
         provenance={"envelope_version": 2, "response_status": "completed",
                     "model_requested": config.MODEL, "model_served": config.MODEL,
+                    "input_sha256_16": "0123456789abcdef",
                     "transport_requests": 1})
 
 
@@ -2047,10 +2050,13 @@ def two_exposures(monkeypatch, tmp_path):
     monkeypatch.setattr(sub, "ROOT", tmp_path)
 
     def artefact(event_id=None, events=None):
+        # Exactly what the real writer emits, flags included: a fixture that omits a
+        # field the producer always writes is a fake of a defect, not of the producer.
         return {"selection": dr._read_selection(),
                 "exposure": {
                     "events": dr.exposure_events() if events is None else events,
                     "evidence_status": dr.evidence_status(),
+                    "evidence_flags": dr.evidence_flags(),
                     "holdout_event_id": event_id or b["event_id"]}}
 
     def validate(**kw):
@@ -2290,7 +2296,7 @@ def test_a_document_filtered_below_the_minimum_stops_the_stage_with_usable_advic
         tf.aggregate([{"meeting_date": "2020-01-01", "calls": calls}], docs)
     message = str(caught.value)
     assert "content_filter" in message, "the message must say WHY the draws failed"
-    assert "will not clear it" in message
+    assert "will not clear them" in message
     assert "DO NOT edit the corpus" in message
     assert "email the lecturer" in message
 
@@ -2307,3 +2313,167 @@ def test_a_truncated_document_below_the_minimum_is_told_to_raise_the_ceiling():
     docs = pd.DataFrame([{"meeting_date": "2020-01-01", "text_scored": "synthetic"}])
     with pytest.raises(RuntimeError, match="MAX_OUTPUT_TOKENS"):
         tf.aggregate([{"meeting_date": "2020-01-01", "calls": calls}], docs)
+
+
+# -------------------------------------------------------------------------------------------
+# MIXED FAILURES: RECOVERABLE VS GENUINELY BLOCKED  (recheck-4 R5)
+# -------------------------------------------------------------------------------------------
+
+def _mixed(valid, **failures):
+    """`valid` successful draws plus counts of failures by category."""
+    calls = [{"ok": True, "call_index": config.CALL_INDEX_BASE + i,
+              "parsed": _parsed_payload()} for i in range(valid)]
+    idx = valid
+    for category, n in failures.items():
+        for _ in range(n):
+            calls.append(dict(_filtered_draw(idx),
+                              failure={"category": category,
+                                       "settled": category != "transport",
+                                       "run_level": False,
+                                       "error_type": "Synthetic"},
+                              error=f"{category}: synthetic"))
+            idx += 1
+    return calls
+
+
+def _aggregate(calls):
+    import pandas as pd
+    import text_features as tf
+    docs = pd.DataFrame([{"meeting_date": "2020-01-01",
+                          "text_scored": "the Board judged that conditions warranted"}])
+    return tf.aggregate([{"meeting_date": "2020-01-01", "calls": calls}], docs)
+
+
+@pytest.mark.parametrize("calls,expect", [
+    # RECOVERABLE: the ceiling can still lift these over the minimum.
+    (_mixed(2, content_filter=1, truncated=2), "MAX_OUTPUT_TOKENS"),
+    # RECOVERABLE: a retry can.
+    (_mixed(2, content_filter=1, transport=2), "failed in transit"),
+    (_mixed(0, truncated=5), "MAX_OUTPUT_TOKENS"),
+])
+def test_a_recoverable_document_is_told_how_to_recover(calls, expect):
+    """
+    THE REGRESSION THIS PINS. The blocked/recoverable test compared the filtered count
+    against `N_PARALLEL_CALLS - len(ok)`, which double-counts the valid draws: two valid
+    draws, one filtered and two TRUNCATED ones can still reach three valid, and were
+    nevertheless declared blocked and sent to the service-failure waiver. Raising the
+    ceiling would have recovered them.
+    """
+    with pytest.raises(RuntimeError) as caught:
+        _aggregate(calls)
+    message = str(caught.value)
+    assert "can still reach the minimum" in message, message
+    assert expect in message, message
+    assert "will not clear them" not in message, (
+        "a recoverable document must not be sent to the approved-service waiver")
+
+
+@pytest.mark.parametrize("calls", [
+    _mixed(0, content_filter=5),
+    _mixed(2, content_filter=3),
+    _mixed(1, content_filter=3, refusal=1),
+])
+def test_a_genuinely_blocked_document_is_told_so(calls):
+    """Below the minimum with nothing recoverable left: the waiver route, and no loop."""
+    with pytest.raises(RuntimeError) as caught:
+        _aggregate(calls)
+    message = str(caught.value)
+    assert "will not clear them" in message, message
+    assert "DO NOT edit the corpus" in message
+    assert "email the lecturer" in message
+    assert "can still reach the minimum" not in message
+
+
+@pytest.mark.parametrize("valid", [config.MIN_VALID_CALLS,
+                                   config.N_PARALLEL_CALLS - 1])
+def test_enough_valid_draws_aggregate_despite_filtered_ones(valid):
+    df, _ev = _aggregate(_mixed(valid,
+                                content_filter=config.N_PARALLEL_CALLS - valid))
+    assert int(df.iloc[0]["n_calls_valid"]) == valid
+
+
+# -------------------------------------------------------------------------------------------
+# THE DOCUMENTED SUBMISSION ROUTES ARE THE ONES THE CHECKER ACCEPTS  (recheck-4 R7)
+# -------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("layout,accepted", [
+    ("paired", True),          # what docs/README.md now tells students to do
+    ("combined", False),       # what it used to tell them to do
+    ("moodle", True),          # the declared restricted route
+    ("subfolder", True),       # the documented per-date folder
+])
+def test_each_documented_meeting_layout_matches_the_checker(tmp_path, monkeypatch,
+                                                            layout, accepted):
+    """
+    THE DRIFT THIS PINS. The published `docs/README.md` and `docs/meetings/README.md` told
+    students to put the transcript and minutes together in ONE file per meeting. The
+    checker requires separately named files for each date, so a team following the
+    instruction in the repository they were given would fail the completeness check.
+    """
+    sub = _submission_module()
+    monkeypatch.setattr(sub, "ROOT", tmp_path)
+    meetings = tmp_path / "docs" / "meetings"
+    meetings.mkdir(parents=True)
+
+    if layout == "paired":
+        for day in ("2026-03-16", "2026-03-23"):
+            for kind in ("transcript", "minutes"):
+                (meetings / f"{day}-{kind}.md").write_text("record", encoding="utf-8")
+    elif layout == "combined":
+        for day in ("2026-03-16", "2026-03-23"):
+            (meetings / f"{day}-meeting.md").write_text(
+                "transcript and minutes together", encoding="utf-8")
+    elif layout == "subfolder":
+        for day in ("2026-03-16", "2026-03-23"):
+            (meetings / day).mkdir()
+            for kind in ("transcript", "minutes"):
+                (meetings / day / f"{kind}.md").write_text("record", encoding="utf-8")
+    else:
+        (meetings / "README.md").write_text("SUBMISSION ROUTE: Moodle\n",
+                                            encoding="utf-8")
+
+    if accepted:
+        sub.test_meeting_records_are_paired_transcripts_and_minutes()
+    else:
+        with pytest.raises(AssertionError):
+            sub.test_meeting_records_are_paired_transcripts_and_minutes()
+
+
+@pytest.mark.parametrize("name", ["cycle-transcript.md", "cycle-transcript.pdf"])
+def test_the_cycle_transcript_gate_accepts_a_file_holding_a_share_link(tmp_path,
+                                                                      monkeypatch, name):
+    """The documented route - export OR share link - must satisfy the gate as a FILE."""
+    sub = _submission_module()
+    monkeypatch.setattr(sub, "ROOT", tmp_path)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / name).write_text("https://chatgpt.com/share/synthetic-link\n",
+                             encoding="utf-8")
+    sub.test_the_cycle_transcript_is_in_the_repository()
+
+
+def test_the_shipped_signposts_do_not_satisfy_any_gate(tmp_path, monkeypatch):
+    """
+    THE BUG THIS PINS. `docs/meetings/README.md` ships as a signpost explaining both
+    routes, so it necessarily mentions Moodle, transcripts and minutes - and it SHOWED the
+    declaration line as an example. Both facts made the untouched starter pass the meeting
+    gate: the prose fallback read the explanation as a choice, and the regex read the
+    example as the choice itself. A template must declare nothing.
+    """
+    import shutil
+    sub = _submission_module()
+    monkeypatch.setattr(sub, "ROOT", tmp_path)
+    src = pathlib.Path(__file__).resolve().parent.parent / "docs"
+    shutil.copytree(src, tmp_path / "docs")
+    assert (tmp_path / "docs/meetings/README.md").exists(), "fixture did not copy"
+
+    assert sub._declared_route(tmp_path / "docs/meetings/README.md") is None, (
+        "the shipped signpost declares a submission route; as shipped it must declare "
+        "nothing, or an untouched starter passes the meeting gate by doing nothing")
+    with pytest.raises(AssertionError):
+        sub.test_meeting_records_are_paired_transcripts_and_minutes()
+
+    # And a team that fills it in IS a declaration.
+    (tmp_path / "docs/meetings/README.md").write_text(
+        "SUBMISSION ROUTE: Moodle\n", encoding="utf-8")
+    sub.test_meeting_records_are_paired_transcripts_and_minutes()
