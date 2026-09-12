@@ -1085,3 +1085,389 @@ def test_a_daily_quota_failure_is_NOT_waited_out(monkeypatch):
     with pytest.raises(unsw_ai.DailyQuotaExceededError):
         courseapi._Completions(structured=False).create(
             messages=[{"role": "user", "content": "hi"}], temperature=1.0)
+
+
+# -------------------------------------------------------------------------------------------
+# ONE TRANSPORT BUDGET, END TO END  (recheck-2 F2)
+# -------------------------------------------------------------------------------------------
+
+def _mock_stack(monkeypatch, responder):
+    """The REAL adapter/instructor/SDK stack over a MockTransport, and the request log."""
+    import httpx
+    import openai
+    import courseapi
+    import unsw_ai
+
+    sent = []
+
+    def transport(request):
+        sent.append(request)
+        return responder(request)
+
+    settings = unsw_ai.ProxySettings(proxy_url="https://mock.invalid",
+                                     access_code="synthetic", student_id="9999999",
+                                     fallback_models=())
+    sdk = openai.OpenAI(api_key="synthetic", base_url="https://mock.invalid",
+                        max_retries=0,
+                        http_client=httpx.Client(transport=httpx.MockTransport(transport)))
+    monkeypatch.setattr(unsw_ai, "build_openai_client", lambda *a, **k: sdk)
+    monkeypatch.setattr(unsw_ai.time, "sleep", lambda *a, **k: None)
+    client = unsw_ai.UNSWInstructor(settings=settings)
+    monkeypatch.setattr(unsw_ai, "get_client", lambda *a, **k: client)
+    monkeypatch.setattr(courseapi, "client_", lambda: courseapi.CourseClient())
+    return sent
+
+
+def _mock_response(status="completed", reason=None, content=None):
+    import httpx
+    import config as _c
+    body = content if content is not None else [
+        {"type": "output_text", "text": '{"value":', "annotations": []}]
+    return httpx.Response(200, json={
+        "id": "resp_synthetic", "object": "response", "created_at": 1,
+        "status": status,
+        "incomplete_details": {"reason": reason} if status == "incomplete" else None,
+        "model": _c.MODEL,
+        "output": [{"type": "message", "id": "msg_synthetic", "status": status,
+                    "role": "assistant", "content": body}],
+        "usage": {"input_tokens": 10, "output_tokens": 10, "total_tokens": 20}})
+
+
+def test_a_persistent_rate_limit_costs_ONE_budget_not_one_per_layer(monkeypatch, tmp_path):
+    """
+    THE DEFECT THIS PINS. The adapter's "exactly one retry budget" was true of the adapter
+    only: Words, Replay and Shock each wrapped config.MAX_RETRIES attempts around the
+    wrapper's rate-limit budget, so ONE persistent 429 cost 5 x 4 = 20 HTTP requests for a
+    single logical draw against a 60/minute budget shared by the whole class.
+    """
+    import httpx
+    import text_features as tf
+    import unsw_ai
+
+    sent = _mock_stack(monkeypatch, lambda r: httpx.Response(
+        429, json={"error": {"message": "Rate limit reached",
+                             "type": "rate_limit_error", "code": "rate_limit"}}))
+    monkeypatch.setattr(tf, "_schema_model", lambda: _Schema)
+    monkeypatch.setattr(tf.time, "sleep", lambda *a, **k: None)
+    envelope = tf.score_once("synthetic", config.CALL_INDEX_BASE)
+
+    budget = unsw_ai.DEFAULT_RATE_LIMIT_RETRIES + 1
+    assert len(sent) == budget, (
+        f"one persistent 429 cost {len(sent)} HTTP requests; the wrapper's budget is "
+        f"{budget} and no layer above it may open a second one")
+    assert envelope["failure"]["category"] == "rate_limit"
+
+
+def test_a_model_refusal_is_not_re_asked(monkeypatch):
+    """A refusal is a COMPLETED answer. Repairing it buys a second identical refusal."""
+    import text_features as tf
+
+    sent = _mock_stack(monkeypatch, lambda r: _mock_response(
+        status="completed",
+        content=[{"type": "refusal", "refusal": "Synthetic refusal"}]))
+    monkeypatch.setattr(tf, "_schema_model", lambda: _Schema)
+    monkeypatch.setattr(tf.time, "sleep", lambda *a, **k: None)
+    envelope = tf.score_once("synthetic", config.CALL_INDEX_BASE)
+
+    assert len(sent) == 1, f"a refusal was requested {len(sent)} times"
+    assert envelope["failure"]["category"] == "refusal", envelope["failure"]
+
+
+@pytest.mark.parametrize("status,reason,category", [
+    ("incomplete", "max_output_tokens", "truncated"),
+    ("incomplete", "content_filter", "content_filter"),
+    ("in_progress", None, "nonterminal"),
+])
+def test_each_unfinished_response_is_classified_as_itself(monkeypatch, status, reason,
+                                                          category):
+    """
+    `truncated`, `content_filter`, `refusal` and `nonterminal` all used to arrive as the
+    string "IncompleteResponseError" and be told apart by substring. They need four
+    different answers: a raised ceiling retries only the first.
+    """
+    import text_features as tf
+
+    sent = _mock_stack(monkeypatch, lambda r: _mock_response(status=status, reason=reason))
+    monkeypatch.setattr(tf, "_schema_model", lambda: _Schema)
+    monkeypatch.setattr(tf.time, "sleep", lambda *a, **k: None)
+    envelope = tf.score_once("synthetic", config.CALL_INDEX_BASE)
+
+    assert len(sent) == 1
+    assert envelope["failure"]["category"] == category, envelope["failure"]
+
+
+# -------------------------------------------------------------------------------------------
+# FAILED ENVELOPES CARRY THEIR SETTINGS  (recheck-2 F3)
+# -------------------------------------------------------------------------------------------
+
+def _ok_draw(idx, **over):
+    import text_features as tf
+    rec = {"ok": True, "parsed": {"ok": True}, "call_index": idx,
+           "config_hash": tf.call_config_hash(),
+           "model": config.MODEL, "temperature": config.SAMPLING_TEMPERATURE,
+           "prompt_hash": tf._prompt_hash(),
+           "request": {"model": config.MODEL,
+                       "temperature": config.SAMPLING_TEMPERATURE,
+                       "max_output_tokens": config.MAX_OUTPUT_TOKENS},
+           "usage": {"prompt_tokens": 10, "completion_tokens": 1},
+           "timestamp": "2026-09-12T00:00:00+00:00",
+           "envelope_version": 2}
+    rec.update(over)
+    return rec
+
+
+def test_a_real_truncation_stays_settled_at_an_unchanged_ceiling(monkeypatch, tmp_path):
+    """
+    THE REGRESSION THIS PINS. The ceiling-compatibility rule needs the ceiling the draw
+    RAN UNDER, and failure envelopes did not record one - so re-running five genuine
+    truncations at an unchanged ceiling made five fresh calls every time.
+    """
+    import text_features as tf
+
+    sent = _mock_stack(monkeypatch, lambda r: _mock_response(
+        status="incomplete", reason="max_output_tokens"))
+    monkeypatch.setattr(tf, "_schema_model", lambda: _Schema)
+    monkeypatch.setattr(tf, "run_dir", lambda: tmp_path)
+    monkeypatch.setattr(tf.time, "sleep", lambda *a, **k: None)
+    failed = tf.score_once("synthetic", config.CALL_INDEX_BASE)
+
+    assert failed["request"]["max_output_tokens"] == config.MAX_OUTPUT_TOKENS, (
+        "a failed envelope must record the ceiling it ran under")
+    indices = [config.CALL_INDEX_BASE + i for i in range(config.N_PARALLEL_CALLS)]
+    (tmp_path / "2020-06-01.json").write_text(
+        json.dumps([dict(failed, call_index=i) for i in indices]))
+
+    calls = {"n": 0}
+
+    def counted(text, idx):
+        calls["n"] += 1
+        return dict(failed, call_index=idx)
+
+    monkeypatch.setattr(tf, "score_once", counted)
+    tf.score_document("2020-06-01", "synthetic")
+    assert calls["n"] == 0, (
+        f"{calls['n']} settled truncations were re-asked at an unchanged ceiling")
+
+
+def test_a_programming_fault_aborts_instead_of_settling_the_document(monkeypatch, tmp_path):
+    """
+    THE CACHE-POISONING THIS PINS. A TypeError from the adapter was written as five
+    settled failures per document; repairing the BUG then produced zero fresh calls and
+    zero valid draws, because the configuration had not changed and every index looked
+    resolved. A fault in this repository is a property of the run, not of the document.
+    """
+    import text_features as tf
+
+    def broken(**kw):
+        raise TypeError("synthetic adapter configuration bug")
+
+    monkeypatch.setattr(tf, "_schema_model", lambda: _Schema)
+    monkeypatch.setattr(tf, "run_dir", lambda: tmp_path)
+    monkeypatch.setattr(tf.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(tf, "client_", lambda: types.SimpleNamespace(
+        beta=types.SimpleNamespace(chat=types.SimpleNamespace(
+            completions=types.SimpleNamespace(parse=broken)))))
+    tf._RUN_ABORTED.clear()
+    with pytest.raises(TypeError):
+        tf.score_document("2020-01-01", "synthetic")
+
+    cached = json.loads((tmp_path / "2020-01-01.json").read_text()) \
+        if (tmp_path / "2020-01-01.json").exists() else []
+    assert not [c for c in cached if tf._settled_failure(c)], (
+        "a programming fault was written as a settled document failure")
+
+    tf._RUN_ABORTED.clear()
+    calls = {"n": 0}
+
+    def repaired(text, idx):
+        calls["n"] += 1
+        return _ok_draw(idx)
+
+    monkeypatch.setattr(tf, "score_once", repaired)
+    rec = tf.score_document("2020-01-01", "synthetic")
+    assert calls["n"] == config.N_PARALLEL_CALLS
+    assert sum(1 for c in rec["calls"] if c["ok"]) == config.N_PARALLEL_CALLS, (
+        "repairing the bug must recover the document")
+
+
+# -------------------------------------------------------------------------------------------
+# THE CACHE VALIDATES AN ENVELOPE AGAINST ITSELF  (recheck-2 F7)
+# -------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("field,value", [
+    ("model", "some-other-model"),
+    ("temperature", 9),
+    ("prompt_hash", "not-this-rubric"),
+    ("model_served", "some-other-model"),
+])
+def test_a_cached_draw_that_contradicts_itself_is_refused(monkeypatch, tmp_path, field,
+                                                          value):
+    """
+    A MATCHING config_hash IS NOT PROVENANCE. A synthetic cache naming a different model,
+    a temperature of 9, an unrelated prompt and an `incomplete` response status loaded and
+    scored, because nothing compared the envelope's own fields against the run.
+    """
+    import text_features as tf
+
+    monkeypatch.setattr(tf, "_schema_model", lambda: _Schema)
+    monkeypatch.setattr(tf, "run_dir", lambda: tmp_path)
+    indices = [config.CALL_INDEX_BASE + i for i in range(config.N_PARALLEL_CALLS)]
+    (tmp_path / "2020-05-01.json").write_text(
+        json.dumps([_ok_draw(i, **{field: value}) for i in indices]))
+    with pytest.raises(RuntimeError, match="offline"):
+        tf.score_document("2020-05-01", "synthetic", offline=True)
+
+
+def test_a_success_recorded_as_incomplete_is_refused(monkeypatch, tmp_path):
+    import text_features as tf
+
+    monkeypatch.setattr(tf, "_schema_model", lambda: _Schema)
+    monkeypatch.setattr(tf, "run_dir", lambda: tmp_path)
+    indices = [config.CALL_INDEX_BASE + i for i in range(config.N_PARALLEL_CALLS)]
+    (tmp_path / "2020-05-02.json").write_text(json.dumps(
+        [_ok_draw(i, provenance={"response_status": "incomplete"}) for i in indices]))
+    with pytest.raises(RuntimeError, match="offline"):
+        tf.score_document("2020-05-02", "synthetic", offline=True)
+
+
+def test_a_legacy_envelope_without_transport_fields_still_loads(monkeypatch, tmp_path):
+    """Absence in a legacy record is classified, never back-filled with an invented value."""
+    import text_features as tf
+
+    monkeypatch.setattr(tf, "_schema_model", lambda: _Schema)
+    monkeypatch.setattr(tf, "run_dir", lambda: tmp_path)
+    indices = [config.CALL_INDEX_BASE + i for i in range(config.N_PARALLEL_CALLS)]
+    legacy = []
+    for i in indices:
+        rec = _ok_draw(i)
+        for gone in ("envelope_version", "prompt_hash", "model", "temperature"):
+            rec.pop(gone)
+        legacy.append(rec)
+    (tmp_path / "2020-05-03.json").write_text(json.dumps(legacy))
+    out = tf.score_document("2020-05-03", "synthetic", offline=True)
+    assert out["cached"] and len(out["calls"]) == config.N_PARALLEL_CALLS
+    assert tf.envelope_generation(out["calls"][0]) == "legacy"
+
+
+# -------------------------------------------------------------------------------------------
+# THE PILOT AUDIT IS NAMED FOR THE AUDIT  (recheck-2 F8)
+# -------------------------------------------------------------------------------------------
+
+def test_a_gate_change_does_not_overwrite_the_previous_pilot_audit(monkeypatch, tmp_path):
+    """
+    Naming the file after `call_config_hash()` alone meant a run after a GATE change wrote
+    to the same path - destroying the before-and-after pair the iteration marks are for.
+    """
+    import pandas as pd
+    import text_features as tf
+
+    docs = pd.DataFrame([{"meeting_date": "2020-01-01", "text_scored": "synthetic"}])
+    monkeypatch.setattr(tf, "load_documents", lambda: docs)
+    monkeypatch.setattr(tf, "pilot_meetings", lambda *a, **k: ["2020-01-01"])
+    monkeypatch.setattr(tf, "_guard", lambda *a, **k: True)
+    monkeypatch.setattr(tf, "_score_documents", lambda *a, **k: (
+        [], {"api_calls": 0, "prompt_tokens": 0, "completion_tokens": 0}))
+    monkeypatch.setattr(tf, "aggregate", lambda *a, **k: (
+        pd.DataFrame(), {"checked": 1, "verbatim": 1}))
+    monkeypatch.setattr(tf, "check_construct_quality", lambda *a, **k: pd.DataFrame(
+        [{"construct": "synthetic", "passes_spread": True}]))
+    monkeypatch.setattr(tf, "orientation_check", lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(tf, "PILOT_DIR", tmp_path)
+    monkeypatch.setattr(tf, "run_dir", lambda: tmp_path)
+
+    tf.run_pilot(offline=True)
+    first = sorted(tmp_path.glob("*.json"))
+    assert len(first) == 1
+    saved = json.loads(first[0].read_text())
+    assert saved["gates"]["min_spread"] == config.MIN_CONSTRUCT_SPREAD, (
+        "a saved audit must record the thresholds it was judged against")
+    assert saved["audit_id"] and saved["stage_config_hash"] and saved["call_config_hash"]
+
+    monkeypatch.setattr(config, "MIN_CONSTRUCT_SPREAD",
+                        config.MIN_CONSTRUCT_SPREAD + 0.01)
+    tf.run_pilot(offline=True)
+    assert len(sorted(tmp_path.glob("*.json"))) == 2, (
+        "the audit taken under the previous gate was overwritten")
+
+
+# -------------------------------------------------------------------------------------------
+# THE EXPOSURE LOG IS APPEND-ONLY  (recheck-2 F4)
+# -------------------------------------------------------------------------------------------
+
+@pytest.fixture()
+def frozen(monkeypatch, tmp_path):
+    monkeypatch.setattr(dr, "SELECTION_STAMP", tmp_path / "selection.json")
+    monkeypatch.setattr(dr, "EXPOSURE_LOG", tmp_path / "exposures.jsonl")
+    monkeypatch.setattr(dr, "dev_sample", lambda *a, **k: ["2020-01-01"])
+    monkeypatch.setattr(dr, "holdout_sample", lambda *a, **k: ["2020-02-01"])
+    return tmp_path
+
+
+def test_refreezing_the_same_configuration_keeps_every_recorded_exposure(frozen):
+    """
+    THE DEFECT THIS PINS. `freeze_selection()` reset `exposure_number` to 0 and `exposures`
+    to [] on EVERY freeze, so after two real exposures an ordinary same-configuration
+    `--dev` freeze wiped the evidence - and the next changed-configuration freeze was then
+    accepted without `--revalidate`, because the count it consulted was zero.
+    """
+    first = dr.freeze_selection()
+    dr.record_holdout_exposure("synthetic first exposure")
+    again = dr.freeze_selection()
+    assert again["exposure_number"] == 1
+    assert len(again["exposures"]) == 1
+    assert again["freeze_id"] == first["freeze_id"], "a no-op freeze changed its identity"
+
+    with pytest.raises(RuntimeError, match="already been run"):
+        with _patched_draw_base():
+            dr.freeze_selection()
+
+
+class _patched_draw_base:
+    def __enter__(self):
+        self._old = config.CALL_INDEX_BASE
+        config.CALL_INDEX_BASE = self._old + 100
+
+    def __exit__(self, *exc):
+        config.CALL_INDEX_BASE = self._old
+        return False
+
+
+def test_a_second_exposure_needs_declared_authority(frozen):
+    dr.freeze_selection()
+    event = dr.record_holdout_exposure("first")
+    dr.close_holdout_exposure(event["event_id"], "benchmark completed")
+    with pytest.raises(RuntimeError, match="authorises"):
+        dr.record_holdout_exposure("a genuinely new question")
+
+    with pytest.raises(RuntimeError, match="say why"):
+        dr.freeze_selection(revalidate=True)
+    dr.freeze_selection(note="the reviewer asked for a second look", revalidate=True)
+    second = dr.record_holdout_exposure("declared second exposure")
+    assert second["sequence"] == 2
+    assert dr.evidence_status() == "retrospective"
+
+
+def test_resuming_an_open_exposure_is_not_a_new_exposure(frozen):
+    dr.freeze_selection()
+    first = dr.record_holdout_exposure("first")
+    resumed = dr.record_holdout_exposure("resumed after a crash")
+    assert resumed["event_id"] == first["event_id"] and resumed["resumed"]
+    assert len(dr.exposures_recorded()) == 1
+
+
+def test_deleting_the_selection_file_does_not_restore_exposure_authority(frozen):
+    """The log is the authority on what the holdout has seen, not the freeze record."""
+    dr.freeze_selection()
+    dr.record_holdout_exposure("first")
+    (frozen / "selection.json").unlink()
+    with pytest.raises(RuntimeError, match="already been run"):
+        with _patched_draw_base():
+            dr.freeze_selection()
+
+
+def test_an_undeclared_empty_log_is_unexposed_and_a_declared_one_is_not(frozen):
+    """An empty log cannot tell "untouched" from "exposed before the log existed"."""
+    dr.freeze_selection()
+    assert dr.evidence_status() == "unexposed"
+    dr.freeze_selection(note="ran before the log existed", prior_exposure=True)
+    assert dr.evidence_status() == "previously_exposed"

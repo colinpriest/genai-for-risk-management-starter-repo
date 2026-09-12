@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
 from typing import Any
 
@@ -59,7 +60,11 @@ import unsw_ai
 
 __all__ = ["client_", "CourseClient", "ShimResponse", "normalise_usage",
            "NON_TRANSIENT_ERRORS", "IncompleteResponseError",
-           "validate_call_kwargs", "response_status"]
+           "validate_call_kwargs", "response_status",
+           "FAILURE_CATEGORIES", "SETTLED_CATEGORIES", "RUN_LEVEL_CATEGORIES",
+           "failure_category", "describe_failure", "transport_budget_spent",
+           "transport_attempts", "failed_attempt_usage", "ENVELOPE_VERSION",
+           "effective_request"]
 
 
 class IncompleteResponseError(unsw_ai.UNSWAIError):
@@ -94,6 +99,198 @@ NON_TRANSIENT_ERRORS = (
     "StructuredOutputError",
     "IncompleteResponseError",
 )
+
+# --------------------------------------------------------------------------- #
+# ONE FAILURE VOCABULARY, SHARED BY EVERY STAGE
+#
+# Words, Replay and Shock each used to decide what a failure meant by testing
+# whether an exception NAME appeared as a substring of a recorded error string.
+# That is fragile in both directions: "IncompleteResponseError" covers a
+# truncation, a refusal and a still-running response, which need three different
+# answers; and a message that happens to quote an exception name classifies
+# itself. The adapter is the only layer that sees the response object, so it is
+# the layer that classifies, once, into a CATEGORY the stages can act on.
+# --------------------------------------------------------------------------- #
+
+#: What went wrong, as a fixed vocabulary. Recorded on every failed envelope.
+FAILURE_CATEGORIES = (
+    "truncated",         # hit the output ceiling; more room may finish it
+    "content_filter",    # Foundry stopped the answer; ceiling-independent
+    "refusal",           # the model declined; a completed, final answer
+    "nonterminal",       # 200 but status not completed (in_progress, failed)
+    "schema",            # completed, well-formed, wrong shape
+    "request_rejected",  # the request itself is invalid (400/422/too large)
+    "rate_limit",        # 429: rate, request-count or token quota
+    "daily_quota",       # the daily allowance is gone; waiting is the only fix
+    "credentials",       # missing/wrong access code or header
+    "deployment",        # the model is not deployed on this proxy
+    "unreachable",       # the proxy itself did not answer
+    "transport",         # timeout, dropped connection, 5xx
+    "programming",       # a bug in this repository, not a service failure
+    "unknown",
+)
+
+#: Exception NAME -> category, for failures that do not carry their own reason.
+_CATEGORY_BY_NAME = {
+    "ContentFilteredError": "content_filter",
+    "StructuredOutputError": "schema",
+    "ValidationError": "schema",
+    "RequestTooLargeError": "request_rejected",
+    "ParameterNotSupportedError": "request_rejected",
+    "UnsupportedModeError": "request_rejected",
+    "BadRequestError": "request_rejected",
+    "UnprocessableEntityError": "request_rejected",
+    "QuotaExceededError": "rate_limit",
+    "RateLimitError": "rate_limit",
+    "DailyQuotaExceededError": "daily_quota",
+    "MissingCredentialsError": "credentials",
+    "InvalidAccessCodeError": "credentials",
+    "MissingHeaderError": "credentials",
+    "AuthenticationError": "credentials",
+    "PermissionDeniedError": "credentials",
+    "ModelNotAvailableError": "deployment",
+    "NotFoundError": "deployment",
+    "ProxyUnreachableError": "unreachable",
+    "APIConnectionError": "transport",
+    "APITimeoutError": "transport",
+    "InternalServerError": "transport",
+    "ConnectionError": "transport",
+    "TimeoutError": "transport",
+    # A TypeError from the adapter is not a service failure and must never be
+    # cached as this document's outcome: see RUN_LEVEL_CATEGORIES.
+    "TypeError": "programming",
+    "KeyError": "programming",
+    "AttributeError": "programming",
+    "IndexError": "programming",
+    "NameError": "programming",
+    "ImportError": "programming",
+    "ModuleNotFoundError": "programming",
+    "ZeroDivisionError": "programming",
+}
+
+#: THIS DOCUMENT's outcome, and deterministic at these settings. Re-asking spends
+#: the shared budget to re-learn what the envelope already records. `truncated` is
+#: settled only while the ceiling is unchanged - see the compatibility rule in
+#: text_features.reusable_under_current_ceiling.
+SETTLED_CATEGORIES = (
+    "truncated", "content_filter", "refusal", "schema", "request_rejected",
+)
+
+#: Properties of the RUN, not of any one call. Every remaining call fails the
+#: same way and the fix is outside the repository - edit .env, deploy the model,
+#: wait for the allowance, or repair the code. These must never be written as a
+#: settled document failure: doing so poisons the cache, so that correcting the
+#: fault produces zero fresh calls and zero valid draws.
+RUN_LEVEL_CATEGORIES = (
+    "credentials", "deployment", "daily_quota", "unreachable", "programming",
+)
+
+#: The only category a stage is right to re-ask itself: nothing below the stage
+#: retried it, and a second attempt is one more HTTP request rather than five.
+STAGE_RETRYABLE_CATEGORIES = ("transport",)
+
+_TRANSPORT_STAMP = "_courseapi_transport"
+
+
+def failure_category(exc: BaseException) -> str:
+    """Classify a failure into FAILURE_CATEGORIES.
+
+    `IncompleteResponseError` carries its own `reason`, because one exception
+    class covers three genuinely different outcomes: an answer cut off at the
+    ceiling (raise the ceiling), a refusal (a final answer, and re-asking is
+    pointless), and a response that had not finished when the body arrived.
+    """
+    if isinstance(exc, IncompleteResponseError):
+        reason = str(getattr(exc, "reason", "") or "")
+        if "max_output_tokens" in reason:
+            return "truncated"
+        if "content_filter" in reason:
+            return "content_filter"
+        if reason == "refusal":
+            return "refusal"
+        return "nonterminal"
+    for klass in type(exc).__mro__:
+        if klass.__name__ in _CATEGORY_BY_NAME:
+            return _CATEGORY_BY_NAME[klass.__name__]
+    return "unknown"
+
+
+def stamp_transport(exc: BaseException, *, attempts: int, budget_spent: bool,
+                    usage: dict | None = None) -> BaseException:
+    """Record on the exception how much transport this failure already cost.
+
+    THE POINT OF THIS STAMP is that a stage must not open a second retry budget
+    around one the adapter has already spent. One persistent 429 used to cost
+    5 (wrapper) x 4 (stage) = 20 HTTP requests against a 60/minute class budget
+    for a single logical draw.
+    """
+    setattr(exc, _TRANSPORT_STAMP, {
+        "attempts": int(attempts), "budget_spent": bool(budget_spent),
+        "usage": usage})
+    return exc
+
+
+def transport_attempts(exc: BaseException) -> int | None:
+    """HTTP requests this failure actually cost, when the adapter counted them."""
+    stamp = getattr(exc, _TRANSPORT_STAMP, None)
+    return None if stamp is None else stamp.get("attempts")
+
+
+def failed_attempt_usage(exc: BaseException) -> dict | None:
+    """Tokens a FAILED attempt still spent, when the service reported them.
+
+    A truncated answer is billed. Dropping its usage understates the run against
+    a shared allowance, which is the opposite of the error to make.
+    """
+    stamp = getattr(exc, _TRANSPORT_STAMP, None)
+    return None if stamp is None else stamp.get("usage")
+
+
+def transport_budget_spent(exc: BaseException) -> bool:
+    """Has the transport budget for this logical call already been spent?
+
+    True means: do not loop again in stage code. Either a lower layer already
+    retried this failure as many times as it is worth retrying, or the failure is
+    deterministic and a second identical request buys nothing.
+    """
+    stamp = getattr(exc, _TRANSPORT_STAMP, None)
+    if stamp is not None:
+        return bool(stamp.get("budget_spent"))
+    return failure_category(exc) not in STAGE_RETRYABLE_CATEGORIES
+
+
+def describe_failure(exc: BaseException, *, request: dict | None = None) -> dict:
+    """The classified failure record written onto a FAILED envelope.
+
+    A failed draw used to record only `ok`, `error`, `call_index`, `config_hash`
+    and `timestamp`. That is not enough to decide anything later: it cannot say
+    what ceiling the attempt ran under (so a raised ceiling could not retry the
+    truncations it was raised for), and it forced every consumer back to
+    substring-matching the exception name.
+    """
+    category = failure_category(exc)
+    return {
+        "category": category,
+        "error_type": type(exc).__name__,
+        "message": str(exc).splitlines()[0][:200] if str(exc) else "",
+        "status": getattr(exc, "status", None),
+        "reason": getattr(exc, "reason", None),
+        "run_level": category in RUN_LEVEL_CATEGORIES,
+        "settled": category in SETTLED_CATEGORIES,
+        "transport_attempts": transport_attempts(exc),
+        "request": dict(request) if request else None,
+        "envelope_version": ENVELOPE_VERSION,
+    }
+
+
+#: Version of the envelope CONTRACT - the set of fields a record written by this
+#: code is guaranteed to carry. Evidence committed before the move to the course
+#: proxy has no version and genuinely lacks fields that did not exist then; the
+#: loaders must be able to tell "legacy, fields unavailable" from "current, field
+#: missing", and inventing values for the first case is how false provenance gets
+#: into a report. See text_features._envelope_generation.
+ENVELOPE_VERSION = 2
+
 
 #: Everything this adapter is willing to be handed. Anything else raises rather
 #: than being dropped: `seed` and `reasoning` were both silently ignored, and a
@@ -232,9 +429,59 @@ def validate_response(raw: Any, settings=None) -> None:
         status=status, reason=reason)
 
 
+def effective_request(*, model=None, temperature=None, max_tokens=None) -> dict:
+    """EXACTLY the parameters that go to the API - no implicit defaults left
+    unstated. The output ceiling is in here because it CHANGES THE ANSWER: the
+    same prompt under a lower ceiling truncates.
+
+    Module-level and callable WITHOUT a response, because a failed draw needs it
+    too. A failure envelope that does not record the ceiling the attempt ran
+    under cannot afterwards be compared against the ceiling now in force, which
+    is precisely the comparison that decides whether raising it should re-ask.
+    """
+    # Temperature is included ONLY when the caller gave one. Defaulting it here would put
+    # a parameter into the transmitted record that the caller chose not to send, which is
+    # the same false-audit-trail problem `seed` was removed for. Every stage passes
+    # config.SAMPLING_TEMPERATURE explicitly.
+    req: dict[str, Any] = {"model": model or config.MODEL}
+    if temperature is not None:
+        req["temperature"] = temperature
+    req["max_output_tokens"] = max(
+        int(max_tokens or config.MAX_OUTPUT_TOKENS), 16)
+    return req
+
+
 #: How many times instructor may re-ask when the model returns a well-formed but
 #: INVALID object. Two means one repair attempt.
 REPAIR_ATTEMPTS = 2
+
+#: Exception names that mean "the model answered, and the answer does not fit the
+#: schema". These - and only these - are worth re-asking: the model can produce a
+#: different object next time. Every other failure either cannot change (a
+#: refusal, a rejected request) or is somebody else's budget to spend (a 429 is
+#: the wrapper's, a dropped connection is the stage's).
+_REPAIRABLE_ERRORS = (
+    "ValidationError", "InstructorRetryException", "IncompleteOutputException",
+    "JSONDecodeError", "StructuredOutputError",
+)
+
+#: Counts REAL HTTP requests for the logical call in flight on this thread.
+#: Incremented once per instructor attempt, which is one request each. Reset by
+#: `_guarded`, so it spans the wrapper's 429 retries and instructor's repairs -
+#: everything one call to `.parse()` costs.
+_http = threading.local()
+
+
+def _http_reset() -> None:
+    _http.count = 0
+
+
+def _http_count() -> int:
+    return int(getattr(_http, "count", 0) or 0)
+
+
+def _http_tick(_retry_state=None) -> None:
+    _http.count = _http_count() + 1
 
 
 def _repair_policy():
@@ -259,12 +506,22 @@ def _repair_policy():
         exc = outcome.exception() if outcome is not None else None
         if exc is None or isinstance(exc, unsw_ai._DETERMINISTIC_FAILURES):
             return False
-        status, _reason = response_status(
-            getattr(unsw_ai._recent, "response", None))
+        # ONLY a schema failure is repairable. A dropped connection is transport
+        # and belongs to the stage's backoff; a 429 belongs to the wrapper. Asking
+        # instructor to re-ask them doubles the request count for no gain.
+        if not any(k.__name__ in _REPAIRABLE_ERRORS for k in type(exc).__mro__):
+            return False
+        raw = getattr(unsw_ai._recent, "response", None)
+        # A REFUSAL IS A COMPLETED ANSWER. The status says `completed` and the
+        # body parses as nothing, so a status-only test read it as repairable and
+        # spent a second request to be refused again in the same words.
+        if _refusal_text(raw):
+            return False
+        status, _reason = response_status(raw)
         return status in (None, "completed")
     return tenacity.Retrying(
         stop=tenacity.stop_after_attempt(REPAIR_ATTEMPTS),
-        retry=worth_repairing, reraise=True)
+        retry=worth_repairing, before=_http_tick, reraise=True)
 
 
 def _sha(value: Any, n: int = 16) -> str:
@@ -323,15 +580,9 @@ class _Completions:
 
     @staticmethod
     def _transmitted(model, temperature, max_tokens) -> dict:
-        """EXACTLY the parameters that go to the API - no implicit defaults left
-        unstated. The output ceiling is in here because it CHANGES THE ANSWER:
-        the same prompt under a lower ceiling truncates."""
-        req: dict[str, Any] = {"model": model or config.MODEL}
-        if temperature is not None:
-            req["temperature"] = temperature
-        req["max_output_tokens"] = max(
-            int(max_tokens or config.MAX_OUTPUT_TOKENS), 16)
-        return req
+        """EXACTLY the parameters that go to the API."""
+        return effective_request(model=model, temperature=temperature,
+                                 max_tokens=max_tokens)
 
     @staticmethod
     def _provenance(req: dict, messages, raw, *, schema=None,
@@ -359,10 +610,15 @@ class _Completions:
             "model_served": getattr(raw, "model", None),
             "response_status": status,
             "incomplete_reason": reason,
-            # ADAPTER attempts only. Instructor may repair once inside a single adapter
-            # attempt (see _repair_policy), and the SDK is configured with max_retries=0,
-            # so this is a lower bound on HTTP requests rather than a count of them.
+            # ADAPTER attempts only: how many times this method called through.
             "adapter_attempts": attempts,
+            # REAL HTTP requests for this logical call, counted at the one place
+            # that sees each one: the instructor attempt hook on the structured
+            # path, and the per-attempt tick on the raw path. Counted separately
+            # from `adapter_attempts` because they are different numbers - the
+            # wrapper's 429 backoff and instructor's repair both sit between them.
+            "transport_requests": _http_count() or None,
+            "envelope_version": ENVELOPE_VERSION,
             "openai_version": getattr(unsw_ai.openai, "__version__", None),
             "unsw_ai_mode": str(unsw_ai.DEFAULT_MODE),
         }
@@ -399,11 +655,22 @@ class _Completions:
         So: when the wrapper already retries (`wrapper_retries=True`) this method
         only translates. When it does not - the raw `responses.create` path has
         no guard of its own - this method supplies the ONE retry budget.
+
+        AND IT SAYS SO ON THE WAY OUT. Every exception leaving here is stamped
+        with how many HTTP requests it cost and whether the budget for this
+        failure is spent, because the previous version's "exactly one retry
+        budget" was only true of the adapter: Words, Replay and Shock each still
+        wrapped four attempts of their own around it, so one persistent 429 cost
+        20 requests for a single logical draw. `transport_budget_spent()` is the
+        signal that stops them. Only `transport` failures - a timeout, a dropped
+        connection, a 5xx - leave here unspent, because nothing below the stage
+        retried them and each stage attempt is one more request rather than five.
         """
         client = unsw_ai.get_client(req["model"])
         self._no_substitution(client, req["model"])
         settings = client.settings
         retries = 0 if wrapper_retries else unsw_ai.DEFAULT_RATE_LIMIT_RETRIES
+        _http_reset()
         for attempt in range(retries + 1):
             # The wrapper stashes each raw response on a THREAD-LOCAL. Clear it
             # first: a request that fails before any response arrives (a 429, a
@@ -412,6 +679,8 @@ class _Completions:
             # call's content filter.
             unsw_ai._recent.response = None
             try:
+                if not wrapper_retries:
+                    _http_tick()      # the raw path is one request per attempt
                 return fn(), attempt + 1
             except Exception as exc:  # noqa: BLE001 - re-raised below
                 # A response that came back 200-but-unfinished makes instructor
@@ -420,9 +689,13 @@ class _Completions:
                 # and completion filtering surface as themselves instead of as a
                 # schema ValueError.
                 recent = getattr(unsw_ai._recent, "response", None)
-                if recent is not None:
-                    validate_response(recent, settings)
-                translated = unsw_ai.translate_error(exc, settings)
+                spent_usage = normalise_usage(getattr(recent, "usage", None))
+                try:
+                    if recent is not None:
+                        validate_response(recent, settings)
+                    translated = unsw_ai.translate_error(exc, settings)
+                except Exception as verdict:  # noqa: BLE001 - stamped below
+                    raise self._stamped(verdict, spent_usage) from exc
                 if (isinstance(translated, unsw_ai.QuotaExceededError)
                         and not isinstance(translated,
                                            unsw_ai.DailyQuotaExceededError)
@@ -430,9 +703,17 @@ class _Completions:
                     time.sleep(unsw_ai.backoff_seconds(translated, attempt))
                     continue
                 if translated is exc:
-                    raise
-                raise translated from exc
+                    raise self._stamped(exc, spent_usage)
+                raise self._stamped(translated, spent_usage) from exc
         raise AssertionError("unreachable")  # pragma: no cover
+
+    @staticmethod
+    def _stamped(exc: BaseException, usage: dict | None) -> BaseException:
+        """Attach the transport cost and the budget verdict before re-raising."""
+        return stamp_transport(
+            exc, attempts=_http_count() or 1,
+            budget_spent=failure_category(exc) not in STAGE_RETRYABLE_CATEGORIES,
+            usage=usage)
 
     # -- .create: free text ------------------------------------------------ #
 

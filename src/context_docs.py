@@ -313,6 +313,7 @@ def manifest(docs: dict[str, str], directory: Path | None = None) -> list[dict]:
             "title": d.get("title"),
             "url": d.get("url"),
             "retrieved": d.get("retrieved"),
+            "retrieval": d.get("retrieval", DEFAULT_RETRIEVAL_ROUTE),
             "chars": len(text),
             "pages": len(PAGE_OFFSETS.get(name, [])) or None,
             "sha256_16": hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16],
@@ -325,6 +326,16 @@ def _guess_org(name: str) -> str:
 
 
 DECLARATION_FIELDS = ("file", "organisation", "title", "url", "retrieved")
+
+#: HOW A MARKER GETS THIS DOCUMENT. The fingerprint record establishes WHICH file a
+#: declaration means; it cannot establish that a quoted passage is relevant, and the
+#: grounding marks turn on relevance. So each record says which retrieval route applies:
+#: "public" - the marker downloads it from the recorded URL; "restricted" - it is behind a
+#: login, paywall or licence that forbids redistribution, and the team supplies it through
+#: the restricted Moodle item on request. Optional, defaulting to "public", so existing
+#: declarations keep working; an unrecognised value is rejected rather than ignored.
+RETRIEVAL_ROUTES = ("public", "restricted")
+DEFAULT_RETRIEVAL_ROUTE = "public"
 
 
 def _norm_org(name: str) -> str:
@@ -384,6 +395,13 @@ def _declared_sources(directory: Path | None = None) -> dict[str, dict]:
         if not str(r["url"]).strip().lower().startswith(("http://", "https://")):
             problems.append(f"{who}: url={r['url']!r} is not a URL")
             continue
+        route = str(r.get("retrieval", DEFAULT_RETRIEVAL_ROUTE)).strip().lower()
+        if route not in RETRIEVAL_ROUTES:
+            problems.append(f"{who}: retrieval={r.get('retrieval')!r} is not one of "
+                            f"{list(RETRIEVAL_ROUTES)} - say how a marker obtains this "
+                            f"document (see the brief's source-retrieval table)")
+            continue
+        r = dict(r, retrieval=route)
         key = str(r["file"]).strip()
         if key in out:
             # a dict would keep only the LAST record for a duplicated filename, so an
@@ -404,7 +422,8 @@ def _declared_sources(directory: Path | None = None) -> dict[str, dict]:
             f"{len(problems)} problem(s) in {f}:" + chr(10) + "  - "
             + (chr(10) + "  - ").join(problems) + chr(10)
             + f"Every record needs {list(DECLARATION_FIELDS)}, a retrieval date as "
-            + "YYYY-MM-DD and a real URL. See sources.json.template.")
+            + f"YYYY-MM-DD, a real URL and a `retrieval` route from "
+            + f"{list(RETRIEVAL_ROUTES)}. See sources.json.template.")
     return out
 
 

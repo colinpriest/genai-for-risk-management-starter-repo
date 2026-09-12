@@ -52,6 +52,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Literal
@@ -538,11 +539,21 @@ def _cached_call(kind: str, system: str, user: str,
     # THE EXPOSURE IS RECORDED HERE, before the request leaves - not after the benchmark
     # finishes, and not at freeze time. Reaching this point means the cache could not
     # answer, so the held-out meetings are about to be asked something new.
-    global _EXPOSURE_RECORDED
-    if _CURRENT_SAMPLE == "holdout" and not _EXPOSURE_RECORDED:
-        _EXPOSURE_RECORDED = True
-        record_holdout_exposure(f"fresh {kind} call on the holdout sample")
+    global _EXPOSURE_RECORDED, _EXPOSURE_EVENT
+    if _CURRENT_SAMPLE == "holdout":
+        # SERIALISED, AND DURABLE BEFORE ANY WORKER GOES ON. The flag used to be set
+        # first, so the other benchmark threads saw "already recorded" and began asking
+        # the holdout while the record of that exposure was still being written.
+        with _EXPOSURE_LOCK:
+            if not _EXPOSURE_RECORDED:
+                _EXPOSURE_EVENT = record_holdout_exposure(
+                    f"fresh {kind} call on the holdout sample")
+                _EXPOSURE_RECORDED = True
     last = None
+    failure = None
+    request = courseapi.effective_request(
+        model=config.MODEL, temperature=config.SAMPLING_TEMPERATURE,
+        max_tokens=config.MAX_OUTPUT_TOKENS)
     for attempt in range(config.MAX_RETRIES):
         try:
             if schema is not None:
@@ -575,17 +586,26 @@ def _cached_call(kind: str, system: str, user: str,
             return rec
         except Exception as e:  # noqa: BLE001
             last = f"{type(e).__name__}: {str(e)[:140]}"
+            failure = courseapi.describe_failure(e, request=request)
             if type(e).__name__ in _NON_TRANSIENT:
                 path.write_text(json.dumps(
-                    {"ok": False, "kind": kind, "error": last, "prompt_sha": key,
+                    {"ok": False, "kind": kind, "error": last, "failure": failure,
+                     "prompt_sha": key, "request": dict(request),
+                     "envelope_version": courseapi.ENVELOPE_VERSION,
                      "timestamp": datetime.now(timezone.utc).isoformat()}, indent=1))
                 raise LLMCallError(
                     f"{kind} call failed with a non-transient error ({last}); retrying "
                     f"cannot fix this, so the run stops here. The failure envelope is "
                     f"{path.name}.")
+            # The adapter has already spent whatever retry budget this failure has;
+            # opening a second one here multiplied a persistent 429 by four.
+            if courseapi.transport_budget_spent(e):
+                break
             if attempt < config.MAX_RETRIES - 1:
                 time.sleep(config.RETRY_BASE_SECONDS * (2 ** attempt) + random.uniform(0, .5))
-    rec = {"ok": False, "kind": kind, "error": last, "prompt_sha": key,
+    rec = {"ok": False, "kind": kind, "error": last, "failure": failure,
+           "prompt_sha": key, "request": dict(request),
+           "envelope_version": courseapi.ENVELOPE_VERSION,
            "timestamp": datetime.now(timezone.utc).isoformat()}
     path.write_text(json.dumps(rec, indent=1))
     # a TOLERATED failure is still part of what the artefact rests on: it shaped the
@@ -743,8 +763,8 @@ def evaluate_all(k: int | None = None, strategies: list[str] | None = None,
     strategies = strategies or list(nshot.STRATEGIES)
     if meetings is None:
         meetings = dev_sample() if sample == "dev" else holdout_sample()
-    global _CURRENT_SAMPLE, _EXPOSURE_RECORDED
-    _CURRENT_SAMPLE, _EXPOSURE_RECORDED = sample, False
+    global _CURRENT_SAMPLE, _EXPOSURE_RECORDED, _EXPOSURE_EVENT
+    _CURRENT_SAMPLE, _EXPOSURE_RECORDED, _EXPOSURE_EVENT = sample, False, None
     meetings, dropped = feasible_everywhere(meetings, strategies, k)
     if dropped:
         print(f"  {len(dropped)} meeting(s) dropped so every strategy is scored on the same "
@@ -926,12 +946,30 @@ def evaluate_all(k: int | None = None, strategies: list[str] | None = None,
               f"{row['a_only']:2d}-{row['b_only']:<2d} discordant  p={row['p']:.3f}")
     print(f"  for scale, one accuracy on {n_meetings} meetings has a descriptive width of "
           f"about +/-{half:.3f}")
+    print("  THESE ARE DESCRIPTIVE RESULTS, AND THERE IS NO WINNER RULE HERE. Report the")
+    print("  discordant counts and the p; do not turn either into a decision. What the")
+    print("  exact McNemar test handles is the WITHIN-MEETING PAIRING - the same meetings")
+    print("  scored by both strategies. What it does NOT handle, and what your report has")
+    print("  to name rather than assume away:")
+    print("    - the meetings are serially dependent; the test assumes the discordant")
+    print("      pairs are independent Bernoulli trials, and they are not;")
+    print("    - the samples are drawn stratified, which the test does not model;")
+    print(f"    - {len(pairs)} pairwise comparisons are being read at once, and nothing")
+    print("      here corrects for looking at all of them.")
     print("  NEITHER number licenses 'these strategies perform equally'. A large p means")
     print("  INSUFFICIENT EVIDENCE TO DISTINGUISH them on this sample - which is what to")
-    print("  write, and what the rubric credits. The meetings are also serially dependent,")
-    print("  so treat even the paired p as approximate.")
+    print("  write, and what the rubric credits.")
 
+    # The benchmark finished, so this exposure is closed: a later resume is a NEW
+    # question and needs its own authority, while an interrupted run can be resumed
+    # inside the exposure it already recorded.
+    if _EXPOSURE_EVENT is not None:
+        close_holdout_exposure(_EXPOSURE_EVENT.get("event_id"),
+                               f"{sample} benchmark completed on {n_meetings} meetings")
     _CURRENT_SAMPLE = None
+    df.attrs["exposure_event_id"] = (
+        _EXPOSURE_EVENT or {}).get("event_id") if _EXPOSURE_EVENT else None
+    df.attrs["evidence_status"] = evidence_status()
     df.attrs["paired_comparison"] = pairs
     df.attrs["summary_majority_vote"] = summary.reset_index().to_dict("records")
     df.attrs["summary_per_draw"] = per_draw.reset_index().to_dict("records")
@@ -1239,74 +1277,294 @@ def _read_selection() -> dict:
         return {}
 
 
-def freeze_selection(note: str = "", revalidate: bool = False) -> dict:
+#: THE EXPOSURE LOG IS APPEND-ONLY AND LIVES IN ITS OWN FILE.
+#:
+#: It used to be a list and a counter inside the freeze record, which meant a freeze
+#: could erase it - and did: `freeze_selection()` reset `exposure_number` to 0 and
+#: `exposures` to [] on EVERY freeze, so after two real holdout exposures an ordinary
+#: same-configuration `--dev` freeze wiped the evidence and the next changed-configuration
+#: freeze sailed through because the count it consulted was zero. A record that the thing
+#: it constrains can rewrite is not a record. Nothing in this module ever rewrites a line
+#: of this file; new facts are appended, including the fact that an exposure finished.
+EXPOSURE_LOG = config.OUTPUTS / "replay_exposures.jsonl"
+
+#: One writer at a time, and the EVENT IS DURABLE BEFORE ANY WORKER PROCEEDS. The flag
+#: used to be set before the write, so the other benchmark workers - up to N_PARALLEL
+#: threads - could start requesting holdout data while the record of that exposure was
+#: still in flight, and a crash in between left holdout draws with no exposure recorded.
+_EXPOSURE_LOCK = threading.Lock()
+
+
+def _freeze_id(config_hash: str, frozen_at: str) -> str:
+    """A stable identity for one freeze, so events can name the freeze they belong to."""
+    return hashlib.sha256(f"{config_hash}|{frozen_at}".encode("utf-8")).hexdigest()[:12]
+
+
+def _event_id(freeze_id: str, sequence: int, at: str) -> str:
+    return hashlib.sha256(
+        f"{freeze_id}|{sequence}|{at}".encode("utf-8")).hexdigest()[:12]
+
+
+def exposure_events() -> list[dict]:
+    """Every event ever appended, oldest first. Unreadable lines are kept as errors
+    rather than skipped: a log with a damaged line must not read as a shorter history."""
+    if not EXPOSURE_LOG.exists():
+        return []
+    events = []
+    for line in EXPOSURE_LOG.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            events.append({"type": "unreadable", "raw": line[:200]})
+    return events
+
+
+def _append_event(event: dict) -> dict:
+    EXPOSURE_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with EXPOSURE_LOG.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(event, sort_keys=True) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    return event
+
+
+def exposures_recorded() -> list[dict]:
+    """The `open` events - one per time the holdout was actually asked something new."""
+    return [e for e in exposure_events() if e.get("type") == "open"]
+
+
+def open_exposure(freeze_id: str) -> dict | None:
+    """An exposure of this freeze that was started and never closed.
+
+    RESUMING ONE IS NOT A NEW EXPOSURE. A run that crashes, or that is stopped and
+    restarted to fill cache misses, is still the same question asked once; charging it a
+    second exposure would either block a legitimate resume or make the count meaningless.
+    A new exposure begins only after the previous one is closed by a completed benchmark.
+    """
+    state: dict[str, dict] = {}
+    for e in exposure_events():
+        if e.get("type") == "open":
+            state[e.get("event_id")] = e
+        elif e.get("type") == "close":
+            state.pop(e.get("event_id"), None)
+    for event in reversed(list(state.values())):
+        if event.get("freeze_id") == freeze_id:
+            return event
+    return None
+
+
+def freeze_selection(note: str = "", revalidate: bool = False,
+                     prior_exposure: bool = False) -> dict:
     """Record the strategy chosen on development, BEFORE the holdout is touched.
 
     A FREEZE IS NOT AN EXPOSURE. Freezing costs nothing and changes nothing about the
-    held-out meetings; what costs is asking them a question. `exposure_number` therefore
-    counts HOLDOUT exposures, recorded by `record_holdout_exposure()` at the moment a
-    fresh holdout draw is about to be requested. An earlier version incremented it on
-    every development freeze, so a team that iterated twice and never touched the holdout
-    reported "exposure 2" and looked as though they had.
+    held-out meetings; what costs is asking them a question. Exposures are counted in the
+    append-only `EXPOSURE_LOG`, written by `record_holdout_exposure()` at the moment a
+    fresh holdout draw is about to be requested. An earlier version incremented a counter
+    on every development freeze, so a team that iterated twice and never touched the
+    holdout reported "exposure 2" and looked as though they had.
 
-    OVERWRITING A FREEZE THE HOLDOUT HAS ALREADY SEEN NEEDS `revalidate=True`. Otherwise
-    re-freezing after a disappointing holdout result would be the whole problem, silently.
+    RE-FREEZING THE SAME CONFIGURATION IS IDEMPOTENT. It keeps the freeze identity, the
+    authorisation and every recorded event: an ordinary `--dev` re-run while iterating on
+    something that does not enter `selection_config_hash()` is not an event at all.
+
+    OVERWRITING A FREEZE THE HOLDOUT HAS ALREADY SEEN NEEDS `revalidate=True` AND A NOTE.
+    Otherwise re-freezing after a disappointing holdout result would be the whole problem,
+    silently.
+
+    `prior_exposure=True` DECLARES that the holdout was run before this log existed - the
+    honest position for evidence produced under an older workflow. It cannot be inferred:
+    an empty log looks identical whether the holdout is untouched or was exposed by a
+    process that never recorded it, and those are opposite claims. Declaring it makes the
+    evidence `previously_exposed` rather than `prospective`, which is what a marker needs
+    to read. It also requires a note saying so.
     """
     old = _read_selection()
-    exposures = int(old.get("exposure_number", 0))
-    if old and exposures > 0 and old.get("config_hash") != selection_config_hash() \
-            and not revalidate:
+    recorded = len(exposures_recorded())
+    same_configuration = bool(old) and old.get("config_hash") == selection_config_hash()
+
+    # NOTE THE ABSENCE OF `old` FROM THIS CONDITION. It used to read `if old and ...`, so
+    # DELETING outputs/replay_selection.json restored a clean slate: with no freeze record
+    # to compare against, a changed configuration froze without complaint and authorised a
+    # further exposure. The log is the authority on what the holdout has seen, and it
+    # answers that question whether or not a freeze record still exists.
+    if recorded > 0 and not same_configuration and not revalidate:
+        frozen_on = str(old.get("frozen_at"))[:10] if old else (
+            "a freeze record that is no longer present")
         raise RuntimeError(
-            f"the holdout has already been run {exposures} time(s) against the selection "
-            f"frozen on {str(old.get('frozen_at'))[:10]}, and this configuration differs "
+            f"the holdout has already been run {recorded} time(s) against the selection "
+            f"frozen on {frozen_on}, and this configuration differs "
             f"from it. Re-freezing now would mean choosing on the held-out sample.\n"
             f"If you genuinely need a second exposure, ask for it and declare it in the "
             f"report:\n"
-            f"    python src/decision_replay.py --dev --revalidate")
-    history = old.get("history", [])
-    if old:
-        history = history + [{k: old.get(k) for k in
-                              ("config_hash", "strategy", "k", "frozen_at",
-                               "exposure_number")}]
-    rec = {"config_hash": selection_config_hash(), "strategy": SHOT_STRATEGY,
-           "k": K_SHOTS, "n_seeds": N_SEEDS,
-           "call_index_base": config.CALL_INDEX_BASE,
-           "max_output_tokens": config.MAX_OUTPUT_TOKENS,
-           "frozen_at": datetime.now(timezone.utc).isoformat(),
-           # a fresh freeze has seen the holdout zero times
-           "exposure_number": 0,
-           "exposures": [],
-           "history": history,
-           "note": note,
-           "revalidated": bool(revalidate)}
+            f'    python src/decision_replay.py --dev --revalidate --note="why"')
+    if revalidate and not str(note).strip():
+        raise RuntimeError(
+            "a revalidation authorises a SECOND look at the held-out sample, so it has to "
+            "say why in words a marker can read:\n"
+            '    python src/decision_replay.py --dev --revalidate --note="..."')
+    if prior_exposure and not str(note).strip():
+        raise RuntimeError(
+            "declaring a PRIOR exposure is a statement about your own evidence, so it has "
+            "to say what happened:\n"
+            '    python src/decision_replay.py --dev --prior-exposure --note="the holdout '
+            'was run before the freeze workflow existed"')
+
+    if same_configuration:
+        # Nothing about the selection moved. Keep the identity and the authorisation; do
+        # not add a history entry for a freeze that changed nothing.
+        rec = dict(old)
+        rec["refrozen_at"] = datetime.now(timezone.utc).isoformat()
+        # A freeze record written before identities existed gets one now, derived from
+        # what it already carries, so it keeps the same identity on every later freeze.
+        rec.setdefault("freeze_id", _freeze_id(str(old.get("config_hash")),
+                                               str(old.get("frozen_at"))))
+        rec.setdefault("authorised_exposures", max(recorded, 1))
+        if note:
+            rec["note"] = note
+        if revalidate:
+            rec["authorised_exposures"] = recorded + 1
+            rec["authorisation"] = note
+            rec["revalidated"] = True
+        if prior_exposure:
+            rec["prior_exposure_declared"] = True
+    else:
+        frozen_at = datetime.now(timezone.utc).isoformat()
+        config_hash = selection_config_hash()
+        history = list(old.get("history", []))
+        if old:
+            history.append({k: old.get(k) for k in
+                            ("freeze_id", "config_hash", "strategy", "k", "frozen_at",
+                             "authorised_exposures")}
+                           | {"exposures_at_supersession": recorded})
+        rec = {"freeze_id": _freeze_id(config_hash, frozen_at),
+               "config_hash": config_hash, "strategy": SHOT_STRATEGY,
+               "k": K_SHOTS, "n_seeds": N_SEEDS,
+               "call_index_base": config.CALL_INDEX_BASE,
+               "max_output_tokens": config.MAX_OUTPUT_TOKENS,
+               "frozen_at": frozen_at,
+               # HOW MANY EXPOSURES THIS SELECTION IS ALLOWED, in total, ever. A first
+               # freeze authorises the one prospective look the design is built around.
+               # A second needs `--revalidate` and a stated reason.
+               "authorised_exposures": recorded + 1,
+               "authorisation": note if revalidate else "prospective selection freeze",
+               "note": note,
+               "history": history,
+               "revalidated": bool(revalidate),
+               # DECLARED, never inferred: an empty log cannot distinguish "the holdout is
+               # untouched" from "the holdout was run by a process that never recorded it".
+               "prior_exposure_declared": bool(prior_exposure)}
+    # DERIVED, never stored as something a freeze can reset.
+    rec["exposure_number"] = recorded
+    rec["exposure_log"] = EXPOSURE_LOG.name
+    # Both spellings, and BOTH read from the append-only log rather than from anything a
+    # freeze can set. The old `exposures` list lived inside this record and was reset to
+    # [] on every freeze; it is now a view of the log, so a freeze cannot shorten it.
+    rec["exposures"] = exposures_recorded()
+    rec["exposure_event_ids"] = [e.get("event_id") for e in rec["exposures"]]
     config.atomic_write_text(SELECTION_STAMP, json.dumps(rec, indent=1))
     return rec
+
+
+def evidence_status() -> str:
+    """How the reported holdout evidence stands in relation to the selection.
+
+    prospective          - frozen first, exposed once, and not re-frozen since.
+    previously_exposed   - the holdout had been run before the freeze that governs it.
+    retrospective        - the selection was re-frozen after the holdout was exposed.
+    unexposed            - nothing has been asked of the holdout yet.
+    """
+    rec = _read_selection()
+    events = exposures_recorded()
+    if not rec:
+        return "unexposed" if not events else "previously_exposed"
+    mine = [e for e in events if e.get("freeze_id") == rec.get("freeze_id")]
+    if not events:
+        # An empty log is only "unexposed" if nobody has declared otherwise.
+        return "previously_exposed" if rec.get("prior_exposure_declared") else "unexposed"
+    if not mine or rec.get("prior_exposure_declared"):
+        return "previously_exposed"
+    if len(events) > len(mine) or rec.get("revalidated"):
+        return "retrospective"
+    return "prospective" if len(mine) == 1 else "retrospective"
 
 
 def record_holdout_exposure(reason: str = "fresh holdout draw") -> dict:
     """Persist an exposure BEFORE the first new holdout call of this freeze.
 
-    Written to disk before the request leaves, so a run that crashes mid-benchmark still
-    leaves the evidence that the holdout was asked. Cached replay of an exposure already
-    recorded is free and does not count again - re-running the stage from committed
-    envelopes asks the held-out meetings nothing new.
+    Appended and fsynced before the request leaves, so a run that crashes mid-benchmark
+    still leaves the evidence that the holdout was asked. Cached replay of an exposure
+    already recorded is free and does not count again - re-running the stage from
+    committed envelopes asks the held-out meetings nothing new.
+
+    A NEW EXPOSURE NEEDS DECLARED AUTHORITY. The freeze says how many looks at the
+    held-out sample this selection is allowed; the first is the prospective one the design
+    exists to protect, and any further look has to be asked for with `--revalidate` and a
+    stated reason. Previously this function incremented a counter and never asked.
     """
     rec = _read_selection()
     if not rec:
         raise RuntimeError("no frozen selection to record an exposure against")
-    rec["exposure_number"] = int(rec.get("exposure_number", 0)) + 1
-    rec.setdefault("exposures", []).append({
-        "at": datetime.now(timezone.utc).isoformat(),
-        "config_hash": selection_config_hash(), "reason": reason})
-    config.atomic_write_text(SELECTION_STAMP, json.dumps(rec, indent=1))
-    print(f"    HOLDOUT EXPOSURE {rec['exposure_number']} recorded ({reason})")
-    return rec
+    freeze_id = rec.get("freeze_id") or _freeze_id(
+        str(rec.get("config_hash")), str(rec.get("frozen_at")))
+    if rec.get("config_hash") != selection_config_hash():
+        raise RuntimeError(
+            "the configuration has moved since the selection was frozen; freeze again "
+            "before asking the holdout anything.")
+
+    resumed = open_exposure(freeze_id)
+    if resumed is not None:
+        print(f"    continuing holdout exposure {resumed['sequence']} "
+              f"({resumed['event_id']}) - a resumed run is not a new exposure")
+        # `exposure_number` is carried alongside `sequence` so a caller written against
+        # the old counter-in-the-freeze-record still reads the right number.
+        return dict(resumed, resumed=True,
+                    exposure_number=resumed["sequence"],
+                    exposures=exposures_recorded())
+
+    recorded = len(exposures_recorded())
+    authorised = int(rec.get("authorised_exposures", 1))
+    if recorded >= authorised:
+        raise RuntimeError(
+            f"the held-out sample has already been exposed {recorded} time(s) and this "
+            f"freeze authorises {authorised}. Asking it again is a second experiment on "
+            f"the same data, and it has to be declared rather than taken:\n"
+            f'    python src/decision_replay.py --dev --revalidate --note="why a second '
+            f'exposure is justified"\n'
+            f"The report must then say so; the rubric credits the declaration, not the "
+            f"number of attempts.")
+
+    at = datetime.now(timezone.utc).isoformat()
+    sequence = recorded + 1
+    event = _append_event({
+        "type": "open", "event_id": _event_id(freeze_id, sequence, at),
+        "sequence": sequence, "at": at, "freeze_id": freeze_id,
+        "selection_config_hash": selection_config_hash(),
+        "strategy": SHOT_STRATEGY, "k": K_SHOTS, "n_seeds": N_SEEDS,
+        "call_index_base": config.CALL_INDEX_BASE,
+        "authorisation": rec.get("authorisation", ""),
+        "reason": reason})
+    print(f"    HOLDOUT EXPOSURE {sequence} recorded as {event['event_id']} ({reason})")
+    return dict(event, resumed=False, exposure_number=sequence,
+                exposures=exposures_recorded())
+
+
+def close_holdout_exposure(event_id: str, outcome: str = "benchmark completed") -> None:
+    """Append the fact that an exposure finished. Never edits the `open` line."""
+    if not event_id:
+        return
+    _append_event({"type": "close", "event_id": event_id, "outcome": outcome,
+                   "at": datetime.now(timezone.utc).isoformat()})
 
 
 #: Which sample the benchmark is currently running, so `_cached_call` can record an
 #: exposure at the moment a fresh HOLDOUT request is about to be made.
 _CURRENT_SAMPLE: str | None = None
 _EXPOSURE_RECORDED = False
+_EXPOSURE_EVENT: dict | None = None
 
 
 def _require_frozen_selection() -> None:
@@ -1338,12 +1596,16 @@ def _require_frozen_selection() -> None:
             f"    python src/decision_replay.py --dev --revalidate\n"
             f"A second exposure is a defensible choice you must state in the report, not a "
             f"silent one.")
-    if rec.get("exposure_number", 1) > 1:
-        print(f"    NOTE: this is holdout exposure {rec['exposure_number']}. Your report "
-              f"must say why the selection was re-frozen.")
+    recorded = len(exposures_recorded())
+    status = evidence_status()
+    if recorded > 1 or status in ("retrospective", "previously_exposed"):
+        print(f"    NOTE: the held-out sample has been exposed {recorded} time(s) and "
+              f"this evidence is {status.replace('_', ' ')}. Your report must say so, "
+              f"and why. See {EXPOSURE_LOG.name} for the events.")
 
 
-def run_dev(revalidate: bool = False, note: str = "") -> pd.DataFrame:
+def run_dev(revalidate: bool = False, note: str = "",
+            prior_exposure: bool = False) -> pd.DataFrame:
     """Development sample only, then freeze the selection. Costs no holdout exposure.
 
     `note` is recorded verbatim in the freeze. Use it when the record needs a caveat a
@@ -1355,7 +1617,8 @@ def run_dev(revalidate: bool = False, note: str = "") -> pd.DataFrame:
             "Set MEETING and write RECOMMENDATION_PROMPT and STATEMENT_PROMPT first.")
     print("  CHOOSING THE STRATEGY - development sample (the holdout is NOT touched)")
     dev = evaluate_all(sample="dev")
-    rec = freeze_selection(note=note, revalidate=revalidate)
+    rec = freeze_selection(note=note, revalidate=revalidate,
+                           prior_exposure=prior_exposure)
     seen = len(rec.get("history", []))
     print(f"\n  FROZEN: {rec['strategy']!r} at k={rec['k']}, config {rec['config_hash']}")
     print(f"  holdout exposures under this freeze: {rec['exposure_number']}"
@@ -1469,6 +1732,17 @@ def run() -> dict:
         # the freeze/exposure record, bound into the artefact so a marker reads the two
         # together rather than having to trust a separate file
         "selection": _read_selection(),
+        # THE EXPOSURE EVIDENCE, bound to the benchmark it governs. A marker can check
+        # that the holdout numbers below belong to a recorded exposure of the frozen
+        # selection, rather than taking the freeze file's word for it.
+        "exposure": {
+            "log": EXPOSURE_LOG.name,
+            "events": exposure_events(),
+            "recorded": len(exposures_recorded()),
+            "evidence_status": evidence_status(),
+            "holdout_event_id": hold.attrs.get("exposure_event_id"),
+            "selection_config_hash": selection_config_hash(),
+        },
         "benchmark_summary": {
             "dev": {
                 "assessed": dev.attrs.get("summary_majority_vote"),
@@ -1523,6 +1797,7 @@ if __name__ == "__main__":
         for _a in sys.argv:
             if _a.startswith("--note="):
                 _note = _a.split("=", 1)[1]
-        run_dev(revalidate="--revalidate" in sys.argv, note=_note)
+        run_dev(revalidate="--revalidate" in sys.argv, note=_note,
+                prior_exposure="--prior-exposure" in sys.argv)
     else:
         run()

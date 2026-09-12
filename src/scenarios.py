@@ -783,6 +783,10 @@ def llm_parsed(system: str, user: str, schema, seed_offset: int = 0) -> dict:
                     _quarantine(path, f"payload no longer validates against "
                                       f"{schema.__name__} ({type(e).__name__})")
     last = None
+    failure = None
+    request = courseapi.effective_request(
+        model=config.MODEL, temperature=config.SAMPLING_TEMPERATURE,
+        max_tokens=config.MAX_OUTPUT_TOKENS)
     for attempt in range(config.MAX_RETRIES):
         try:
             r = client_().beta.chat.completions.parse(
@@ -808,15 +812,18 @@ def llm_parsed(system: str, user: str, schema, seed_offset: int = 0) -> dict:
             return payload
         except Exception as e:  # noqa: BLE001
             last = f"{type(e).__name__}: {str(e)[:140]}"
-            if type(e).__name__ in _NON_TRANSIENT:
+            failure = courseapi.describe_failure(e, request=request)
+            # One transport budget per logical call: the adapter says when it is spent.
+            if courseapi.transport_budget_spent(e):
                 break
             if attempt < config.MAX_RETRIES - 1:
                 time.sleep(config.RETRY_BASE_SECONDS * (2 ** attempt) + random.uniform(0, .5))
     path.write_text(json.dumps(
-        {"ok": False, "error": last, "schema": schema.__name__,
-         "model": config.MODEL,
+        {"ok": False, "error": last, "failure": failure, "schema": schema.__name__,
+         "model": config.MODEL, "request": dict(request),
          "call_index": config.CALL_INDEX_BASE + seed_offset,
          "prompt_sha": key,
+         "envelope_version": courseapi.ENVELOPE_VERSION,
          "timestamp": datetime.now(timezone.utc).isoformat()}, indent=1))
     raise LLMCallError(
         f"{schema.__name__} call failed ({last}). Nothing reportable can be built from a "

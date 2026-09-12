@@ -407,7 +407,17 @@ def score_once(text: str, call_index: int) -> dict:
     nothing here can pin the model's sampling; see config.CALL_INDEX_BASE.
     """
     schema = _schema_model()
-    last_err = None
+    # THE EFFECTIVE REQUEST, COMPUTED BEFORE THE CALL, so a failure can record it.
+    # A failed envelope used to carry only ok/error/call_index/config_hash/timestamp.
+    # Without the ceiling it ran under, the compatibility rule below could not tell a
+    # truncation worth re-asking at a higher ceiling from one already settled - so
+    # re-running five real truncations at an UNCHANGED ceiling made five fresh calls.
+    request = courseapi.effective_request(
+        model=config.MODEL, temperature=config.SAMPLING_TEMPERATURE,
+        max_tokens=config.MAX_OUTPUT_TOKENS)
+    failure = None
+    spent_usage = None
+    transport = 0
     for attempt in range(config.MAX_RETRIES):
         try:
             r = client_().beta.chat.completions.parse(
@@ -427,31 +437,57 @@ def score_once(text: str, call_index: int) -> dict:
                 "provenance": getattr(r, "provenance", None),
                 "model_served": getattr(r, "model", None),
                 "config_hash": call_config_hash(),
-                "prompt_hash": _sha(SYSTEM_PROMPT + json.dumps(CONSTRUCTS, sort_keys=True)),
+                "prompt_hash": _prompt_hash(),
                 "request_id": getattr(r, "id", None),
                 "usage": getattr(r, "usage", None),
                 "attempt": attempt + 1,
+                "transport_requests": (getattr(r, "provenance", None) or {}
+                                       ).get("transport_requests"),
+                "envelope_version": courseapi.ENVELOPE_VERSION,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         except Exception as e:  # noqa: BLE001
+            failure = courseapi.describe_failure(e, request=request)
+            transport += courseapi.transport_attempts(e) or 1
+            spent_usage = courseapi.failed_attempt_usage(e) or spent_usage
             # A RUN-LEVEL failure is not this call's failure, it is the end of the run:
             # every remaining call will fail the same way, and the fix is outside the
             # repository. Recording it as a failed call instead let one run mark 66 calls
             # "failed", score twelve documents with zero valid calls, and only stop later
             # in aggregate() - by which point the cache held a corpus that looked scored
             # and was not. Worse, a mistyped access code wrote settled failures that
-            # survived correcting it. Stop here, keep what is committed, and resume once
-            # the run is configured correctly or the budget returns.
-            if type(e).__name__ in _RUN_LEVEL_ERRORS:
+            # survived correcting it, and an adapter TypeError cached five settled
+            # failures per document that survived FIXING THE BUG. Credentials, deployment,
+            # daily budget and plain programming faults are all in this class: stop here,
+            # keep what is committed, and resume once the fault is repaired.
+            if failure["run_level"]:
                 raise
-            last_err = f"{type(e).__name__}: {str(e)[:120]}"
-            if type(e).__name__ in _NON_TRANSIENT:
-                break  # a bad key or a rejected schema does not get better with backoff
+            # THE TRANSPORT BUDGET IS NOT THIS LOOP'S TO SPEND TWICE. The adapter says
+            # whether anything below it already retried this failure. One persistent 429
+            # used to cost 5 wrapper requests x 4 attempts here = 20 HTTP requests for a
+            # single logical draw, against a 60/minute budget shared by the whole class.
+            if courseapi.transport_budget_spent(e):
+                break
             if attempt < config.MAX_RETRIES - 1:
                 time.sleep(config.RETRY_BASE_SECONDS * (2 ** attempt)
                            + random.uniform(0, 0.5))
-    return {"ok": False, "error": last_err, "call_index": call_index,
+    return {"ok": False,
+            "error": f"{failure['error_type']}: {failure['message']}",
+            # THE CLASSIFIED REASON, not an exception name to be substring-matched.
+            # `truncated`, `refusal` and `nonterminal` all used to arrive as
+            # "IncompleteResponseError" and were treated identically.
+            "failure": failure,
+            "call_index": call_index,
             "config_hash": call_config_hash(),
+            # The ceiling and model this attempt actually ran under. Present on FAILED
+            # envelopes as well as successful ones - that is the whole point.
+            "request": dict(request),
+            "model": config.MODEL,
+            "temperature": config.SAMPLING_TEMPERATURE,
+            # A truncated answer is billed. Dropping its usage understates the run.
+            "usage": spent_usage,
+            "transport_requests": transport or None,
+            "envelope_version": courseapi.ENVELOPE_VERSION,
             "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
@@ -484,18 +520,57 @@ _CACHE_LOCK = threading.Lock()
 #: re-running then made ZERO fresh calls and produced ZERO valid draws, because the
 #: cache configuration had not changed and every index looked resolved. The first
 #: keystroke error silently destroyed the corpus.
+#: A PROGRAMMING FAULT IS IN THIS LIST TOO, and for the same reason. A synthetic
+#: adapter TypeError used to be cached as five settled failures per document; repairing
+#: the bug and re-running then made ZERO calls and kept ZERO valid draws, because the
+#: configuration had not changed and every index looked resolved. A bug in this
+#: repository is not a property of the document, it is a property of the run - and it is
+#: fixed in the same place a mistyped access code is fixed.
 _RUN_LEVEL_ERRORS = (
     "MissingCredentialsError", "InvalidAccessCodeError", "MissingHeaderError",
     "AuthenticationError", "PermissionDeniedError",
     "ModelNotAvailableError", "DailyQuotaExceededError",
-    "ProxyUnreachableError", "MissingHeaderError",
+    "ProxyUnreachableError",
+    "TypeError", "KeyError", "AttributeError", "IndexError", "NameError",
+    "ImportError", "ModuleNotFoundError", "ZeroDivisionError",
 )
+
+
+def envelope_generation(call: dict) -> str:
+    """"current" if this record was written under the versioned contract, else "legacy".
+
+    Evidence committed before the move to the course proxy genuinely lacks fields that
+    did not exist when it was written. That is a different thing from a current record
+    with a field missing, and the difference decides what may be concluded: a legacy
+    envelope is classified as "fields unavailable", never back-filled with a value
+    invented now. See courseapi.ENVELOPE_VERSION.
+    """
+    v = call.get("envelope_version")
+    return "current" if isinstance(v, int) and v >= courseapi.ENVELOPE_VERSION else "legacy"
+
+
+def failure_category(call: dict) -> str | None:
+    """The classified reason a draw failed, for records that carry one.
+
+    `None` means a legacy failure envelope that predates classification. Callers fall
+    back to the exception name for those and must not pretend to more.
+    """
+    if call.get("ok"):
+        return None
+    cat = (call.get("failure") or {}).get("category")
+    return cat if cat in courseapi.FAILURE_CATEGORIES else None
+
+
+def _error_name(call: dict) -> str:
+    return str(call.get("error", "")).split(":", 1)[0].strip()
 
 
 def _is_run_level(call: dict) -> bool:
     """Did this draw fail because the RUN is misconfigured, rather than the document?"""
-    name = str(call.get("error", "")).split(":", 1)[0].strip()
-    return name in _RUN_LEVEL_ERRORS
+    cat = failure_category(call)
+    if cat is not None:
+        return cat in courseapi.RUN_LEVEL_CATEGORIES
+    return _error_name(call) in _RUN_LEVEL_ERRORS      # legacy envelope
 
 
 def recorded_ceiling(call: dict) -> int | None:
@@ -505,6 +580,13 @@ def recorded_ceiling(call: dict) -> int | None:
 
 
 def _truncated(call: dict) -> bool:
+    """Did this draw stop at the output ceiling - as opposed to being refused, filtered
+    or left unfinished? All three used to arrive as `IncompleteResponseError` and a
+    substring test could not tell them apart, so a refusal was re-asked whenever the
+    ceiling moved and a truncation was settled whether or not it could still be fixed."""
+    cat = failure_category(call)
+    if cat is not None:
+        return cat == "truncated"
     return "IncompleteResponseError" in str(call.get("error", ""))
 
 
@@ -562,8 +644,94 @@ def _settled_failure(call: dict) -> bool:
         return False
     if _is_run_level(call):
         return False
-    name = str(call.get("error", "")).split(":", 1)[0].strip()
-    return name in _NON_TRANSIENT
+    cat = failure_category(call)
+    if cat is not None:
+        return cat in courseapi.SETTLED_CATEGORIES
+    return _error_name(call) in _NON_TRANSIENT         # legacy envelope
+
+
+def _prompt_hash() -> str:
+    """Identifies the rubric this draw was scored against."""
+    return _sha(SYSTEM_PROMPT + json.dumps(CONSTRUCTS, sort_keys=True))
+
+
+#: What a record written under courseapi.ENVELOPE_VERSION always carries. Checked on
+#: load, so "field missing from a current record" is a defect rather than something to
+#: shrug at, and legacy evidence is classified rather than back-filled.
+_REQUIRED_FIELDS = {
+    True:  ("call_index", "config_hash", "request", "model", "temperature",
+            "prompt_hash", "parsed", "timestamp"),
+    False: ("call_index", "config_hash", "request", "model", "temperature",
+            "failure", "timestamp"),
+}
+
+
+def _envelope_contradictions(call: dict) -> list[str]:
+    """Fields inside one envelope that disagree with each other or with this run.
+
+    A MATCHING `config_hash` IS NOT PROVENANCE. It says the run was configured the same
+    way; it says nothing about what the envelope itself claims. A hand-written cache
+    naming a different model, a temperature of 9, an unrelated prompt and a response
+    status of `incomplete` used to load and score, because nothing ever compared the
+    envelope's own fields against the configuration whose hash it carried.
+
+    ONLY FIELDS THAT ARE PRESENT ARE CHECKED. Absence in a legacy record means the field
+    did not exist when it was written, and inventing a value for it now would be exactly
+    the false provenance this validation exists to prevent.
+    """
+    bad: list[str] = []
+    current = envelope_generation(call) == "current"
+
+    def check(field, actual, expected):
+        if actual is not None and actual != expected:
+            bad.append(f"{field}={actual!r}, but this run is {expected!r}")
+
+    check("model", call.get("model"), config.MODEL)
+    check("temperature", call.get("temperature"), config.SAMPLING_TEMPERATURE)
+    check("prompt_hash", call.get("prompt_hash"), _prompt_hash())
+    req = call.get("request") or {}
+    check("request.model", req.get("model"), config.MODEL)
+    check("request.temperature", req.get("temperature"), config.SAMPLING_TEMPERATURE)
+
+    prov = call.get("provenance") or {}
+    # NO SILENT MODEL SUBSTITUTION, on the way back in as well as on the way out. An
+    # envelope whose served model differs from the one it requested is a record of an
+    # answer some other deployment produced.
+    served = call.get("model_served") or prov.get("model_served")
+    requested = prov.get("model_requested") or call.get("model") or config.MODEL
+    if served is not None and served != requested:
+        bad.append(f"model_served={served!r} but model_requested={requested!r}: "
+                   f"this answer came from a different deployment")
+    status = prov.get("response_status")
+    if call.get("ok") and status is not None and status != "completed":
+        bad.append(f"marked ok with response_status={status!r}: an unfinished response "
+                   f"is a fragment, not a result")
+    if current:
+        missing = [f for f in _REQUIRED_FIELDS[bool(call.get("ok"))]
+                   if call.get(f) is None]
+        if missing:
+            bad.append(f"declares envelope_version {call.get('envelope_version')} but "
+                       f"is missing {missing}")
+    return bad
+
+
+def _archive_superseded(out, dropped: list[tuple[dict, str]]) -> None:
+    """Keep an envelope that a settings change has replaced, instead of deleting it.
+
+    A draw re-asked under a raised ceiling overwrites its predecessor in the document
+    file. The previous version treated the committed git history as the archive, which
+    only works for teams that commit between every run - and the record most worth
+    keeping is the truncation that motivated raising the ceiling in the first place.
+    """
+    if not dropped:
+        return
+    archive = out.parent / "superseded" / f"{out.stem}.jsonl"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).isoformat()
+    with _CACHE_LOCK, archive.open("a", encoding="utf-8") as fh:
+        for call, why in dropped:
+            fh.write(json.dumps({"superseded_at": stamp, "superseded_because": why,
+                                 "envelope": call}) + "\n")
 
 
 def _load_cached_calls(out, schema) -> dict[int, dict]:
@@ -579,6 +747,7 @@ def _load_cached_calls(out, schema) -> dict[int, dict]:
     try:
         calls = json.loads(out.read_text())
         keep: dict[int, dict] = {}
+        superseded: list[tuple[dict, str]] = []
         for c in calls:
             idx = c.get("call_index")
             # DRAW IDS ARE PART OF THE EXPERIMENT, not a label. An envelope numbered
@@ -597,13 +766,22 @@ def _load_cached_calls(out, schema) -> dict[int, dict]:
                 raise ValueError(f"duplicated call_index {idx}")
             if c.get("config_hash") != call_config_hash():
                 continue
+            contradictions = _envelope_contradictions(c)
+            if contradictions:
+                raise ValueError(
+                    f"draw {idx} contradicts itself or this run: "
+                    + "; ".join(contradictions))
             if not reusable_under_current_ceiling(c):
+                superseded.append(
+                    (c, f"produced under output ceiling "
+                        f"{recorded_ceiling(c)}, now {config.MAX_OUTPUT_TOKENS}"))
                 continue        # re-ask this draw under the ceiling now in force
             if c.get("ok"):
                 schema.model_validate(c["parsed"])       # re-validate, never trust "ok"
                 keep[idx] = c
             elif _settled_failure(c):
                 keep[idx] = c
+        _archive_superseded(out, superseded)
         return keep
     except Exception as e:  # noqa: BLE001 - any invalid cache is quarantined
         bad = out.with_suffix(out.suffix + ".invalid")
@@ -1160,9 +1338,24 @@ def _write_scores(df: pd.DataFrame, which: str) -> int:
     return len(combined)
 
 
-#: Where pilot audits are kept. One file per scoring configuration, so a rubric edit
-#: produces a NEW file beside the old one and the before-and-after pair survives.
+#: Where pilot audits are kept. One file per AUDIT, not per scoring configuration: a
+#: rubric edit, a gate change, a ceiling change or a different sample each produce a new
+#: file beside the old one, so the before-and-after pair survives the edit that made it
+#: worth keeping.
 PILOT_DIR = config.OUTPUTS / "words_pilot"
+
+
+def audit_id(documents) -> str:
+    """Identity of one pilot AUDIT: the stage configuration plus the sample audited.
+
+    `call_config_hash()` is deliberately blind to gates and to the output ceiling, because
+    it keys the response cache and neither of those changes a stored answer. That makes it
+    the wrong name for an audit FILE: two audits that differ only in the gate they were
+    judged against are two different pieces of evidence, and the first version wrote both
+    to the same path.
+    """
+    return _sha(json.dumps({"stage": config_hash(),
+                            "documents": list(documents)}, sort_keys=True), 8)
 
 
 def run_pilot(dry_run: bool = False, offline: bool = False) -> pd.DataFrame | None:
@@ -1204,16 +1397,46 @@ def run_pilot(dry_run: bool = False, offline: bool = False) -> pd.DataFrame | No
     orient = orientation_check(df)
 
     PILOT_DIR.mkdir(parents=True, exist_ok=True)
-    out = PILOT_DIR / f"{call_config_hash()}.json"
+    audit = audit_id(sorted(docs["meeting_date"]))
+    out = PILOT_DIR / f"{call_config_hash()}-{audit}.json"
+    # The ceilings the draws behind this audit were ACTUALLY produced under - which is
+    # not necessarily the one now configured, since a document may be reusing draws made
+    # earlier under a lower ceiling that still satisfy the compatibility rule.
+    ceilings = sorted({c for r in records for c in
+                       [recorded_ceiling(call) for call in r.get("calls", [])]
+                       if c is not None})
     config.atomic_write_text(out, json.dumps({
         "scope": "pilot",
+        # THE AUDIT'S OWN IDENTITY, distinct from the call configuration's. Naming the
+        # file after `call_config_hash()` alone meant a run after a GATE change wrote to
+        # the same path and overwrote its predecessor - so the before-and-after pair the
+        # rubric's iteration marks are for could be destroyed by the very edit it was
+        # supposed to document. The gates and the ceiling are in the stage hash; the
+        # sample is in here too, because the same gates on a different sample is a
+        # different audit.
+        "audit_id": audit,
+        "stage_config_hash": config_hash(),
+        # kept as its own field: this is what decides CACHE REUSE, and it is deliberately
+        # blind to gates and to the ceiling.
         "call_config_hash": call_config_hash(),
-        "prompt_hash": _sha(SYSTEM_PROMPT + json.dumps(CONSTRUCTS, sort_keys=True)),
+        "prompt_hash": _prompt_hash(),
         "n_documents": len(docs),
         "documents": sorted(docs["meeting_date"]),
         "model": config.MODEL, "temperature": config.SAMPLING_TEMPERATURE,
         "max_output_tokens": config.MAX_OUTPUT_TOKENS,
+        "observed_call_ceilings": ceilings,
         "n_calls_per_document": config.N_PARALLEL_CALLS,
+        # THE THRESHOLDS THIS AUDIT WAS JUDGED AGAINST. A pass/fail column means nothing
+        # a month later without the numbers behind it, and a saved audit that omits them
+        # cannot be compared with one taken under different gates.
+        "gates": {"min_spread": config.MIN_CONSTRUCT_SPREAD,
+                  "max_binned_concentration": config.MAX_BINNED_CONCENTRATION,
+                  "bin_width": config.BIN_WIDTH,
+                  "min_effective_bins": getattr(config, "MIN_EFFECTIVE_BINS", None),
+                  "min_signal_to_noise": config.MIN_SIGNAL_TO_NOISE,
+                  "min_valid_calls": config.MIN_VALID_CALLS},
+        "expected_orientation": EXPECTED_ORIENTATION,
+        "constructs": sorted(CONSTRUCTS),
         "usage": usage,
         "evidence": ev,
         "quality": quality.round(4).to_dict("records"),
@@ -1223,8 +1446,10 @@ def run_pilot(dry_run: bool = False, offline: bool = False) -> pd.DataFrame | No
     kept = sorted(p.name for p in PILOT_DIR.glob("*.json"))
     print(f"{chr(10)}  pilot audit saved: outputs/words_pilot/{out.name}")
     if len(kept) > 1:
-        print(f"  {len(kept)} pilot audits on file - the before-and-after pair the "
-              f"rubric asks for is any two of them. Commit them.")
+        print(f"  {len(kept)} pilot audits on file. A BEFORE-AND-AFTER PAIR IS NOT ANY "
+              f"TWO OF THEM: it is two audits of comparable pilot samples whose prompt "
+              f"or gate change you can state. Each file records its documents, its "
+              f"prompt hash and its gates - cite those when you name the pair.")
     print(f"  {usage['api_calls']} fresh calls, "
           f"{usage['prompt_tokens'] + usage['completion_tokens']:,} tokens "
           f"(cached to {run_dir().name}).")

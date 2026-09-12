@@ -98,7 +98,13 @@ def _classifier():
 # ---------------------------------------------------------------------------
 
 def load_model():
-    """The fitted classifier, plus the design matrix it was trained on."""
+    """The fitted classifier, plus the FULL design matrix - all 211 meetings.
+
+    NOT "the matrix it was trained on": the fit uses a subset (the rows with a
+    resolved label, under the rolling-origin embargo), and the exported frame is
+    the whole panel so that scoring and inspection have every row available.
+    Confusing the two overstates how much data the model actually saw.
+    """
     if not (CARD / "model.joblib").exists():
         raise FileNotFoundError(
             f"model card not built - run `python src/model_card.py` first")

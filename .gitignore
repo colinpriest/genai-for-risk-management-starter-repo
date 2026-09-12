@@ -55,3 +55,14 @@ data/processed/llm_raw/_superseded/**
 !outputs/tot_trees.json
 !data/processed/shock_raw/**
 !outputs/reaction_profiles.json
+# The statement the report's hash identifies:
+!outputs/replay_statement.md
+# The Replay selection freeze and its APPEND-ONLY exposure log. Both are required
+# evidence: the freeze says what was chosen on development before the holdout was
+# touched, and the log says when the holdout was actually asked something. Neither is
+# derivable from anything else, and the submission check reads both.
+!outputs/replay_selection.json
+!outputs/replay_exposures.jsonl
+# Pilot iteration evidence - one file per audit. The rubric's iteration marks are
+# awarded for a before-and-after pair, so these must be committed as you go.
+!outputs/words_pilot/**

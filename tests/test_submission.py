@@ -328,6 +328,34 @@ def test_the_cycle_transcript_is_in_the_repository():
         "point validity gate")
 
 
+#: An EXPLICIT route declaration, on its own line, rather than a keyword hunt through
+#: prose. "SUBMISSION ROUTE: Moodle" is a statement a team makes on purpose; the word
+#: "Moodle" appearing in a sentence is not.
+_ROUTE_RE = re.compile(
+    r"^\s*(?:submission[ _-]?)?route\s*[:=]\s*(moodle|repository|repo)\b",
+    re.I | re.M)
+
+
+def _declared_route(declaration) -> str | None:
+    """"moodle", "repository", or None when the README declares no route.
+
+    The explicit line wins. Failing that - a team working from an earlier version of the
+    template, which asked for prose - a README that plainly says the records went to
+    Moodle is still honoured. The prose reading is only ever consulted when there are no
+    record files to check, so it can no longer contradict the evidence on disk.
+    """
+    if not declaration.exists():
+        return None
+    text = declaration.read_text(encoding="utf-8", errors="ignore")
+    m = _ROUTE_RE.search(text)
+    if m:
+        return "moodle" if m.group(1).lower() == "moodle" else "repository"
+    low = text.lower()
+    if "moodle" in low and any(w in low for w in ("transcript", "minutes", "records")):
+        return "moodle"
+    return None
+
+
 def test_meeting_records_are_paired_transcripts_and_minutes():
     """
     The naming convention from the meeting-records template: for every recorded meeting,
@@ -340,35 +368,38 @@ def test_meeting_records_are_paired_transcripts_and_minutes():
              if p.is_file() and p.suffix.lower() in (".md", ".pdf", ".txt", ".docx")] \
         if d.exists() else []
 
-    # THE RESTRICTED-MOODLE ROUTE. The brief offers teams a choice: keep identifiable
-    # records in the private repository, or submit them to the restricted Moodle item and
-    # declare that here. The second route used to fail this test, so the privacy-
-    # preserving option the brief recommends was the one that broke the submission check.
+    # RECORD FILES ARE EVIDENCE; THE README IS A ROUTE DECLARATION. Deciding the route by
+    # scanning the README for the word "Moodle" got this backwards. The assignment itself
+    # requires a mid-term Moodle delivery, so "mid-term transcripts were submitted on
+    # Moodle; all records are also stored here" is an ordinary, accurate sentence - and it
+    # made a complete, correctly paired private repository FAIL, because the scan read it
+    # as choosing the Moodle-only route and then objected to the records being present.
     #
-    # The declaration is a claim, not evidence: what it does is tell the marker where the
-    # records are, and put the team on record as having made them. Staff verify receipt on
-    # Moodle. A team that declares records it never submitted has made a false statement
-    # rather than slipped through a gap.
+    # So: if the records are here, they are checked, whatever the README says about where
+    # else they went. The declaration is consulted only when there is nothing to check.
+    records = [p for p in files if "readme" not in p.name.lower()]
     declaration = d / "README.md"
-    if declaration.exists():
-        text = declaration.read_text(encoding="utf-8", errors="ignore").lower()
-        if "moodle" in text and any(w in text for w in
-                                    ("transcript", "minutes", "records")):
-            assert not files or all("readme" in p.name.lower() for p in files), (
-                "docs/meetings/README.md declares the records were submitted to Moodle, "
-                "but the folder also contains record files. Choose one route: either the "
-                "records live here, or they live on Moodle and this folder only explains "
-                "that.")
-            return
+    route = _declared_route(declaration)
 
-    assert files, (
-        "docs/meetings/ is missing or holds no transcript/minutes files - the meeting "
-        "records are a condition of assessment and are read for the individual 10. If "
-        "your team submitted them to the restricted Moodle item instead, say so in "
-        "docs/meetings/README.md (see the brief's submission matrix) and this check will "
-        "accept that declaration.")
+    if not records:
+        # THE RESTRICTED-MOODLE ROUTE. The brief offers teams a choice: keep identifiable
+        # records in the private repository, or submit them to the restricted Moodle item
+        # and declare that here. The declaration is a claim, not evidence: it tells the
+        # marker where the records are and puts the team on record as having made them.
+        # Staff verify receipt on Moodle. A team that declares records it never submitted
+        # has made a false statement rather than slipped through a gap.
+        assert route == "moodle", (
+            "docs/meetings/ is missing or holds no transcript/minutes files - the meeting "
+            "records are a condition of assessment and are read for the individual 10. If "
+            "your team submitted them to the restricted Moodle item instead, declare the "
+            "route on its own line in docs/meetings/README.md:\n"
+            "    SUBMISSION ROUTE: Moodle\n"
+            "and this check will accept that declaration (see the brief's submission "
+            "matrix).")
+        return
+
     kinds: dict[str, set] = {}
-    for p in files:
+    for p in records:
         dm = re.search(r"\d{4}-\d{2}-\d{2}", str(p.relative_to(d)))
         km = re.search(r"transcript|minutes", p.name, re.I)
         if dm and km:
@@ -653,6 +684,84 @@ def test_replay_artefact_matches_the_prompts_and_reviews_in_this_repository():
         "the claim reviews persisted in replay.json differ from CLAIM_REVIEWS")
 
 
+def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposure():
+    """
+    THE GAP THIS CLOSES. The suite checked the Replay prompts and the claim reviews, but
+    nothing required the selection freeze or the exposure record to exist at all. A
+    private-copy probe deleted outputs/replay_selection.json, the embedded "selection"
+    block and both A/B prompt hashes, and the submission suite stayed exactly as green as
+    before - so the one safeguard standing between "chosen on development" and "chosen on
+    the held-out sample" was unverified at submission time.
+    """
+    import decision_replay as dr
+    rep = _artefact("replay.json")
+
+    stamp = ROOT / "outputs" / dr.SELECTION_STAMP.name
+    assert stamp.exists(), (
+        f"outputs/{dr.SELECTION_STAMP.name} is missing - the holdout result has no frozen "
+        f"selection to belong to. Run:  python src/decision_replay.py --dev")
+    selection = json.loads(stamp.read_text(encoding="utf-8"))
+
+    embedded = rep.get("selection") or {}
+    assert embedded, "replay.json carries no embedded selection record - regenerate it"
+    assert embedded.get("config_hash") == selection.get("config_hash"), (
+        "the selection embedded in replay.json is not the one in "
+        f"outputs/{dr.SELECTION_STAMP.name} - one of them is stale")
+    assert embedded.get("config_hash") == dr.selection_config_hash(), (
+        "the frozen selection does not match this repository's prompts, strategy, k, seed "
+        "count, draw indices, output ceiling, benchmark samples or panel - the reported "
+        "holdout numbers were produced under a different selection")
+
+    # THE EXPOSURE THE HOLDOUT NUMBERS BELONG TO, bound to the freeze that governs it.
+    exposure = rep.get("exposure") or {}
+    assert exposure.get("events") is not None, (
+        "replay.json carries no exposure record - regenerate the Replay stage")
+    opened = [e for e in exposure["events"] if e.get("type") == "open"]
+    # EITHER the log records the exposure, OR the team declares that it happened before
+    # the log existed. An empty log means one of two opposite things - untouched, or
+    # exposed by a process that never recorded it - and the difference has to be stated
+    # rather than inferred. What is NOT acceptable is holdout results with neither.
+    declared_prior = bool(selection.get("prior_exposure_declared"))
+    assert opened or declared_prior, (
+        "the holdout results are reported, but no holdout exposure was recorded and none "
+        "was declared. Either regenerate the stage so the log records what was asked, or "
+        "declare an exposure that predates the log:\n"
+        '    python src/decision_replay.py --dev --prior-exposure --note="..."')
+    assert all(e.get("selection_config_hash") == selection.get("config_hash")
+               for e in opened), (
+        "a recorded holdout exposure belongs to a different selection than the frozen "
+        "one - the reported result and the exposure record disagree")
+    status = exposure.get("evidence_status")
+    assert status in ("prospective", "retrospective", "previously_exposed"), (
+        "replay.json does not classify how its holdout evidence stands in relation to "
+        "the selection")
+    if declared_prior:
+        assert status == "previously_exposed", (
+            f"the selection declares a prior exposure but the artefact reports "
+            f"{status!r} - regenerate the Replay stage so the two agree")
+        assert str(selection.get("note", "")).strip(), (
+            "a declared prior exposure must say what happened, in words a marker reads")
+
+
+def test_the_causal_ab_comparison_used_two_genuinely_different_prompts():
+    """
+    Guidance that is blank, or identical in both arms, makes the A/B comparison a
+    comparison of one thing with itself. The runner rejects that; nothing verified it at
+    SUBMISSION time, so an artefact with the prompt identities stripped out passed.
+    """
+    rep = _artefact("replay.json")
+    plain = rep.get("recommendation_plain") or {}
+    guided = rep.get("recommendation_guided") or {}
+    for name, arm in (("recommendation_plain", plain), ("recommendation_guided", guided)):
+        assert arm.get("prompt_sha"), (
+            f"replay.json[{name!r}] carries no prompt_sha - the A/B arms cannot be shown "
+            f"to have asked different questions. Rerun the Replay stage.")
+    assert plain["prompt_sha"] != guided["prompt_sha"], (
+        "the guided and unguided recommendations were produced from the SAME prompt, so "
+        "the reported comparison is between a thing and itself. Write real causal "
+        "guidance and rerun.")
+
+
 def test_shock_artefact_matches_the_prompts_and_judgements_in_this_repository():
     import scenarios as sc
     sh = _artefact("shock.json")
@@ -701,3 +810,56 @@ def test_reaction_profiles_artefact_schema():
             f"{name}: expected profile does not cover the seven constructs")
         assert rec.get("claimed_analogue"), f"{name}: no claimed analogue recorded"
     assert "excluded_constructs" in rp
+
+
+#: Evidence the submission matrix REQUIRES, which `.gitignore` must therefore let out.
+#: outputs/ is ignored by default with a per-file allowlist, and three required files were
+#: missing from it - a team following the instructions would have had them silently
+#: dropped by git, and the marker would have read their absence as work not done.
+REQUIRED_COMMITTED_EVIDENCE = (
+    "outputs/cycle.json",
+    "outputs/words_audit.json",
+    "outputs/words_validation.json",
+    "outputs/words_pilot/0123abcd-4567ef01.json",
+    "outputs/replay.json",
+    "outputs/replay_statement.md",
+    "outputs/replay_selection.json",
+    "outputs/replay_exposures.jsonl",
+    "outputs/shock.json",
+    "outputs/tot_trees.json",
+    "outputs/reaction_profiles.json",
+    "data/processed/construct_scores.parquet",
+)
+
+
+@pytest.mark.submission
+def test_gitignore_lets_every_required_artefact_be_committed(tmp_path):
+    """
+    Asked of REAL git, not of a regex over the file: the allowlist uses negated patterns
+    whose interaction with directory ignores is exactly the part that is easy to get
+    wrong, and a hand-rolled matcher would agree with the bug.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:                      # pragma: no cover
+        pytest.skip("git is not on PATH")
+    ignore = ROOT / ".gitignore"
+    if not ignore.exists():
+        pytest.skip("no .gitignore in this repository")
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True,
+                   capture_output=True)
+    shutil.copyfile(ignore, tmp_path / ".gitignore")
+    for rel in REQUIRED_COMMITTED_EVIDENCE:
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("{}", encoding="utf-8")
+
+    dropped = [rel for rel in REQUIRED_COMMITTED_EVIDENCE
+               if subprocess.run(["git", "check-ignore", "-q", rel], cwd=tmp_path,
+                                 capture_output=True).returncode == 0]
+    assert not dropped, (
+        f".gitignore would silently drop required submission evidence: {dropped}. "
+        f"Add a negated pattern for each - the submission check reads these files, and a "
+        f"team cannot be marked on evidence git refused to commit.")

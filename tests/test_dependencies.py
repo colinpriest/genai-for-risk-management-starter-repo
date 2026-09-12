@@ -114,7 +114,7 @@ def test_a_genuinely_fresh_virtualenv_can_import_every_stage(tmp_path):
     """
     THE REAL INSTALLATION TEST, opt-in because it downloads packages:
 
-        python -m pytest tests/test_clean_checkout.py -m slow_install -q
+        python -m pytest tests/test_dependencies.py -m slow_install -q
 
     Builds an empty virtual environment, installs ONLY the declared requirements
     under the pinned constraints, and imports each stage module. The fast static

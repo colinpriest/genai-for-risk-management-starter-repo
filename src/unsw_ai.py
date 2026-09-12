@@ -373,14 +373,37 @@ def _looks_like_placeholder(value: str) -> bool:
     return any(marker in low for marker in _PLACEHOLDER_MARKERS)
 
 
+#: Overrides the ``.env`` search from the environment. Set it to a path to read that
+#: file and nothing else; set it to "none" (or an empty string) to DISABLE the search
+#: entirely, so the process environment is the only source of credentials.
+#:
+#: This exists because an offline test that carefully sets empty credentials and a
+#: loopback endpoint could still be overridden by an ancestor ``.env`` it never knew
+#: about - the walk up the parents found the developer's real file, and file values beat
+#: the environment. A test that cannot switch the discovery off cannot promise isolation.
+DOTENV_PATH_VAR = "DOTENV_PATH"
+
+_DOTENV_DISABLED = ("none", "", "off", "0", "false")
+
+
 def find_env_file(start: str | os.PathLike[str] | None = None) -> Path | None:
     """Locate the nearest ``.env``.
 
-    Searches, in order: ``start`` (default: the current working directory) and
+    ``DOTENV_PATH`` in the environment overrides everything: a path is used directly,
+    and "none" disables the search so nothing on disk can contribute credentials.
+
+    Otherwise searches, in order: ``start`` (default: the current working directory) and
     each of its parents, then the directory holding this module.  Returns
     ``None`` when no ``.env`` exists anywhere on that path - the process
     environment is then the only source of credentials.
     """
+    override = os.environ.get(DOTENV_PATH_VAR)
+    if override is not None:
+        if override.strip().lower() in _DOTENV_DISABLED:
+            return None
+        explicit = Path(override).expanduser()
+        return explicit if explicit.is_file() else None
+
     candidates: list[Path] = []
     base = Path(start) if start is not None else Path.cwd()
     base = base.resolve()
