@@ -1,6 +1,11 @@
 """
 unsw_ai.py - an `instructor`-compatible client for the UNSW AI Foundry student proxy.
 
+Upstream: https://github.com/colinpriest/UNSW-student-ChatGPT-API-wrapper
+This file is VENDORED, not installed: the copy here is the one the assignment is tested
+against, and it does not update underneath you. Report problems with it to the course
+staff rather than editing it - `src/courseapi.py` is the layer the assignment calls.
+
 The UNSW proxy (see `student-guide.docx`) is a thin pass-through to the Azure
 OpenAI **Responses API**.  It differs from a stock OpenAI endpoint in two ways:
 

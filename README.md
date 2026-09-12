@@ -7,9 +7,14 @@ The case study is Australian monetary policy — can we tell whether the RBA is 
 easing, stable or hardening phase, and what would the Board do about a shock that has never
 happened? **You are marked on what you checked, not on what the models produced.**
 
-Read **the assignment brief on Moodle** first — if you received this repository on its
-own, the relative link that used to sit here does not resolve — then [TRAPS.md](TRAPS.md)
-before you write any code.
+Read **the assignment brief on Moodle** first — then [TRAPS.md](TRAPS.md) before you
+write any code.
+
+This repository is published at
+<https://github.com/colinpriest/genai-for-risk-management-starter-repo>; the ZIP on Moodle
+is the same release. **Your work does not go back there** — you cannot push to it, and a
+public fork publishes your team's answers. Push this into your own **private** repository
+as its first commit and add the teaching accounts listed on Moodle (brief §7).
 
 ## Setup
 
