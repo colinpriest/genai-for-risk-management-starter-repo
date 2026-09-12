@@ -98,6 +98,7 @@
     ]
   },
   "n_features_negative": 11,
+  "n_features_mc_interval_clear_of_zero": 14,
   "n_features_significant": 14,
   "regime_probability_populations": {
     "rows_described": 211,

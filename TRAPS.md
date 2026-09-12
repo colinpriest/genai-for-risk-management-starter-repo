@@ -49,13 +49,26 @@ it was being asked to judge.
 
 ## Live in the code and the judgements you supply
 
-### 4. Rolling origin, or nothing
+### 4. Use the supplied protocol for the kind of claim you are making
 
 `sklearn.model_selection.cross_val_score` and `train_test_split` both leak here. Policy is
 strongly autocorrelated, so a randomly chosen test meeting usually sits between two training
 meetings that between them nearly give the answer away. Your numbers will look excellent.
 
-Use `evaluation.rolling_origin()`. **This is the rubric's −20 mark validity gate.**
+There is more than one supplied protocol, because the stages predict different things:
+
+- **Cycle** classifier accuracy → `evaluation.rolling_origin()`, **with the
+  label-availability embargo**. It refuses to run without one, so this is now hard to get
+  wrong by accident.
+- **Replay** strategy accuracy → the supplied paired benchmark
+  `decision_replay.evaluate_all()`, chosen on `dev_sample()` and reported on
+  `holdout_sample()`. It is **not** a rolling-origin fit, and re-deriving it as one is
+  wrong rather than safer.
+
+**The −20 raw-stage-point gate is for leaking information that was not available at
+prediction time** — a random split, k-fold, training on labels that had not resolved, or
+choosing a strategy on the sample you then report. It is not for using Replay's evaluator
+on Replay.
 
 ### 5. The scaler must be refitted inside the window
 
@@ -82,9 +95,14 @@ decision, so you cannot build the question from the raw panel by accident. Pass
 ### 7. Do not choose your strategy on the meetings you then report
 
 Four strategies, and the best of four always looks better than it is. Iterate on
-`dev_sample()`; run `holdout_sample()` **once** and report what it gives you. Our own worked
-solution found all four strategies tied at 0.778 on dev — a four-way tie is a result, and
-reporting the "winner" would have been reporting a coin toss.
+`dev_sample()` and freeze what you chose (`python src/decision_replay.py --dev`); the
+holdout then runs **once**, against that frozen selection, and you report what it gives you.
+
+Expect the four strategies to sit close together. With this many meetings the rough
+descriptive width on any single accuracy is wide enough to cover a gap of several points, so
+"we cannot distinguish these four on this evidence" is a legitimate — and often correct —
+result. It is not the same claim as "they perform equally", and the runner prints the
+distinction. Reporting a "winner" separated by less than the noise is reporting a coin toss.
 
 ### 8. Never shock a policy-outcome variable
 
@@ -109,6 +127,8 @@ one and publishing the other is not a safeguard.
 
 What remains sayable is `channel_direction()`: a tally of YOUR adjudicated channels,
 aggregated by mechanism, carrying no probability and labelled as human reasoning wherever it
-appears. Both worked scenarios land out of support, and "the model cannot speak here,
-here is why, and here is what our channels say instead" is the complete answer. Quoting a
-model probability or a model direction anyway is an 8-mark gate.
+appears. A severe geopolitical shock can easily land outside the support of a model fitted
+on ordinary meetings — check, rather than assume, and check per base row, because the answer
+can differ between them. Where it does land outside, "the model cannot speak here, here is
+why, and here is what our channels say instead" is the complete answer. Quoting a model
+probability or a model direction anyway is an 8-mark gate.

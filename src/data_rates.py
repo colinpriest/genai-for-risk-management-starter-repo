@@ -195,11 +195,89 @@ def load_rates_daily() -> pd.DataFrame:
         df["slope_cash3y"] = df["bond_3y"] - df["cash_rate"]
 
     df.index.name = "date"
+
+    # REQUIRED-INPUT CONTRACT. The warnings above are diagnostics; this is the gate. The
+    # source workbooks are VENDORED, so the features the panel depends on are required:
+    # a build that silently continued without bond yields would drop slope_cash3y - the
+    # model's second-largest feature - and every downstream number with it. The OIS
+    # series are the documented exception: FENICS stopped supplying them in 2022 and
+    # they are retained as a 2006-2022 cross-check only.
+    import numpy as np
+    required = ("cash_rate", "bab_3m", "bond_3y", "bond_10y",
+                "bab_spread", "slope_cash3y", "slope_3y10y")
+    problems = [c for c in required if c not in df.columns]
+    have = [c for c in required if c in df.columns]
+    # empty columns first: on an all-NaN column isna().mean() is 1.0 but a ZERO-ROW frame
+    # gives NaN, which silently failed the old > 0.20 comparison
+    problems += [f"{c} is empty" for c in have if df[c].dropna().empty]
+    problems += [f"{c} ({df[c].isna().mean():.0%} missing)" for c in have
+                 if not df[c].dropna().empty and df[c].isna().mean() > 0.20]
+    problems += [f"{c} contains non-finite values" for c in have
+                 if not df[c].dropna().empty
+                 and not np.isfinite(df[c].dropna().to_numpy()).all()]
+    # broad plausibility, to catch parsing errors rather than police economics
+    bounds = {"cash_rate": (0.0, 25.0), "bab_3m": (-2.0, 30.0),
+              "bond_3y": (-2.0, 30.0), "bond_10y": (-2.0, 30.0),
+              "bab_spread": (-10.0, 10.0), "slope_cash3y": (-10.0, 10.0),
+              "slope_3y10y": (-10.0, 10.0)}
+    for c, (lo, hi) in bounds.items():
+        if c in df.columns and not df[c].dropna().empty:
+            v = df[c].dropna()
+            if float(v.min()) < lo or float(v.max()) > hi:
+                problems.append(f"{c} outside plausible range [{lo}, {hi}] "
+                                f"(min {v.min():.2f}, max {v.max():.2f})")
+    if len(df) < 4000:
+        problems.append(f"only {len(df)} daily rows - the corpus window needs ~5,000")
+    if not df.index.is_unique:
+        problems.append("duplicated dates in the daily rate frame")
+    if not df.index.is_monotonic_increasing:
+        problems.append("dates are not sorted in the daily rate frame")
+    # CHRONOLOGICAL COVERAGE, not just volume
+    if len(df):
+        if df.index.min() > pd.Timestamp(config.CORPUS_START) + pd.Timedelta(days=7):
+            problems.append(f"rates start {df.index.min().date()}, after the corpus "
+                            f"start")
+        if df.index.max() < pd.Timestamp(config.CORPUS_LAST_MEETING):
+            problems.append(f"rates end {df.index.max().date()}, before the last "
+                            f"meeting {config.CORPUS_LAST_MEETING}")
+    if problems:
+        raise RuntimeError(
+            f"required rate series failed to build: {problems}. The raw workbooks are "
+            f"vendored, so this is a corrupt or renamed input, not a normal condition - "
+            f"restore data/raw and re-run.")
     return df
 
 
+def _check_decisions(dec: pd.DataFrame) -> pd.DataFrame:
+    """
+    REQUIRED-INPUT CONTRACT for A2. A decision series that is empty, stops short of the
+    corpus, or contains no hikes or no cuts is a corrupt or truncated workbook - the
+    panel built from it would look complete while fabricating the target.
+    """
+    problems = []
+    if dec.empty:
+        problems.append("no decisions parsed from a02hist.xlsx")
+    else:
+        in_corpus = dec.loc[config.CORPUS_START:]
+        if not dec.index.is_unique:
+            problems.append("duplicated decision dates")
+        if in_corpus.empty or in_corpus.index.max() < pd.Timestamp("2024-01-01"):
+            problems.append(f"decisions end at {dec.index.max().date()} - the corpus "
+                            f"window is not covered")
+        if not (in_corpus["change_pct"] > 0).any():
+            problems.append("no hikes in the corpus window")
+        if not (in_corpus["change_pct"] < 0).any():
+            problems.append("no cuts in the corpus window")
+    if problems:
+        raise RuntimeError(
+            f"decision series failed to build: {problems}. The raw workbook is "
+            f"vendored, so this is a corrupt or renamed input - restore data/raw "
+            f"and re-run.")
+    return dec
+
+
 def run() -> tuple[pd.DataFrame, pd.DataFrame]:
-    dec = load_decisions()
+    dec = _check_decisions(load_decisions())
     rates = load_rates_daily()
 
     in_corpus = dec.loc[config.CORPUS_START:]

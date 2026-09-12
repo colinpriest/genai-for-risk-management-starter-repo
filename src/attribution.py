@@ -26,14 +26,26 @@ import evaluation as ev
 
 def permutation_importance_oos(panel: pd.DataFrame, tiers: dict, target: str,
                                upto: list[str], clf=None, n_repeats: int = 30,
-                               scoring: str = "balanced_accuracy") -> dict:
+                               scoring: str = "balanced_accuracy",
+                               available_on: pd.Series | None = None) -> dict:
     """
     Permutation importance on held-out meetings, refit once on the head.
+
+    THE EMBARGO APPLIES HERE TOO. This helper used to fit on the first
+    MIN_TRAIN_MEETINGS labelled rows and evaluate on everything after them, with no
+    reference to when those labels became knowable. On the supplied panel that put four
+    rows in the training set whose outcomes had not resolved by the first evaluation
+    date - the same leak `rolling_origin()` now refuses to commit, in a helper advertised
+    as an honest out-of-sample attribution. The training set is now trimmed to the rows
+    whose labels had resolved BEFORE the first evaluation date.
 
     NEGATIVE IMPORTANCE IS A REAL RESULT, NOT AN ERROR. It means the model scored BETTER
     when that feature was shuffled - the feature was actively misleading it. On a small
     sample with collinear predictors this is common and it is worth reporting: a feature
     with negative importance is a candidate for removal, and saying so is part of the Cycle stage.
+
+    The interval this reports is Monte-Carlo precision over `n_repeats` shuffles of THIS
+    sample, exactly as in the model card - not uncertainty about another sample.
 
     Returns per-feature and per-tier importance. The per-tier figure is the SUM over that
     tier's features, so a tier of seventeen weakly-harmful variables can total to a large
@@ -47,7 +59,29 @@ def permutation_importance_oos(panel: pd.DataFrame, tiers: dict, target: str,
     if len(y) <= cut + 10:
         raise ValueError("not enough held-out meetings for permutation importance")
 
-    model = (clf or ev.default_classifier()).fit(X.iloc[:cut], y.iloc[:cut])
+    avail = available_on
+    if avail is None:
+        col = f"{target}_available_on"
+        if col not in panel.columns:
+            raise ValueError(
+                f"permutation_importance_oos() needs label-availability dates: pass "
+                f"available_on=, or build the panel so it carries {col!r}. Without them "
+                f"the fit includes labels that had not resolved when the held-out "
+                f"meetings began, which is the leak this assignment deducts for.")
+        avail = panel[col]
+    avail = pd.to_datetime(avail).reindex(y.index)
+    first_eval = y.index[cut]
+    train_idx = avail.iloc[:cut].index[avail.iloc[:cut] <= first_eval]
+    dropped = cut - len(train_idx)
+    if len(train_idx) < 40:
+        raise ValueError(
+            f"only {len(train_idx)} training rows have labels resolved by "
+            f"{first_eval.date()}; widen the head or move the split")
+    if dropped:
+        print(f"  embargo: {dropped} of {cut} head rows dropped - their labels had not "
+              f"resolved by {first_eval.date()}")
+
+    model = (clf or ev.default_classifier()).fit(X.loc[train_idx], y.loc[train_idx])
     r = permutation_importance(model, X.iloc[cut:], y.iloc[cut:], n_repeats=n_repeats,
                                random_state=config.REGIME_SEED, scoring=scoring)
 
@@ -84,22 +118,40 @@ def staleness_table(panel: pd.DataFrame, tiers: dict) -> pd.DataFrame:
 
 
 def staleness_cost(panel: pd.DataFrame, tiers: dict, target: str, classes: list[int],
-                   upto: list[str], slow_threshold_days: int = 60, clf=None) -> dict:
+                   upto: list[str], slow_threshold_days: int = 60, clf=None,
+                   available_on: pd.Series | None = None) -> dict:
     """
     What the publication lag costs, measured by removing the slowest-published series.
 
     Quarterly series are two to four months old at a typical meeting. Refitting without
     them tells you how much of your model's performance rests on figures that were already
     stale when the Board met.
+
+    BOTH arms run under the label-availability embargo. They used to run without it - this
+    helper called `rolling_origin()` with no `available_on`, so a team that followed the
+    instruction to use the supplied evaluator still produced two leaky numbers and a
+    difference between them. The difference was the least wrong part: both arms leaked in
+    the same direction, which is exactly the kind of error that survives a sanity check.
     """
     ages = staleness_table(panel, tiers)
     slow = ages.loc[ages["median_age_days"] >= slow_threshold_days, "series"].tolist()
     print(f"  {len(slow)} of {len(ages)} macro series are >={slow_threshold_days}d stale")
 
     y = panel[target]
-    full = ev.score(ev.rolling_origin(ev.build_design(panel, tiers, upto), y, clf), classes)
+    avail = available_on
+    if avail is None:
+        col = f"{target}_available_on"
+        if col not in panel.columns:
+            raise ValueError(
+                f"staleness_cost() needs label-availability dates: pass available_on=, "
+                f"or build the panel so it carries {col!r}. Without them both arms train "
+                f"on labels that had not resolved yet.")
+        avail = pd.to_datetime(panel[col])
+    full = ev.score(ev.rolling_origin(ev.build_design(panel, tiers, upto), y, clf,
+                                      available_on=avail), classes)
     t2 = {**tiers, "macro": [c for c in tiers.get("macro", []) if c not in slow]}
-    fast = ev.score(ev.rolling_origin(ev.build_design(panel, t2, upto), y, clf), classes)
+    fast = ev.score(ev.rolling_origin(ev.build_design(panel, t2, upto), y, clf,
+                                      available_on=avail), classes)
 
     print(f"  all macro        acc={full['accuracy']:.3f} bal={full['balanced_accuracy']:.3f}")
     print(f"  fast macro only  acc={fast['accuracy']:.3f} bal={fast['balanced_accuracy']:.3f}"

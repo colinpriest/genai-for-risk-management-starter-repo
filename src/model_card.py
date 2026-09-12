@@ -6,7 +6,8 @@ procedural and the marks are for what you do with it afterwards.
 
 WHAT YOU GET
 
-    load_model()        the fitted classifier, trained under the rolling-origin protocol
+    load_model()        the fitted classifier - ONE fit on the meetings whose labels had
+                        resolved by TRAIN_END, NOT a rolling-origin object
     importances()       permutation importance on HELD-OUT meetings, per feature and tier
     partial_dependence()  how the predicted state changes as one feature moves
     regime_probabilities()  easing / stable / hardening probability for all 211 meetings
@@ -15,11 +16,15 @@ WHAT YOU GET
 WHAT THE MODEL IS
     A gradient-boosted classifier predicting `y_cycle` - the direction of the cash rate over
     the 182 days after each meeting - from the persistence, macro, market and text tiers.
-    Out of sample it reaches roughly 81% accuracy. The baseline that matters is NOT the
-    28% majority rate but `current_decision` at about 66% - policy is persistent, so
-    carrying today's decision forward is a strong and completely trivial rule.
 
-    It is a good model. It is not a causal model, and telling the difference is your job in
+    TWO ACCURACIES, AND ONLY ONE OF THEM IS HONEST. Under rolling-origin evaluation WITHOUT
+    the label-availability embargo it reaches about 0.805; WITH the embargo - training only
+    on labels that had actually resolved at each prediction date - it reaches 0.570. The
+    second is the real one. The baseline that matters is not the 0.266 majority rate but
+    `current_decision` at 0.656, so the honest number LOSES to the trivial rule by nine
+    points.
+
+    It is not a good model, and it is not a causal model. Telling the difference is your job in
     the Cycle stage. A feature can dominate the importances for at least four different
     reasons: it causes the outcome, the outcome causes it, something else causes both, or it
     is a proxy for a variable that does one of those. The model cannot distinguish them and
@@ -105,9 +110,12 @@ def importances() -> pd.DataFrame:
     Permutation importance, measured on held-out meetings.
 
     NEGATIVE IMPORTANCE IS A REAL RESULT. It means the model scored better when that feature
-    was shuffled - the feature was actively misleading it. On a 131-meeting evaluation with
-    collinear predictors this is common, and a feature with negative importance is a
-    candidate for removal, not a bug to be hidden.
+    was shuffled - the feature was actively misleading it. On the 73 held-out meetings, with
+    collinear predictors, this is common; a feature with negative importance is a candidate
+    for removal, not a bug to be hidden.
+
+    The interval is MONTE-CARLO precision over the permutation repeats (`mc_lo`/`mc_hi`),
+    not a confidence interval for another sample.
     """
     return pd.read_parquet(CARD / "importances.parquet")
 
@@ -161,12 +169,17 @@ def summary() -> None:
     print(f"  top features (permutation importance on the meetings after "
           f"{perf['train_end']}):")
     for r in imp.head(8).itertuples():
-        sig = "" if r.ci_lo > 0 else "  (interval spans zero)"
+        sig = "" if r.mc_lo > 0 else "  (interval spans zero)"
         print(f"    {r.feature:28s} {r.importance:+.4f}  ({r.tier}){sig}")
     neg = imp[imp["importance"] < 0]
     print("")
     print(f"  {len(neg)} of {len(imp)} features have NEGATIVE importance; "
-          f"{perf['n_features_significant']} have a 95% interval clear of zero")
+          f"{perf['n_features_significant']} have a Monte-Carlo interval clear of zero")
+    print("  That interval is the precision of 30 permutation shuffles on THIS held-out "
+          "sample.")
+    print("  It is not evidence that a feature would matter in another sample - more "
+          "shuffles would")
+    print("  narrow it without adding information. Do not call it significance.")
     print(f"  by tier: {imp.groupby('tier')['importance'].sum().round(4).to_dict()}")
 
 
@@ -233,7 +246,10 @@ def run() -> dict:
 
     # ---- performance, with and without the embargo -----------------------------------------
     print("  rolling-origin evaluation, WITHOUT the label embargo (the leaky number)")
-    leaky = ev.rolling_origin(Xf, yf, _classifier())
+    # DELIBERATE, and now explicit: this arm exists to show what the leak is worth. The
+    # flag is what makes it a teaching comparison rather than an accident.
+    leaky = ev.rolling_origin(Xf, yf, _classifier(), available_on=None,
+                              allow_unresolved_labels=True)
     s_leaky = ev.score(leaky, CLASSES)
     print(f"    acc {s_leaky['accuracy']:.3f}  bal {s_leaky['balanced_accuracy']:.3f}  "
           f"n={s_leaky['n']}")
@@ -279,22 +295,48 @@ def run() -> dict:
     print(f"    holdout acc {perf['holdout']['accuracy']:.3f}")
 
     print("  permutation importance, measured on the held-out meetings")
-    r = permutation_importance(model, Xf.loc[hold_idx], yf.loc[hold_idx], n_repeats=30,
+    # WHAT THE INTERVAL BELOW IS, AND IS NOT.
+    #
+    # `permutation_importance` shuffles ONE COLUMN of THIS held-out sample, against THIS
+    # fitted model, n_repeats times. `importances_std` is the spread across those shuffles
+    # (scikit-learn documents it exactly that way), so mean +/- 1.96*sd/sqrt(n_repeats) is
+    # the Monte Carlo precision of the shuffling: how well 30 shuffles pin down the number
+    # you would get from infinitely many shuffles of this same data.
+    #
+    # It is NOT a confidence interval for the importance in the population. It does not
+    # account for a different historical sample, for the overlapping policy cycles that
+    # make these 73 meetings far less independent than they look, or for refitting the
+    # model. Doing MORE shuffles narrows it without adding any evidence - which is the
+    # giveaway that it cannot be measuring sampling uncertainty.
+    #
+    # The columns are named `mc_lo`/`mc_hi` for that reason. A feature whose interval
+    # clears zero has a shuffling effect this sample can resolve; it has NOT been shown to
+    # matter in general, and nothing in the report may claim it has.
+    n_repeats = 30
+    r = permutation_importance(model, Xf.loc[hold_idx], yf.loc[hold_idx],
+                               n_repeats=n_repeats,
                                random_state=config.REGIME_SEED,
                                scoring="balanced_accuracy")
     tier_of = {c: t for t in TIERS for c in tiers.get(t, []) if c in X.columns}
     imp = (pd.DataFrame({"feature": X.columns, "importance": r.importances_mean,
                          "sd": r.importances_std})
            .assign(tier=lambda d: d["feature"].map(tier_of),
-                   ci_lo=lambda d: d["importance"] - 1.96 * d["sd"] / np.sqrt(30),
-                   ci_hi=lambda d: d["importance"] + 1.96 * d["sd"] / np.sqrt(30))
+                   interval_kind="monte_carlo_over_permutation_repeats",
+                   n_repeats=n_repeats,
+                   mc_lo=lambda d: d["importance"] - 1.96 * d["sd"] / np.sqrt(n_repeats),
+                   mc_hi=lambda d: d["importance"] + 1.96 * d["sd"] / np.sqrt(n_repeats))
            .sort_values("importance", ascending=False)
            .reset_index(drop=True))
     imp.to_parquet(CARD / "importances.parquet", index=False)
-    n_sig = int((imp["ci_lo"] > 0).sum())
+    n_sig = int((imp["mc_lo"] > 0).sum())
     print(f"    {(imp['importance'] < 0).sum()} of {len(imp)} features negative; "
-          f"only {n_sig} have a 95% interval clear of zero")
+          f"only {n_sig} have a Monte-Carlo interval clear of zero")
+    print("    (that interval is permutation precision on THIS sample, not evidence "
+          "about a new one)")
     perf["n_features_negative"] = int((imp["importance"] < 0).sum())
+    perf["n_features_mc_interval_clear_of_zero"] = n_sig
+    # kept under the old name so existing readers do not break; both mean the
+    # Monte-Carlo permutation interval, never statistical significance
     perf["n_features_significant"] = n_sig
 
     print(f"  partial dependences for the top {N_TOP_PDP} features, from the SAME model")

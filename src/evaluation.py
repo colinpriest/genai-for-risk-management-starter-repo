@@ -68,7 +68,8 @@ def build_design(panel: pd.DataFrame, tiers: dict, upto: list[str],
 def rolling_origin(X: pd.DataFrame, y: pd.Series, clf=None,
                    min_train: int | None = None,
                    available_on: pd.Series | None = None,
-                   min_embargoed_train: int = 40) -> pd.DataFrame:
+                   min_embargoed_train: int = 40,
+                   allow_unresolved_labels: bool = False) -> pd.DataFrame:
     """
     Expanding-window one-step-ahead prediction, with a LABEL-AVAILABILITY EMBARGO.
 
@@ -85,8 +86,25 @@ def rolling_origin(X: pd.DataFrame, y: pd.Series, clf=None,
     beating the current-decision baseline to losing to it. That is not a bug in the embargo.
     It is what the model is actually worth.
 
-    Pass `available_on=None` only to reproduce the leaky number deliberately, for teaching.
+    OMITTING `available_on` IS NOW AN ERROR, not a default. It used to be the default, and a
+    supplied helper called it that way - so a team could follow the instruction to "use
+    rolling_origin()" and still produce exactly the leakage the assignment penalises, with
+    nothing in the output saying so. Reproducing the leaky number deliberately is still
+    supported, and now has to be asked for:
+
+        rolling_origin(X, y, available_on=None, allow_unresolved_labels=True)
+
+    Every row of the returned frame carries `label_embargo`, so a table of results cannot
+    lose track of which protocol produced it.
     """
+    if available_on is None and not allow_unresolved_labels:
+        raise ValueError(
+            "rolling_origin() needs `available_on`: the date each row's LABEL became "
+            "knowable. Without it, training at meeting t includes labels that had not "
+            "resolved at t - the leak this assignment marks teams down for. Use "
+            "panel['label_available_on'] (see model_card.py for the supplied call). To "
+            "reproduce the leaky comparison ON PURPOSE, pass "
+            "allow_unresolved_labels=True as well, and report it as the leaky arm.")
     min_train = min_train or config.MIN_TRAIN_MEETINGS
     clf = clf or default_classifier()
     ok = y.notna()
@@ -110,6 +128,9 @@ def rolling_origin(X: pd.DataFrame, y: pd.Series, clf=None,
         rows.append({"date": t, "y_true": y.iloc[i],
                      "y_pred": m.classes_[proba.argmax()],
                      "n_train": len(train_idx),
+                     # stamped per row so a results table can never lose track of which
+                     # protocol produced it
+                     "label_embargo": avail is not None,
                      **{f"p_{int(c)}": p for c, p in zip(m.classes_, proba)}})
     return pd.DataFrame(rows).set_index("date") if rows else pd.DataFrame()
 
@@ -196,15 +217,29 @@ TIER_ORDER = ["persistence", "macro", "market", "text"]
 def nested_evaluation(panel: pd.DataFrame, tiers: dict, target: str,
                       classes: list[int], clf=None,
                       tier_order: list[str] | None = None,
-                      quiet: bool = False) -> dict:
+                      quiet: bool = False,
+                      available_on: pd.Series | None = None,
+                      allow_unresolved_labels: bool = False) -> dict:
     """
     Fit the cumulative tier sequence and report each step.
 
     This is the instrument the whole assignment is built on: it separates what a tier adds
     CONDITIONAL on the tiers before it from what it looks worth on its own.
+
+    `available_on` is passed straight to `rolling_origin()` and is required for the same
+    reason it is required there: a tier ladder built on unresolved labels compares tiers
+    on how well each one reads the future.
     """
     tier_order = tier_order or TIER_ORDER
     y = panel[target]
+    avail = available_on
+    if avail is None and not allow_unresolved_labels:
+        col = f"{target}_available_on"
+        if col not in panel.columns:
+            raise ValueError(
+                f"nested_evaluation() needs label-availability dates: pass "
+                f"available_on=, or build the panel so it carries {col!r}.")
+        avail = pd.to_datetime(panel[col])
     res = {"baselines": baselines(panel, y), "tiers": {}}
     prev = None
     for i in range(1, len(tier_order) + 1):
@@ -215,7 +250,9 @@ def nested_evaluation(panel: pd.DataFrame, tiers: dict, target: str,
         X = build_design(panel, tiers, upto)
         if X.empty:
             continue
-        s = score(rolling_origin(X, y, clf), classes)
+        s = score(rolling_origin(X, y, clf, available_on=avail,
+                                 allow_unresolved_labels=allow_unresolved_labels),
+                  classes)
         if not s:
             continue
         s["n_features"] = int(X.shape[1])

@@ -20,5 +20,6 @@ markers = [
     "clean_install: proves the ENVIRONMENT and supplied pipeline run from a fresh checkout; run with -m clean_install. It passes on the untouched starter by design",
     "submission: the repository-and-pipeline completeness check; run with -m submission before submitting. It fails on the untouched starter by design",
     "release_audit: cross-repository release audit (worked solution only); run with -m release_audit",
+    "slow_install: builds a real virtual environment and installs the declared requirements; needs network, run with -m slow_install",
 ]
-addopts = "-m 'not clean_install and not submission and not release_audit'"
+addopts = "-m 'not clean_install and not submission and not release_audit and not slow_install'"

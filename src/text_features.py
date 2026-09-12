@@ -28,9 +28,14 @@ measure of the Board's reaction the decision is part of what is being measured.
 Where it WOULD leak is using a meeting's own minutes at that meeting, and `data_panel`
 prevents that by lagging the whole text tier one meeting.
 
-RUN IT TWICE, OVER DISJOINT DOCUMENTS:
-    python src/text_features.py              development - validation meetings withheld
+HOW TO RUN IT, IN ORDER:
+    python src/text_features.py --pilot      iterate here: 25 fixed development documents,
+                                             writes nothing, prints the full audit
+    python src/text_features.py              development pass - validation withheld
     python src/text_features.py --validate   one shot, held-out meetings only
+
+    add --offline to any of them to replay committed envelopes without calling the API
+    add --dry-run to see the cost and stop before any call
 
 WRITES data/processed/construct_scores.parquet
        data/processed/llm_raw/<config-hash>/<date>.json  (reproducibility
@@ -45,6 +50,7 @@ import json
 import os
 import random
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -52,11 +58,11 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from openai import OpenAI
 from pydantic import BaseModel, Field, create_model
 
 sys.path.insert(0, os.path.dirname(__file__))
 import config  # noqa: E402
+import courseapi  # noqa: E402
 
 load_dotenv()
 
@@ -152,19 +158,56 @@ CONSTRUCTS: dict[str, str] = {
     ),
 
     # ---- SUPPLIED EXEMPLAR 2 of 3 - INTENSITY - DO NOT ALTER ----------------------------
+    # RECALIBRATED 2026-09-11 for gpt-5.4-mini. The previous landmarks anchored the scale to
+    # plain declarative English ("0 = no hedging at all", "25 = routine caveats only"), which
+    # the RBA never writes. The whole corpus therefore compressed into the top half, and 65%
+    # of calls came back as exactly 75 - the construct failed both the concentration and the
+    # coverage gate and could not discriminate between documents at all. The axis is now
+    # anchored to the BOARD'S OWN usual level at 50 and graded finely either side of it,
+    # which is the same technique `policy_stance` uses to defeat its midpoint pile-up.
     "uncertainty_language": (
-        "How heavily does the Board hedge? INTENSITY, 50 = moderate. "
-        "Count and weigh hedging constructions: 'uncertain', 'difficult to predict', 'a "
-        "range of outcomes', 'considerable uncertainty', 'depends on', conditional forecast "
-        "language, explicit scenario branching. Judge the FORM of the language, not whether "
-        "the Board is right to be uncertain. "
-        "0 = confident, declarative, single-path prose with no hedging at all. "
-        "15 = one or two routine caveats in an otherwise assured document. "
-        "25 = routine caveats only. "
-        "50 = uncertainty acknowledged in the usual places. "
-        "75 = uncertainty is a recurring theme and shapes the discussion. "
-        "100 = the Board repeatedly says it does not know: multiple scenarios, explicit "
-        "refusal to forecast, uncertainty named as the reason for the decision."
+        "How heavily does the Board hedge? INTENSITY, 50 = the Board's OWN usual level. "
+        "THE RBA ALWAYS HEDGES. Conditional forecasts, 'a range of outcomes' and 'depends "
+        "on' appear in every set of minutes, so the PRESENCE of hedging tells you nothing "
+        "and a document is not high on this axis merely for reading like central-bank "
+        "prose. Score against how this Board writes ACROSS ITS 2006-2026 RANGE: measured "
+        "against plain declarative English every document would sit near the top and the "
+        "axis would measure nothing at all. "
+        "Judge the FORM of the language, not whether the Board is right to be uncertain. "
+        "WHAT SEPARATES DOCUMENTS is whether the hedging is BOILERPLATE or LOAD-BEARING. "
+        "Boilerplate sits in the standard forecast caveats and the closing paragraph and "
+        "could be deleted without changing the argument. Load-bearing hedging drives the "
+        "discussion: scenarios set out and weighed, a decision explicitly deferred for more "
+        "information, the Board naming what would change its mind. Apply that test before "
+        "you score. "
+        "50 IS THE BASELINE, NOT A REFUGE. Most documents sit somewhat above or below it, "
+        "and the gradations between 35 and 80 exist to be used. "
+        "CALIBRATION CHECK BEFORE YOU COMMIT: by construction the MEDIAN meeting of "
+        "2006-2026 scores 50 here, because 50 is defined as this Board's usual level. So a "
+        "routine meeting - no crisis, no turning point, the standard caveats in the standard "
+        "places - is a 50, not a 70. If you are about to score an unremarkable document in "
+        "the 70s, you are measuring hedging against ordinary English instead of against this "
+        "Board. Re-read the 50 landmark and come down. Reserve the 70s and 80s for documents "
+        "where uncertainty is visibly doing work the routine ones do not ask of it. "
+        "0 = no hedging whatever: every forecast stated flat, no conditionals, no caveats. "
+        "Not observed in this corpus - it anchors the scale rather than describing a "
+        "document. "
+        "20 = markedly more direct than this Board's usual: forecasts stated with unusual "
+        "firmness, caveats confined to a single sentence. "
+        "35 = slightly more direct than usual: the standard caveats are present but brief "
+        "and undeveloped. "
+        "50 = the Board's usual level: conditional forecast language throughout and "
+        "uncertainty acknowledged in the usual places, none of it shaping the argument. "
+        "60 = one source of uncertainty is named repeatedly and developed beyond the "
+        "standard caveat. "
+        "70 = two or more sources are argued rather than noted, and they shape how the "
+        "outlook is described. "
+        "80 = uncertainty shapes the DECISION: the Board says it is waiting for further "
+        "information, or names what would change its mind. "
+        "90 = multiple explicit scenarios are set out and weighed, with no single central "
+        "path committed to. "
+        "100 = the Board repeatedly says it does not know: forecasting explicitly "
+        "suspended, uncertainty named as the reason for the decision."
     ),
 
     # ---- YOURS --------------------------------------------------------------------------
@@ -218,20 +261,19 @@ REQUIRE_EVIDENCE = True
 SCORE_MIN, SCORE_MAX = 0, 100
 
 FIELDS = list(CONSTRUCTS)
-_client: OpenAI | None = None
+_client = None
 
 EXEMPLAR_HASHES = {
     "policy_stance": "c1d9f9d7e666adfa",
-    "uncertainty_language": "b25c2f6439d26a3c",
+    # recalibrated 2026-09-11 for gpt-5.4-mini - see the rubric comment above
+    "uncertainty_language": "5bd868014bd1b1a2",
     "global_risk_salience": "20dbb4c6db17f337",
 }
 
 
-def client_() -> OpenAI:
-    global _client
-    if _client is None:
-        _client = OpenAI()
-    return _client
+def client_():
+    """The course API client (see courseapi): same shape, UNSW proxy underneath."""
+    return courseapi.client_()
 
 
 def _sha(text: str, n: int = 16) -> str:
@@ -260,13 +302,11 @@ def _prompts_written() -> bool:
             and not any("TODO" in CONSTRUCTS[c] for c in STUDENT_CONSTRUCTS))
 
 
-def config_hash() -> str:
+def call_config_hash() -> str:
     """
-    Identifies THIS scoring configuration. Everything that can change an answer is in it.
-
-    The cache is keyed on this. An earlier version keyed only on the meeting date, so
-    revising a rubric and re-running silently returned the previous run's answers - which
-    made the required iteration impossible to perform and impossible to detect.
+    Identifies the CALL configuration - everything that changes what the API returns.
+    The cache directory is keyed on this: revising a rubric and re-running makes fresh
+    calls rather than silently returning the previous run's answers.
     """
     payload = json.dumps({
         "system_prompt": SYSTEM_PROMPT,
@@ -275,14 +315,60 @@ def config_hash() -> str:
         "evidence": REQUIRE_EVIDENCE,
         "model": config.MODEL,
         "temperature": config.SAMPLING_TEMPERATURE,
-        "seed": config.SEED,
+        "call_index_base": config.CALL_INDEX_BASE,
         "n_calls": config.N_PARALLEL_CALLS,
+        # The corpus the scores were extracted FROM. Swapping or editing the vendored
+        # minutes after scoring must invalidate the run exactly as editing a rubric would.
+        "corpus": _corpus_fingerprint(),
     }, sort_keys=True)
     return _sha(payload, 12)
 
 
+def config_hash() -> str:
+    """
+    Identifies the STAGE configuration - the call configuration PLUS everything that
+    shapes what is audited, gated, oriented or validated without touching the calls.
+    Stored in words_audit.json and words_validation.json and compared by the submission
+    check: loosening a gate or moving a validation episode after the artefacts were
+    written invalidates them exactly as editing a rubric would.
+    """
+    payload = json.dumps({
+        "calls": call_config_hash(),
+        # The output ceiling CHANGES THE ANSWER: the same prompt under a lower ceiling
+        # truncates. It belongs HERE, in the stage hash, and NOT in call_config_hash()
+        # above - that one keys the cache directory, so putting it there would discard
+        # every committed envelope and re-call the whole corpus the first time anyone
+        # touched the ceiling. Lowering it now invalidates the ARTEFACT, which is what a
+        # marker needs to see, while the calls made at the ceiling then in force survive.
+        "max_output_tokens": config.MAX_OUTPUT_TOKENS,
+        "gates": {"min_spread": config.MIN_CONSTRUCT_SPREAD,
+                  "max_binned_concentration": config.MAX_BINNED_CONCENTRATION,
+                  "bin_width": config.BIN_WIDTH,
+                  "min_effective_bins": getattr(config, "MIN_EFFECTIVE_BINS", None),
+                  "min_signal_to_noise": config.MIN_SIGNAL_TO_NOISE},
+        "min_valid_calls": config.MIN_VALID_CALLS,
+        "validation_episodes": VALIDATION_EPISODES,
+        "expected_orientation": EXPECTED_ORIENTATION,
+    }, sort_keys=True)
+    return _sha(payload, 12)
+
+
+_CORPUS_FP: str | None = None
+
+
+def _corpus_fingerprint() -> str:
+    """sha256 of the vendored minutes file, memoised - the corpus never changes within a
+    process, and config_hash() is called per document during scoring."""
+    global _CORPUS_FP
+    if _CORPUS_FP is None:
+        p = config.DOCUMENTS
+        _CORPUS_FP = (hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+                      if p.exists() else "absent")
+    return _CORPUS_FP
+
+
 def run_dir() -> "os.PathLike":
-    d = config.LLM_RAW / config_hash()
+    d = config.LLM_RAW / call_config_hash()
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -302,7 +388,7 @@ def _schema_model() -> type[BaseModel]:
     return create_model("ConstructScores", **fields)
 
 
-def score_once(text: str, seed: int) -> dict:
+def score_once(text: str, call_index: int) -> dict:
     """
     One call, with bounded exponential backoff.
 
@@ -311,13 +397,22 @@ def score_once(text: str, seed: int) -> dict:
     archive, because it is not one - the full API response object, including the unparsed
     message content and response headers, is not retained. What is here is enough to
     reproduce the run and to audit what was asked and answered.
+
+    `request` is recorded from what the API client ACTUALLY sent, not from what this
+    function meant to send. The two used to be assumed identical; since the move to the
+    course proxy they are not - `seed` is gone from this model family - and an envelope
+    that reports a parameter the API never received is a false audit record.
+
+    `call_index` says WHICH of the N parallel draws this is. It is not a random seed and
+    nothing here can pin the model's sampling; see config.CALL_INDEX_BASE.
     """
     schema = _schema_model()
     last_err = None
     for attempt in range(config.MAX_RETRIES):
         try:
             r = client_().beta.chat.completions.parse(
-                model=config.MODEL, temperature=config.SAMPLING_TEMPERATURE, seed=seed,
+                model=config.MODEL, temperature=config.SAMPLING_TEMPERATURE,
+                call_index=call_index, max_tokens=config.MAX_OUTPUT_TOKENS,
                 messages=[{"role": "system", "content": SYSTEM_PROMPT},
                           {"role": "user", "content":
                            "RBA minutes of the monetary policy meeting:\n\n" + text}],
@@ -327,45 +422,322 @@ def score_once(text: str, seed: int) -> dict:
                 "parsed": r.choices[0].message.parsed.model_dump(),
                 "model": config.MODEL,
                 "temperature": config.SAMPLING_TEMPERATURE,
-                "seed": seed,
-                "config_hash": config_hash(),
+                "call_index": call_index,
+                "request": getattr(r, "request", None),
+                "provenance": getattr(r, "provenance", None),
+                "model_served": getattr(r, "model", None),
+                "config_hash": call_config_hash(),
                 "prompt_hash": _sha(SYSTEM_PROMPT + json.dumps(CONSTRUCTS, sort_keys=True)),
                 "request_id": getattr(r, "id", None),
-                "usage": (r.usage.model_dump() if getattr(r, "usage", None) else None),
+                "usage": getattr(r, "usage", None),
                 "attempt": attempt + 1,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         except Exception as e:  # noqa: BLE001
+            # A RUN-LEVEL failure is not this call's failure, it is the end of the run:
+            # every remaining call will fail the same way, and the fix is outside the
+            # repository. Recording it as a failed call instead let one run mark 66 calls
+            # "failed", score twelve documents with zero valid calls, and only stop later
+            # in aggregate() - by which point the cache held a corpus that looked scored
+            # and was not. Worse, a mistyped access code wrote settled failures that
+            # survived correcting it. Stop here, keep what is committed, and resume once
+            # the run is configured correctly or the budget returns.
+            if type(e).__name__ in _RUN_LEVEL_ERRORS:
+                raise
             last_err = f"{type(e).__name__}: {str(e)[:120]}"
+            if type(e).__name__ in _NON_TRANSIENT:
+                break  # a bad key or a rejected schema does not get better with backoff
             if attempt < config.MAX_RETRIES - 1:
                 time.sleep(config.RETRY_BASE_SECONDS * (2 ** attempt)
                            + random.uniform(0, 0.5))
-    return {"ok": False, "error": last_err, "seed": seed,
-            "config_hash": config_hash(),
+    return {"ok": False, "error": last_err, "call_index": call_index,
+            "config_hash": call_config_hash(),
             "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
-def score_document(date: str, text: str) -> dict:
-    """N calls for one document, cached under the configuration hash."""
-    out = run_dir() / f"{date}.json"
-    if out.exists():
+# Errors that retrying cannot fix: bad credentials, malformed requests (including a schema
+# the endpoint rejects), and plain programming errors. Matched by name so no extra imports
+# are needed; anything else (rate limits, timeouts, connection drops, 5xx) is transient.
+_NON_TRANSIENT = ("AuthenticationError", "PermissionDeniedError", "BadRequestError",
+                  "NotFoundError", "UnprocessableEntityError",
+                  "TypeError", "KeyError", "AttributeError", "ValidationError"
+                  ) + courseapi.NON_TRANSIENT_ERRORS
+
+
+#: Set when a run-wide failure (exhausted daily budget, bad credentials) makes every
+#: remaining call pointless. Workers check it before starting, so a document already in
+#: flight finishes and nothing new is scheduled.
+_RUN_ABORTED = threading.Event()
+
+#: One writer at a time per process. Each completed draw is flushed to disk as it lands,
+#: so a quota failure on the fifth call cannot discard the four that succeeded.
+_CACHE_LOCK = threading.Lock()
+
+
+#: Failures of the RUN, not of the document. Bad or missing credentials, an undeployed
+#: model and an exhausted daily budget are properties of how the run was configured, and
+#: every one of them is fixed OUTSIDE the repository - by editing .env, or by waiting.
+#:
+#: THE DISTINCTION MATTERS BECAUSE SETTLING THEM POISONS THE CACHE. An earlier version
+#: treated every non-transient error as a settled draw, so a run started with a mistyped
+#: access code wrote five "settled" failures per document; correcting the code and
+#: re-running then made ZERO fresh calls and produced ZERO valid draws, because the
+#: cache configuration had not changed and every index looked resolved. The first
+#: keystroke error silently destroyed the corpus.
+_RUN_LEVEL_ERRORS = (
+    "MissingCredentialsError", "InvalidAccessCodeError", "MissingHeaderError",
+    "AuthenticationError", "PermissionDeniedError",
+    "ModelNotAvailableError", "DailyQuotaExceededError",
+    "ProxyUnreachableError", "MissingHeaderError",
+)
+
+
+def _is_run_level(call: dict) -> bool:
+    """Did this draw fail because the RUN is misconfigured, rather than the document?"""
+    name = str(call.get("error", "")).split(":", 1)[0].strip()
+    return name in _RUN_LEVEL_ERRORS
+
+
+def recorded_ceiling(call: dict) -> int | None:
+    """The output ceiling this draw was actually produced under, if it recorded one."""
+    v = (call.get("request") or {}).get("max_output_tokens")
+    return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _truncated(call: dict) -> bool:
+    return "IncompleteResponseError" in str(call.get("error", ""))
+
+
+def reusable_under_current_ceiling(call: dict) -> bool:
+    """
+    THE OUTPUT-CEILING COMPATIBILITY RULE, applied per draw.
+
+    The ceiling is deliberately NOT part of the cache key: putting it there would throw
+    away every committed envelope the first time anyone touched it, and the committed
+    evidence for this assignment was in fact produced under three different ceilings
+    (1500, 4000 and 8000 tokens) as the pipeline was developed. Discarding all of it
+    would be a large, pointless bill. Instead each draw records the ceiling it ran under
+    and this rule decides, honestly, whether it still stands:
+
+      SUCCESS at ceiling X, current ceiling C
+        C >= X  reusable. The answer finished inside X tokens, so a larger allowance
+                could not have cut it short.
+        C <  X  NOT reusable. That answer was allowed more room than the current
+                configuration gives, and may not fit; re-ask at C.
+
+      TRUNCATION at ceiling X
+        C >  X  NOT settled. More room may finish it - this is the case the brief tells
+                students to fix by RAISING config.MAX_OUTPUT_TOKENS, and it silently did
+                nothing before.
+        C <= X  still settled: the same wall, in the same place.
+
+      NO RECORDED CEILING
+        Successes are not reused (nothing establishes what they were allowed), and
+        truncations are retried. Content filtering does not depend on the ceiling, so a
+        filtered draw stays settled either way.
+    """
+    current = int(config.MAX_OUTPUT_TOKENS)
+    recorded = recorded_ceiling(call)
+    if call.get("ok"):
+        return recorded is not None and current >= recorded
+    if _truncated(call):
+        return recorded is not None and current <= recorded
+    return True                      # filtering and schema refusals: ceiling-independent
+
+
+def _settled_failure(call: dict) -> bool:
+    """A failed draw that asking again cannot fix, and that is THIS DOCUMENT's problem.
+
+    A content filter, a rejected schema or a truncated answer is deterministic: the same
+    prompt at the same settings fails the same way on this document. Re-running it on
+    every pass spends the shared token budget to re-learn what the envelope already
+    records.
+
+    NOT settled: transient failures (timeouts, 429s, dropped connections), and run-level
+    failures (credentials, deployment, daily budget). The second group is deterministic
+    too - but it is fixed by changing the run, and a fixed run must be able to fill the
+    gap. See `_RUN_LEVEL_ERRORS`.
+    """
+    if call.get("ok"):
+        return False
+    if _is_run_level(call):
+        return False
+    name = str(call.get("error", "")).split(":", 1)[0].strip()
+    return name in _NON_TRANSIENT
+
+
+def _load_cached_calls(out, schema) -> dict[int, dict]:
+    """Valid draws already on disk, by call index. Quarantines an unusable file.
+
+    Returns BOTH successful draws and settled failures: a document with three good draws
+    and two filtered ones is complete under MIN_VALID_CALLS, and re-calling the two
+    filtered indices would just reproduce the filter.
+    """
+    if not out.exists():
+        return {}
+    expected = {config.CALL_INDEX_BASE + i for i in range(config.N_PARALLEL_CALLS)}
+    try:
         calls = json.loads(out.read_text())
-        if sum(1 for c in calls if c.get("ok")) >= config.N_PARALLEL_CALLS:
-            return {"meeting_date": date, "calls": calls, "cached": True}
+        keep: dict[int, dict] = {}
+        for c in calls:
+            idx = c.get("call_index")
+            # DRAW IDS ARE PART OF THE EXPERIMENT, not a label. An envelope numbered
+            # outside the current draw set was produced by a different configuration
+            # (or by hand), and counting it towards this run's coverage would let a
+            # document pass the minimum on evidence this run never requested. A
+            # duplicate id is worse: a dict silently collapses it, so five copies of
+            # one draw would have read as five independent draws.
+            if not isinstance(idx, int) or isinstance(idx, bool):
+                raise ValueError(f"call_index {idx!r} is not an integer")
+            if idx not in expected:
+                raise ValueError(
+                    f"call_index {idx} is outside the current draw set "
+                    f"{sorted(expected)}")
+            if idx in keep:
+                raise ValueError(f"duplicated call_index {idx}")
+            if c.get("config_hash") != call_config_hash():
+                continue
+            if not reusable_under_current_ceiling(c):
+                continue        # re-ask this draw under the ceiling now in force
+            if c.get("ok"):
+                schema.model_validate(c["parsed"])       # re-validate, never trust "ok"
+                keep[idx] = c
+            elif _settled_failure(c):
+                keep[idx] = c
+        return keep
+    except Exception as e:  # noqa: BLE001 - any invalid cache is quarantined
+        bad = out.with_suffix(out.suffix + ".invalid")
+        try:
+            out.replace(bad)
+            moved = f" Moved to {bad.name};"
+        except OSError:
+            moved = ""
+        print(f"    CACHE QUARANTINED: {out.name} - no longer validates "
+              f"({type(e).__name__}).{moved} re-scoring this document fresh.")
+        return {}
+
+
+def _flush(out, by_index: dict[int, dict]) -> None:
+    """Write the draws collected so far, atomically, ordered by call index."""
+    with _CACHE_LOCK:
+        config.atomic_write_text(
+            out, json.dumps([by_index[i] for i in sorted(by_index)], indent=1))
+
+
+def score_document(date: str, text: str, offline: bool = False) -> dict:
+    """
+    N calls for one document, cached under the configuration hash.
+
+    A cached call is only trusted after its parsed payload RE-validates against the current
+    response schema: a cache written under an older schema, truncated on disk, or edited by
+    hand is quarantined and the document re-scored, rather than flowing into the combined
+    table because it once said "ok".
+
+    PARTIAL WORK IS KEPT AND REUSED. Each draw is written to the document's envelope file
+    the moment it returns, so an exhausted daily budget on the fifth call no longer throws
+    away the four that succeeded. On the next run only the MISSING draws are requested: a
+    document that already holds enough valid draws costs nothing, and one that holds three
+    good draws and two content-filtered ones is complete rather than permanently re-tried.
+
+    `offline=True` never contacts the service: a document is accepted if the committed
+    envelopes already carry config.MIN_VALID_CALLS valid draws, and the run stops with a
+    clear message if they do not.
+    """
+    schema = _schema_model()
+    out = run_dir() / f"{date}.json"
+    by_index = _load_cached_calls(out, schema)
+    expected = [config.CALL_INDEX_BASE + i for i in range(config.N_PARALLEL_CALLS)]
+    n_valid = sum(1 for c in by_index.values() if c.get("ok"))
+    missing = [i for i in expected if i not in by_index]
+
+    if not missing:
+        config.ledger_add("words", out)
+        return {"meeting_date": date, "calls": [by_index[i] for i in sorted(by_index)],
+                "cached": True, "fresh": []}
+
+    if offline:
+        if n_valid >= config.MIN_VALID_CALLS:
+            config.ledger_add("words", out)
+            return {"meeting_date": date,
+                    "calls": [by_index[i] for i in sorted(by_index)],
+                    "cached": True, "fresh": []}
+        raise RuntimeError(
+            f"--offline: {date} has only {n_valid} valid committed draws, and the minimum "
+            f"is {config.MIN_VALID_CALLS}. Offline mode replays committed evidence and "
+            f"never calls the service; re-run without --offline to fill the gap.")
+
+    if _RUN_ABORTED.is_set():
+        raise RuntimeError(f"{date}: run already stopped by a run-wide failure")
+
+    if n_valid or by_index:
+        print(f"    {date}: reusing {n_valid} committed draw(s), requesting "
+              f"{len(missing)}")
     with ThreadPoolExecutor(max_workers=config.N_PARALLEL_CALLS) as ex:
-        futs = [ex.submit(score_once, text, config.SEED + i)
-                for i in range(config.N_PARALLEL_CALLS)]
-        calls = [f.result() for f in as_completed(futs)]
-    out.write_text(json.dumps(calls, indent=1))
-    return {"meeting_date": date, "calls": calls, "cached": False}
+        futs = {ex.submit(score_once, text, i): i for i in missing}
+        try:
+            for f in as_completed(futs):
+                call = f.result()
+                by_index[futs[f]] = call
+                _flush(out, by_index)          # persisted the moment it lands
+        except BaseException:
+            # A run-wide failure (quota, credentials) makes every QUEUED call pointless,
+            # but the calls already in flight will land anyway and were already paid for.
+            # Cancel what has not started, collect what has, and keep the lot: losing four
+            # good draws because the fifth hit the daily cap is how a stopped run used to
+            # cost a document its entire evidence.
+            _RUN_ABORTED.set()
+            for pending in futs:
+                pending.cancel()
+            for done, idx in futs.items():
+                if done.cancelled() or idx in by_index:
+                    continue
+                try:
+                    by_index[idx] = done.result()
+                except Exception:  # noqa: BLE001 - this draw is the one that failed
+                    continue
+            _flush(out, by_index)
+            raise
+    config.ledger_add("words", out)
+    return {"meeting_date": date, "calls": [by_index[i] for i in sorted(by_index)],
+            "cached": False,
+            # THE DRAWS THIS RUN ACTUALLY PAID FOR. A resumed document is not "fresh":
+            # reporting all five of its draws as fresh calls inflated a one-call resume
+            # into five, and its 11 tokens into 55 - which then fed the budget planning
+            # the brief asks teams to do.
+            "fresh": [by_index[i] for i in missing if i in by_index]}
+
+
+#: Quotation marks a model may wrap around an otherwise verbatim quote - straight and
+#: curly, single and double. gpt-5.4-mini returns `"..."` where gpt-4o-mini returned
+#: `...`, which is a presentation habit and not a paraphrase.
+_ENCLOSING_QUOTES = "\"'“”‘’«»"
 
 
 def _validate_evidence(quote: str, source: str) -> bool:
-    """A quote must appear verbatim in the document. Whitespace-normalised comparison."""
-    if not quote or len(quote) < 12:
+    """
+    A quote must appear verbatim in the document. Whitespace-normalised comparison.
+
+    ENCLOSING QUOTATION MARKS ARE STRIPPED FIRST, and that is a normalisation rather than
+    a loosening: a model that hands back `"members noted..."` has quoted the document
+    exactly and merely punctuated the fact that it is quoting. Requiring the bare form
+    would mark a correct quote wrong on a typographic habit - which is precisely what
+    happened when this stage moved to gpt-5.4-mini, taking the verbatim rate from ~84% to
+    0% without a single word of any quote changing.
+
+    Everything that WOULD be a loosening is still refused: the quote must still occur, in
+    order, inside the document. A paraphrase fails, a stitched-together quote fails, and a
+    quote shorter than 12 characters fails as too short to evidence anything.
+    """
+    if not quote:
+        return False
+    q = quote.strip()
+    # only a MATCHED enclosing pair comes off, so an internal quotation is untouched
+    while (len(q) >= 2 and q[0] in _ENCLOSING_QUOTES and q[-1] in _ENCLOSING_QUOTES):
+        q = q[1:-1].strip()
+    if len(q) < 12:
         return False
     norm = lambda s: " ".join(s.split()).lower()
-    return norm(quote) in norm(source)
+    return norm(q) in norm(source)
 
 
 def aggregate(records: list[dict], docs: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
@@ -636,16 +1008,59 @@ def validation_meetings(docs: pd.DataFrame) -> set[str]:
     return keep
 
 
-def _score_documents(docs: pd.DataFrame, label: str) -> tuple[list[dict], dict]:
+#: Documents in the iteration pilot. Large enough for the audit gates to mean something,
+#: small enough that a rubric rewrite costs about a seventh of a full development pass.
+PILOT_N = 25
+
+
+def pilot_meetings(docs: pd.DataFrame) -> list[str]:
+    """
+    The FIXED pilot sample: where rubric iteration happens.
+
+    WHY A PILOT EXISTS. The cache is keyed on your prompts, so editing a rubric re-scores
+    every document it touches - a full development pass, every time. That made the honest
+    workflow (revise, re-score, re-audit) the expensive one, and the rubric awards marks
+    for exactly that iteration. Iterating here costs about 0.9M tokens instead of 5.7M.
+
+    DEVELOPMENT MEETINGS ONLY, evenly spaced across the corpus so the sample spans easing,
+    tightening and quiet periods rather than clustering in one regime. It is deterministic:
+    every team gets the same documents from the same corpus, so before-and-after audit
+    tables are comparable, and yours are comparable with your own from last week.
+
+    The pilot NEVER writes the construct-score tables. It prints the audit and stops.
+    """
+    held = validation_meetings(docs)
+    dev = (docs.loc[~docs["meeting_date"].isin(held), "meeting_date"]
+           .sort_values().tolist())
+    if len(dev) <= PILOT_N:
+        return dev
+    step = len(dev) / PILOT_N
+    return [dev[int(i * step)] for i in range(PILOT_N)]
+
+
+def _score_documents(docs: pd.DataFrame, label: str,
+                     offline: bool = False) -> tuple[list[dict], dict]:
     t0, records = time.time(), []
+    _RUN_ABORTED.clear()
     with ThreadPoolExecutor(max_workers=config.N_DOC_WORKERS) as ex:
-        futs = [ex.submit(score_document, r.meeting_date, r.text_scored)
+        futs = [ex.submit(score_document, r.meeting_date, r.text_scored, offline)
                 for r in docs.itertuples()]
-        for i, f in enumerate(as_completed(futs), 1):
-            records.append(f.result())
-            if i % 50 == 0:
-                print(f"    {i}/{len(docs)} ({time.time()-t0:.0f}s)")
-    fresh = [c for r in records if not r["cached"] for c in r["calls"]]
+        try:
+            for i, f in enumerate(as_completed(futs), 1):
+                records.append(f.result())
+                if i % 50 == 0:
+                    print(f"    {i}/{len(docs)} ({time.time()-t0:.0f}s)")
+        except BaseException:
+            # Stop scheduling on a run-wide failure. Every completed draw is already on
+            # disk (score_document flushes as each one lands), so the next run resumes
+            # instead of starting over.
+            _RUN_ABORTED.set()
+            for pending in futs:
+                pending.cancel()
+            raise
+    # THE DRAWS THIS RUN PAID FOR, per draw rather than per document. Treating every
+    # call in a partly-resumed document as fresh reported a one-call resume as five.
+    fresh = [c for r in records for c in r.get("fresh", [])]
     usage = {"scope": label,
              "api_calls": len(fresh),
              "failed_calls": sum(1 for c in fresh if not c.get("ok")),
@@ -654,6 +1069,11 @@ def _score_documents(docs: pd.DataFrame, label: str) -> tuple[list[dict], dict]:
                                   for c in fresh),
              "completion_tokens": sum((c.get("usage") or {}).get("completion_tokens", 0)
                                       for c in fresh),
+             # Reasoning tokens are billed as output but never appear in the answer.
+             # gpt-5.4-mini reports 0 while no reasoning effort is requested; if this
+             # ever goes non-zero, the model configuration changed underneath us.
+             "reasoning_tokens": sum((c.get("usage") or {}).get("reasoning_tokens", 0)
+                                     for c in fresh),
              "wall_seconds": round(time.time() - t0, 1),
              "documents_cached": sum(1 for r in records if r["cached"])}
     print(f"\n  {usage['api_calls']} fresh calls "
@@ -689,17 +1109,131 @@ def _write_scores(df: pd.DataFrame, which: str) -> int:
     """
     target = (config.CONSTRUCT_SCORES_DEV if which == "development"
               else config.CONSTRUCT_SCORES_VAL)
-    df.to_parquet(target, index=False)
+    config.atomic_to_parquet(df, target)
+    target.with_suffix("").with_suffix(".provenance.json").write_text(json.dumps({
+        # the CALL hash: the identity of the scores themselves. The stage hash also
+        # covers gates and validation settings, which do not change what was scored -
+        # stamping it here would force a needless re-score on every gate adjustment.
+        "config_hash": call_config_hash(), "scope": which, "n_rows": len(df),
+        # the TABLE's identity, not just its configuration's: a sidecar that only named
+        # the configuration once let an edited score file keep certifying itself
+        "scores_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+        "written_at": datetime.now(timezone.utc).isoformat()}, indent=1),
+        encoding="utf-8")
+    # ONE CONFIGURATION PER COMBINED TABLE. Development and validation partials produced
+    # under different prompts must not be concatenated: a team could otherwise keep old
+    # development scores, revalidate under revised rubrics, and quote a combined table no
+    # single configuration ever produced. A partial with no provenance sidecar predates
+    # this check and is tolerated; two sidecars that disagree are not.
+    hashes = {}
+    for p in (config.CONSTRUCT_SCORES_DEV, config.CONSTRUCT_SCORES_VAL):
+        prov = p.with_suffix("").with_suffix(".provenance.json")
+        if p.exists() and prov.exists():
+            hashes[p.name] = json.loads(prov.read_text(encoding="utf-8"))["config_hash"]
+    if len(set(hashes.values())) > 1:
+        raise RuntimeError(
+            f"the development and validation score partials were produced under DIFFERENT "
+            f"configurations ({hashes}); refusing to combine them. Re-run the stale side "
+            f"under the current prompts (a repeat validation exposure needs --revalidate "
+            f"and must be declared).")
     parts = [pd.read_parquet(p) for p in
              (config.CONSTRUCT_SCORES_DEV, config.CONSTRUCT_SCORES_VAL) if p.exists()]
     combined = (pd.concat(parts, ignore_index=True)
                   .drop_duplicates(subset="meeting_date", keep="last")
                   .sort_values("meeting_date").reset_index(drop=True))
-    combined.to_parquet(config.CONSTRUCT_SCORES, index=False)
+    config.atomic_to_parquet(combined, config.CONSTRUCT_SCORES)
+    # The COMBINED table's identity, tied to the partials it was merged from. The
+    # submission suite requires every hash here to match the file on disk, so a score
+    # edited consistently across all three tables still fails: the sidecars no longer
+    # certify it, and the downstream stage hashes (panel provenance, Shock inputs) no
+    # longer agree either.
+    config.atomic_write_text(
+        config.CONSTRUCT_SCORES.with_suffix("").with_suffix(".provenance.json"),
+        json.dumps({
+            "config_hash": call_config_hash(),
+            "combined_sha256": hashlib.sha256(
+                config.CONSTRUCT_SCORES.read_bytes()).hexdigest(),
+            "partials": {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                         for p in (config.CONSTRUCT_SCORES_DEV,
+                                   config.CONSTRUCT_SCORES_VAL) if p.exists()},
+            "written_at": datetime.now(timezone.utc).isoformat()}, indent=1))
     return len(combined)
 
 
-def run(dry_run: bool = False) -> pd.DataFrame | None:
+#: Where pilot audits are kept. One file per scoring configuration, so a rubric edit
+#: produces a NEW file beside the old one and the before-and-after pair survives.
+PILOT_DIR = config.OUTPUTS / "words_pilot"
+
+
+def run_pilot(dry_run: bool = False, offline: bool = False) -> pd.DataFrame | None:
+    """
+    ITERATION PASS on the fixed pilot sample, SAVED as evidence.
+
+    Run this while you are still changing rubrics. It reports the same construct audit
+    the full pass reports - spread, concentration, effective bins, separation and
+    orientation - for about a seventh of the tokens.
+
+    IT WRITES AN AUDIT FILE, one per scoring configuration, under
+    `outputs/words_pilot/<call-hash>.json`. That is deliberate: the rubric awards the
+    iteration marks for a before-and-after audit pair, and an earlier version printed
+    those tables to the terminal and threw them away - so following the supplied command
+    produced none of the evidence the marks are for. Each file records the documents
+    scored, the call hash, every gate, the orientation table, the evidence rate and the
+    usage, so two of them side by side ARE the before-and-after.
+
+    It does NOT write the construct-score tables or `words_audit.json`: a 25-document
+    sample is not a corpus measurement, and only the frozen development pass may produce
+    the numbers the report quotes.
+    """
+    all_docs = load_documents()
+    pilot = pilot_meetings(all_docs)
+    docs = all_docs[all_docs["meeting_date"].isin(pilot)].reset_index(drop=True)
+    print(f"  PILOT run - {len(docs)} fixed development documents "
+          f"({docs.meeting_date.min()} to {docs.meeting_date.max()})")
+    print("  The score tables and words_audit.json are NOT written - but the pilot audit")
+    print("  IS saved, and API responses are cached like any other call.")
+    if not _guard(dry_run, docs):
+        return None
+    records, usage = _score_documents(docs, "pilot", offline=offline)
+    df, ev = aggregate(records, docs)
+    print(f"{chr(10)}  evidence quotes verbatim: {ev['verbatim']}/{ev['checked']} "
+          f"({ev['verbatim']/max(1,ev['checked']):.0%})")
+    print(f"{chr(10)}  CONSTRUCT QUALITY AUDIT (pilot sample - iteration evidence, "
+          f"not a corpus measurement)")
+    quality = check_construct_quality(df)
+    orient = orientation_check(df)
+
+    PILOT_DIR.mkdir(parents=True, exist_ok=True)
+    out = PILOT_DIR / f"{call_config_hash()}.json"
+    config.atomic_write_text(out, json.dumps({
+        "scope": "pilot",
+        "call_config_hash": call_config_hash(),
+        "prompt_hash": _sha(SYSTEM_PROMPT + json.dumps(CONSTRUCTS, sort_keys=True)),
+        "n_documents": len(docs),
+        "documents": sorted(docs["meeting_date"]),
+        "model": config.MODEL, "temperature": config.SAMPLING_TEMPERATURE,
+        "max_output_tokens": config.MAX_OUTPUT_TOKENS,
+        "n_calls_per_document": config.N_PARALLEL_CALLS,
+        "usage": usage,
+        "evidence": ev,
+        "quality": quality.round(4).to_dict("records"),
+        "orientation": orient.round(4).to_dict("records") if len(orient) else [],
+        "written_at": datetime.now(timezone.utc).isoformat(),
+    }, indent=2, default=float))
+    kept = sorted(p.name for p in PILOT_DIR.glob("*.json"))
+    print(f"{chr(10)}  pilot audit saved: outputs/words_pilot/{out.name}")
+    if len(kept) > 1:
+        print(f"  {len(kept)} pilot audits on file - the before-and-after pair the "
+              f"rubric asks for is any two of them. Commit them.")
+    print(f"  {usage['api_calls']} fresh calls, "
+          f"{usage['prompt_tokens'] + usage['completion_tokens']:,} tokens "
+          f"(cached to {run_dir().name}).")
+    print("  When the audit stops changing your mind, freeze the rubrics and run the full")
+    print("  development pass:  python src/text_features.py")
+    return df
+
+
+def run(dry_run: bool = False, offline: bool = False) -> pd.DataFrame | None:
     """
     DEVELOPMENT run. Scores every document EXCEPT the validation meetings.
 
@@ -713,8 +1247,9 @@ def run(dry_run: bool = False) -> pd.DataFrame | None:
           f"({len(docs)} of {len(all_docs)} scored)")
     if not _guard(dry_run, docs):
         return None
-
-    records, usage = _score_documents(docs, "development")
+    config.stage_begin("words", config_hash())
+    config.ledger_reset("words")
+    records, usage = _score_documents(docs, "development", offline=offline)
     df, ev = aggregate(records, docs)
     print(f"\n  evidence quotes verbatim: {ev['verbatim']}/{ev['checked']} "
           f"({ev['verbatim']/max(1,ev['checked']):.0%})")
@@ -733,16 +1268,23 @@ def run(dry_run: bool = False) -> pd.DataFrame | None:
         "run_dir": str(run_dir().relative_to(config.ROOT)).replace("\\", "/"),
         "n_documents_scored": len(docs),
         "n_validation_withheld": len(held),
+        # the development table this audit describes - the audit must not keep
+        # certifying a score file that was edited after it was written
+        "scores_sha256": hashlib.sha256(
+            config.CONSTRUCT_SCORES_DEV.read_bytes()).hexdigest(),
         "usage": usage,
         "evidence": ev,
         "quality": quality.round(4).to_dict("records"),
         "orientation": orient.round(4).to_dict("records") if len(orient) else [],
     }, indent=2, default=float), encoding="utf-8")
+    config.ledger_commit("words", name="words_development")
+    config.stage_complete("words", config_hash())
     print(f"\n  when your rubrics are final: python src/text_features.py --validate")
     return df
 
 
-def validate(dry_run: bool = False, revalidate: bool = False) -> pd.DataFrame | None:
+def validate(dry_run: bool = False, revalidate: bool = False,
+             offline: bool = False) -> pd.DataFrame | None:
     """
     VALIDATION run. Scores ONLY the held-out meetings, once, and records what produced it.
 
@@ -773,8 +1315,9 @@ def validate(dry_run: bool = False, revalidate: bool = False) -> pd.DataFrame | 
         print("  --revalidate: this is a REPEAT exposure and is recorded as one")
     if not _guard(dry_run, docs):
         return None
-
-    records, _ = _score_documents(docs, "validation")
+    config.stage_begin("words", config_hash())
+    config.ledger_reset("words")
+    records, _ = _score_documents(docs, "validation", offline=offline)
     df, _ = aggregate(records, docs)
     n_total = _write_scores(df, "validation")
     print(f"  construct_scores.parquet now covers {n_total} of 211 meetings")
@@ -791,10 +1334,15 @@ def validate(dry_run: bool = False, revalidate: bool = False) -> pd.DataFrame | 
         "exposure_number": len(prior) + 1,
         "previous_exposures": prior,
         "meetings": sorted(held),
+        # the validation table this stamp describes, by content
+        "scores_sha256": hashlib.sha256(
+            config.CONSTRUCT_SCORES_VAL.read_bytes()).hexdigest(),
         "system_prompt": SYSTEM_PROMPT,
         "constructs": CONSTRUCTS,
         "episodes": out.round(4).to_dict("records"),
     }, indent=2, default=float), encoding="utf-8")
+    config.ledger_commit("words", name="words_validation")
+    config.stage_complete("words", config_hash())
     if prior:
         print(f"\n  RECORDED AS EXPOSURE {len(prior) + 1}. Your report must say why you "
               f"revalidated.")
@@ -804,7 +1352,14 @@ def validate(dry_run: bool = False, revalidate: bool = False) -> pd.DataFrame | 
 
 
 if __name__ == "__main__":
-    if "--validate" in sys.argv:
-        validate(dry_run="--dry-run" in sys.argv, revalidate="--revalidate" in sys.argv)
+    # --offline replays the committed envelopes and never contacts the service. Use it to
+    # reproduce a run from someone else's evidence, or to carry on after a quota stop
+    # without spending more budget.
+    _offline = "--offline" in sys.argv
+    if "--pilot" in sys.argv:
+        run_pilot(dry_run="--dry-run" in sys.argv, offline=_offline)
+    elif "--validate" in sys.argv:
+        validate(dry_run="--dry-run" in sys.argv, revalidate="--revalidate" in sys.argv,
+                 offline=_offline)
     else:
-        run(dry_run="--dry-run" in sys.argv)
+        run(dry_run="--dry-run" in sys.argv, offline=_offline)

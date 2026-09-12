@@ -41,17 +41,18 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Literal
 
 import pandas as pd
 from dotenv import load_dotenv
-from openai import OpenAI
 from pydantic import BaseModel
 from pydantic import Field as PField
 
 sys.path.insert(0, os.path.dirname(__file__))
 import channels        # noqa: E402
 import config          # noqa: E402
+import courseapi  # noqa: E402
 import context_docs    # noqa: E402
 from scenario_engine import (HORIZONS, Branch, Tree,  # noqa: E402
                              apply_adjudications, opposing_direction_guard,
@@ -66,20 +67,20 @@ from scenario_engine import (HORIZONS, Branch, Tree,  # noqa: E402
                              DIRECTION_MARGIN)
 
 load_dotenv()
-_client: OpenAI | None = None
+_client = None
 
 
-def client_() -> OpenAI:
-    global _client
-    if _client is None:
-        _client = OpenAI()
-    return _client
+def client_():
+    """The course API client (see courseapi): same shape, UNSW proxy underneath."""
+    return courseapi.client_()
 
 
 # The WORKED EXAMPLE. Not assessed - it exists so you can see one complete
-# branch -> evaluate -> prune -> expand cycle before attempting your own. Run it with
-# `python src/scenarios.py --worked`. See worked-solution/outputs/worked_scenario.json for
-# what a good tree looks like, including a properly recorded rejected branch.
+# branch -> evaluate -> prune cycle before committing to your own prompts.
+#
+# READ docs/worked-example-tree.md FIRST. It is a static record of this scenario's tree,
+# costs nothing to read, and needs no prompts of your own. `--worked` runs the same
+# scenario live through YOUR branch prompt, so it only works once Step 3 is done.
 WORKED_SCENARIO = (
     "Sharp cut to net overseas migration",
     "The Australian government cuts the permanent migration cap and tightens student visa "
@@ -421,30 +422,35 @@ ADVERSARIAL_RESPONSES: dict[str, dict] = {}
 # adjudication is a judgement about credibility, and credibility does not supply evidence.
 #
 # ---------------------------------------------------------------------------------------
-# A COMPLETE EXAMPLE, keyed exactly as the assessed scenario emits it. Copy the shape.
+# THE SHAPE OF ONE RECORD, on the UNASSESSED migration scenario.
+#
+# It is deliberately written for the scenario you are NOT marked on, and the evidence
+# fields are left as descriptions of what belongs there rather than findings. Both
+# assessed scenarios are yours to reach: a worked record for one of them would hand you
+# the canonical claim, the verdict and the cross-stage evidence that the marks are for.
+#
+# The KEY is emitted by the discovery step (`--discover`) and must be copied exactly.
 #
 # CHANNEL_REVIEWS = {
-#     "A. Taiwan Strait blockade": {
-#         "external_demand | easing | 1-2q | gdp_growth_yoy": {
-#             "canonical": "Declining External Demand",
-#             "confidence": "high",
-#             "global_verdict": "scenario_fact",
-#             "fact_id": "china_contraction",
-#             "fact_link_reason": "the stipulated contraction IS the demand fall this "
-#                                 "claim asserts, one step upstream of the proxy",
-#             "australian_verdict": "supports",
-#             "evidence_cycle": "gdp_growth_yoy importance +0.0050 with an interval that "
-#                               "clears zero - small but real",
-#             "evidence_words": "downside_risk_emphasis runs 0.680 on cuts against 0.445 "
-#                               "on hikes, monotonic as expected",
-#             "evidence_replay": "the 2010-11 reconstruction failed by reading "
-#                                "contemporaneous activity as settled; forward demand is "
-#                                "where the Board looks",
-#             "decision": "accept",
-#             "reason": "the contraction is stipulated (china_contraction); the Australian "
-#                       "leg - a third of shipments is a large activity shock - is ours "
-#                       "and we sign it",
-#             "by": "AB"},
+#     "Sharp cut to net overseas migration": {
+#         "labour_supply | <direction> | <horizon> | <proxy>": {
+#             "canonical": "<the canonical claim text, as the tree emitted it>",
+#             "confidence": "high" | "moderate" | "low",
+#             "global_verdict": "supports" | "does_not_support" | "scenario_fact"
+#                               | "uncertain",
+#             "fact_id": "<required only with scenario_fact; a key from SCENARIO_FACTS>",
+#             "fact_link_reason": "<required with scenario_fact: why THAT stipulated fact "
+#                                 "carries THIS claim - one sentence, signed>",
+#             "australian_verdict": "supports" | "does_not_support" | "uncertain",
+#             "evidence_cycle": "<what YOUR causal tests found about this proxy, with the "
+#                               "verdict and the number you are resting on>",
+#             "evidence_words": "<what YOUR construct scores show, with the figures>",
+#             "evidence_replay": "<what YOUR reconstruction showed about how the Board "
+#                                "weighs this>",
+#             "decision": "accept" | "modify" | "reject",
+#             "reason": "<why, in your words - this sentence is the judgement being "
+#                       "assessed>",
+#             "by": "<initials>"},
 #     },
 # }
 CHANNEL_REVIEWS: dict[str, dict[str, dict]] = {}
@@ -555,6 +561,7 @@ class BranchOut(BaseModel):
 
 
 class ScoreOut(BaseModel):
+    channel_id: str = PField(description="the id given with the channel, echoed exactly")
     channel: str
     credibility: float = PField(ge=0.0, le=1.0)
     reason: str
@@ -658,48 +665,163 @@ def _prompts_written() -> bool:
 RAW_DIR = config.DATA_PROCESSED / "shock_raw"
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 
+# How many channels one evaluator call is asked to score. Chosen well inside the point at
+# which a model stops early: asked for 36 scores in one response, gpt-4o-mini returned 12.
+# The chunk size was NOT re-tuned when the course moved to gpt-5.4-mini - it is a
+# conservative bound, and raising it to save calls would be a change to what is generated,
+# which the Shock configuration hash covers deliberately.
+EVALUATE_CHUNK = 12
+
+
+class LLMCallError(RuntimeError):
+    """
+    An LLM call this stage NEEDS did not produce a valid response.
+
+    Raised, never swallowed: a failed branch call is not "the model proposed no channels",
+    a failed evaluator call is not a set of default credibilities, and a failed adversarial
+    call is not an answered challenge. The run stops, the failure envelope is on disk, and
+    re-running retries only the failed call - everything successful is already cached.
+    """
+
+
+# Errors that retrying cannot fix: bad credentials, malformed requests (including a schema
+# the endpoint rejects), and plain programming errors. Matched by name so no extra imports
+# are needed; anything else (rate limits, timeouts, connection drops, 5xx) is transient and
+# retried with backoff.
+_NON_TRANSIENT = ("AuthenticationError", "PermissionDeniedError", "BadRequestError",
+                  "NotFoundError", "UnprocessableEntityError",
+                  "TypeError", "KeyError", "AttributeError", "ValidationError"
+                  ) + courseapi.NON_TRANSIENT_ERRORS
+
+
+def _quarantine(path, why: str) -> None:
+    """Move an unusable cache file aside and say exactly what to do about it."""
+    bad = path.with_suffix(path.suffix + ".invalid")
+    try:
+        path.replace(bad)
+    except OSError:
+        bad = None
+    print(f"    CACHE QUARANTINED: {path.name} - {why}."
+          + (f" Moved to {bad.name}; " if bad else " ")
+          + "re-run to make a fresh call (an unchanged prompt re-bills nothing else).")
+
+
+def reusable_under_current_ceiling(rec: dict) -> bool:
+    """
+    THE OUTPUT-CEILING COMPATIBILITY RULE. Same rule as Words - see
+    `text_features.reusable_under_current_ceiling` for the full reasoning.
+
+    A cached SUCCESS is reusable only when the ceiling now in force is at least the one
+    it was produced under (it finished inside that allowance, so more room cannot cut it
+    short; less room might). A cached TRUNCATION stops being settled as soon as the
+    ceiling RISES, which is what makes the brief's advice - raise
+    config.MAX_OUTPUT_TOKENS and re-run - actually do something.
+    """
+    current = int(config.MAX_OUTPUT_TOKENS)
+    v = (rec.get("request") or {}).get("max_output_tokens")
+    recorded = int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    if rec.get("ok"):
+        return recorded is not None and current >= recorded
+    if "IncompleteResponseError" in str(rec.get("error", "")):
+        return recorded is not None and current <= recorded
+    return True
+
 
 def llm_parsed(system: str, user: str, schema, seed_offset: int = 0) -> dict:
     """
-    Schema-validated, cached and retried. Returns {} only after MAX_RETRIES failures.
+    Schema-validated, cached and retried. Raises LLMCallError instead of failing open.
 
     The earlier version asked for a bare JSON object and swallowed a parse failure as an
     empty dict, which surfaced as "the model proposed no channels" - indistinguishable from
     the model genuinely proposing none.
+
+    Cached payloads are RE-validated against the current schema on load - a cache written
+    under an older schema, or corrupted on disk, is quarantined rather than trusted just
+    because it once said "ok". Failures are persisted as envelopes too, so a marker can see
+    what failed and when; a failure envelope never short-circuits a retry on the next run.
+    Non-transient errors (authentication, malformed request/schema, programming errors)
+    fail immediately - exponential backoff cannot fix a bad key.
     """
+    # The key covers the SCHEMA ITSELF, not just its class name: a schema edit under an
+    # unchanged name used to leave old envelopes valid-looking, so a cached payload could
+    # bypass the validation a fresh response would have faced.
+    schema_fp = hashlib.sha256(json.dumps(
+        schema.model_json_schema(), sort_keys=True, default=str
+    ).encode("utf-8")).hexdigest()[:12]
     key = hashlib.sha256(json.dumps(
         [system, user, config.MODEL, config.SAMPLING_TEMPERATURE,
-         config.SEED + seed_offset, schema.__name__], sort_keys=True
+         config.CALL_INDEX_BASE + seed_offset, schema.__name__, schema_fp], sort_keys=True
     ).encode("utf-8")).hexdigest()[:16]
     path = RAW_DIR / f"{schema.__name__}-{key}.json"
     if path.exists():
-        rec = json.loads(path.read_text())
+        try:
+            rec = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            _quarantine(path, f"unreadable ({type(e).__name__})")
+            rec = {}
         if rec.get("ok"):
-            return rec["payload"]
+            # metadata must match the request being served: a valid envelope renamed or
+            # copied over another cache path must not be accepted for it
+            expected = {"model": config.MODEL,
+                        "temperature": config.SAMPLING_TEMPERATURE,
+                        "call_index": config.CALL_INDEX_BASE + seed_offset,
+                        "prompt_sha": key}
+            wrong = {k: (rec.get(k), v) for k, v in expected.items()
+                     if rec.get(k) != v}
+            if wrong:
+                _quarantine(path, f"envelope metadata does not match this request "
+                                  f"({list(wrong)})")
+            elif not reusable_under_current_ceiling(rec):
+                print(f"    re-asking {path.name}: produced under a different output "
+                      f"ceiling than the one now in force")
+            else:
+                try:
+                    payload = schema.model_validate(rec["payload"]).model_dump()
+                    config.ledger_add("shock", path)
+                    return payload
+                except Exception as e:  # noqa: BLE001 - any invalid cache is quarantined
+                    _quarantine(path, f"payload no longer validates against "
+                                      f"{schema.__name__} ({type(e).__name__})")
     last = None
     for attempt in range(config.MAX_RETRIES):
         try:
             r = client_().beta.chat.completions.parse(
                 model=config.MODEL, temperature=config.SAMPLING_TEMPERATURE,
-                seed=config.SEED + seed_offset, response_format=schema,
+                call_index=config.CALL_INDEX_BASE + seed_offset,
+                max_tokens=config.MAX_OUTPUT_TOKENS, response_format=schema,
                 messages=[{"role": "system", "content": system},
                           {"role": "user", "content": user}])
             payload = r.choices[0].message.parsed.model_dump()
             path.write_text(json.dumps(
                 {"ok": True, "payload": payload, "attempt": attempt + 1,
-                 "model": config.MODEL, "seed": config.SEED + seed_offset,
+                 "model": config.MODEL,
+                 "call_index": config.CALL_INDEX_BASE + seed_offset,
                  "temperature": config.SAMPLING_TEMPERATURE,
+                 "request": getattr(r, "request", None),
+                 "provenance": getattr(r, "provenance", None),
+                 "model_served": getattr(r, "model", None),
                  "prompt_sha": key,
                  "request_id": getattr(r, "id", None),
-                 "usage": (r.usage.model_dump() if getattr(r, "usage", None) else None),
+                 "usage": getattr(r, "usage", None),
                  "timestamp": datetime.now(timezone.utc).isoformat()}, indent=1))
+            config.ledger_add("shock", path)
             return payload
         except Exception as e:  # noqa: BLE001
             last = f"{type(e).__name__}: {str(e)[:140]}"
+            if type(e).__name__ in _NON_TRANSIENT:
+                break
             if attempt < config.MAX_RETRIES - 1:
                 time.sleep(config.RETRY_BASE_SECONDS * (2 ** attempt) + random.uniform(0, .5))
-    print(f"    CALL FAILED after {config.MAX_RETRIES} attempts: {last}")
-    return {}
+    path.write_text(json.dumps(
+        {"ok": False, "error": last, "schema": schema.__name__,
+         "model": config.MODEL,
+         "call_index": config.CALL_INDEX_BASE + seed_offset,
+         "prompt_sha": key,
+         "timestamp": datetime.now(timezone.utc).isoformat()}, indent=1))
+    raise LLMCallError(
+        f"{schema.__name__} call failed ({last}). Nothing reportable can be built from a "
+        f"failed call, so the run stops here; the failure envelope is {path.name}. Fix the "
+        f"cause and re-run - every successful call is cached and will not re-bill.")
 
 
 _TAG_RE = re.compile(r"([^\[\]]+?\.(?:pdf|html?|txt|md))(?:\s+p\.(\d+))?", re.I)
@@ -1069,19 +1191,161 @@ def effective_pruning_reviews(scenario: str) -> dict | None:
     return _load_json_table("pruning_reviews.json").get(scenario)
 
 
+@lru_cache(maxsize=64)
+def _file_fingerprint(path_str: str, mtime_ns: int, size: int) -> str:
+    """sha256 of a file's bytes, memoised on (path, mtime, size) so repeated hashing of
+    the same unchanged input costs one read per process."""
+    h = hashlib.sha256()
+    with open(path_str, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def file_fingerprint(path) -> str:
+    """Fingerprint one input file; a missing file fingerprints as 'absent'."""
+    import pathlib
+    p = pathlib.Path(path)
+    if not p.exists():
+        return "absent"
+    st = p.stat()
+    return _file_fingerprint(str(p), st.st_mtime_ns, st.st_size)
+
+
+def _json_fingerprint(path, drop: tuple = ()) -> str:
+    """
+    Content fingerprint of a JSON input: canonicalised, with run incidentals (wall time,
+    cache counts) dropped. Byte-hashing these files made an honest offline regeneration
+    look like a changed input, because the incidentals differ on every run while the
+    content that shapes the outputs does not.
+    """
+    import pathlib
+    p = pathlib.Path(path)
+    if not p.exists():
+        return "absent"
+    rec = json.loads(p.read_text(encoding="utf-8"))
+    for k in drop:
+        rec.pop(k, None)
+    return hashlib.sha256(json.dumps(rec, sort_keys=True, default=str)
+                          .encode("utf-8")).hexdigest()[:16]
+
+
+#: Committed evidence about the context documents, so a checkout WITHOUT them can still be
+#: verified. The documents themselves are not redistributable and are gitignored; this file
+#: is their fingerprint record and IS committed.
+CONTEXT_FINGERPRINTS = config.OUTPUTS / "context_fingerprints.json"
+
+
+def _live_context_fingerprints() -> dict:
+    """{filename: content hash} for the SOURCE DOCUMENTS present on disk, if any.
+
+    Uses `context_docs.source_files()` so this is exactly the set `load_documents()`
+    reads - not "every supported file in the folder", which used to sweep in README.md
+    and sources.json and thereby made the set impossible to reproduce from a record.
+    """
+    return {p.name: file_fingerprint(p)
+            for p in context_docs.source_files(context_docs.CONTEXT_DIR)}
+
+
+def write_context_fingerprints(docs: dict | None = None) -> dict:
+    """Record one content hash per context document, and commit it.
+
+    THE GAP THIS CLOSES. The Shock stage hash reads the bytes of every context document,
+    and the submission suite loads the real files. Both are right when the documents are
+    present - and neither can run at all on a Git-only checkout, because the documents are
+    correctly gitignored as non-redistributable. A marker who cloned the repository was
+    therefore asked to reproduce a hash from files the repository is forbidden to carry.
+
+    The fix is to commit the fingerprints rather than the sources. `input_fingerprints()`
+    prefers the files when they are present and falls back to this record when they are
+    not, so the stage hash is the same either way, and the submission suite can verify the
+    declaration offline. Reading the documents themselves remains a staff action, done
+    from the team's own downloads.
+    """
+    live = _live_context_fingerprints()
+    rec = {"documents": live,
+           "n_documents": len(live),
+           # the DECLARATION is committed, so it is recorded separately rather than
+           # mixed in with the documents it describes
+           "declaration_sha256": file_fingerprint(
+               context_docs.CONTEXT_DIR / "sources.json"),
+           "declared": sorted(context_docs._declared_sources()),
+           "written_at": datetime.now(timezone.utc).isoformat()}
+    config.atomic_write_text(CONTEXT_FINGERPRINTS, json.dumps(rec, indent=1))
+    return rec
+
+
+def _committed_context_fingerprints() -> dict:
+    if not CONTEXT_FINGERPRINTS.exists():
+        return {}
+    try:
+        return json.loads(CONTEXT_FINGERPRINTS.read_text(encoding="utf-8")).get(
+            "documents", {})
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def input_fingerprints() -> dict:
+    """
+    The DATA this stage reads, fingerprinted: the source declaration, every context
+    document, and the frozen-model inputs. Part of the stage hash, so replacing a source
+    PDF, editing sources.json or swapping the frozen panel after generation invalidates
+    the committed artefact exactly as editing a prompt would.
+
+    The SOURCE DOCUMENTS are fingerprinted from the files when they are present, and from
+    the committed `outputs/context_fingerprints.json` when they are not - see
+    `write_context_fingerprints()`. The two are the same mapping by construction, because
+    both use `context_docs.source_files()`, so the stage hash is reproducible on a clone
+    that cannot legally carry the sources.
+
+    The DECLARATION (`sources.json`) is hashed as its own field. It is committed, so it is
+    always available and never needs a fallback - and mixing it in with the documents was
+    what stopped the fallback ever firing: the dictionary could not become empty, so the
+    "no sources present" branch was unreachable.
+    """
+    docs = _live_context_fingerprints() or _committed_context_fingerprints()
+    return {"context_documents": docs,
+            "context_declaration": file_fingerprint(
+                context_docs.CONTEXT_DIR / "sources.json"),
+            "frozen_panel": file_fingerprint(config.DATA_PROCESSED
+                                             / "panel_frozen.parquet"),
+            "frozen_tiers": file_fingerprint(config.FROZEN_TIERS),
+            # the Shock model artefacts and the Words audit both shape the outputs: the
+            # model card supplies the frozen coefficients, and words_audit.json decides
+            # which constructs the reaction-profile ranking may use
+            "shock_design": file_fingerprint(config.MODEL_CARD / "shock_design.parquet"),
+            "shock_train_design": file_fingerprint(config.MODEL_CARD
+                                                   / "shock_train_design.parquet"),
+            "model_card_performance": _json_fingerprint(config.MODEL_CARD
+                                                        / "performance.json"),
+            "words_audit": _json_fingerprint(config.OUTPUTS / "words_audit.json",
+                                             drop=("usage",)),
+            # the TEAM's construct scores are the seven columns the episode profiles
+            # rank against (see _profile_panel) - editing them after generation must
+            # invalidate the committed Shock artefacts
+            "construct_scores": file_fingerprint(config.CONSTRUCT_SCORES)}
+
+
 def config_hash() -> str:
     """
-    Identifies THIS Shock configuration - the four prompts, the model settings, and every
-    human judgement table in effect (Python dict or JSON file alike). Stored in shock.json
-    by `write_shock_outputs()` and compared by the submission check: an artefact generated
-    under different prompts or judgements than the repository holds cannot pass as
-    current. Words has carried this guarantee since its cache was rebuilt; Replay and
-    Shock used to carry none.
+    Identifies THIS Shock configuration - the four prompts, the model settings, every
+    human judgement table in effect (Python dict or JSON file alike), AND the input data
+    the stage read (sources.json, the context documents, the frozen-model files). Stored
+    in shock.json by `write_shock_outputs()` and compared by the submission check: an
+    artefact generated under different prompts, judgements or inputs than the repository
+    holds cannot pass as current.
     """
     payload = json.dumps({
         "prompts": [BRANCH_PROMPT, EVALUATE_PROMPT, EXPAND_PROMPT, ADVERSARIAL_PROMPT],
         "model": config.MODEL, "temperature": config.SAMPLING_TEMPERATURE,
-        "seed": config.SEED,
+        "call_index_base": config.CALL_INDEX_BASE,
+        "inputs": input_fingerprints(),
+        "evaluate_chunk": EVALUATE_CHUNK,
+        # the output ceiling changes the answer: a lower one truncates
+        "max_output_tokens": config.MAX_OUTPUT_TOKENS,
+        "response_schemas": {m.__name__: hashlib.sha256(json.dumps(
+            m.model_json_schema(), sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:12] for m in (BranchOut, EvaluateOut, AdversarialOut)},
         # Everything that shapes what is GENERATED, RETRIEVED, PRUNED or REPORTED. A field
         # missing here is a field that can be edited after artefact generation without
         # invalidating the submission check - which is how the check gets lied to.
@@ -1114,14 +1378,36 @@ def config_hash() -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
+_RUN_ID: str | None = None
+
+
+def stage_run_id() -> str:
+    """
+    One identifier per Shock PROCESS, stamped into shock.json, every tree in
+    tot_trees.json and reaction_profiles.json. The three artefacts are only coherent when
+    written by the same run - a reaction_profiles.json regenerated on its own describes a
+    tree that may no longer exist, and before the run_id nothing could tell.
+    """
+    global _RUN_ID
+    if _RUN_ID is None:
+        _RUN_ID = f"{random.getrandbits(48):012x}"
+    return _RUN_ID
+
+
 def write_shock_outputs(out: dict, trees: dict, wall_seconds: float) -> None:
-    """The one writer for shock.json and tot_trees.json - the stage hash rides along."""
-    (config.OUTPUTS / "shock.json").write_text(
+    """The one writer for shock.json and tot_trees.json - the stage hash rides along.
+    Atomic: a crash between the two writes cannot leave one current and one stale."""
+    for t in trees.values():
+        t["run_id"] = stage_run_id()
+    config.atomic_write_text(
+        config.OUTPUTS / "shock.json",
         json.dumps({"scenarios": out, "config_hash": config_hash(),
+                    "run_id": stage_run_id(),
                     "wall_seconds": round(wall_seconds, 1)},
-                   indent=2, default=float), encoding="utf-8")
-    (config.OUTPUTS / "tot_trees.json").write_text(
-        json.dumps(trees, indent=2, default=float), encoding="utf-8")
+                   indent=2, default=float))
+    config.atomic_write_text(
+        config.OUTPUTS / "tot_trees.json",
+        json.dumps(trees, indent=2, default=float))
 
 
 PRUNING_REVIEW_VERDICTS = ("agree", "reinstate")
@@ -1686,22 +1972,74 @@ def evaluate(branches: list[Branch], scenario: str, panel_columns: list[str],
     # passages. An earlier version passed only mechanism/direction/proxy and then asked
     # whether the channel was well grounded and correctly sized - questions its input
     # could not answer.
-    payload = [{"channel": b.channel, "channel_type": b.channel_type,
-                "mechanism": b.mechanism, "direction": b.direction, "proxy": b.proxy,
-                "n_sd": b.n_sd, "horizon": b.horizon, "pathway": b.pathway,
-                "source": b.source, "pathway_flag": b.pathway_note or None,
-                "note": b.note[:200]}
-               for b in branches]
-    data = llm_parsed(EVALUATE_PROMPT + chr(10) + chr(10) + required_fields(EvaluateOut),
-                      f"SCENARIO: {scenario}\n\nAVAILABLE PANEL COLUMNS: {panel_columns}\n\n"
-                      f"{channels.describe_calibration()}\n\n"
-                      f"THE SOURCE PASSAGES THE CHANNELS CITE:\n{passages[:12000]}\n\n"
-                      f"CHANNELS:\n{json.dumps(payload, indent=1)}", EvaluateOut)
-    by_name = {str(s.get("channel", "")).strip().lower()[:60]: s
-               for s in (data.get("scores") or [])}
+    #
+    # CHUNKED, because coverage is the contract. One call carrying every channel is how a
+    # 36-channel second-order tree came back with 12 scores - the model simply stopped -
+    # and the missing 24 then took the silent default. Small chunks keep each response
+    # comfortably inside what the model will actually finish, and one follow-up call
+    # re-asks for anything an individual chunk still skipped.
+    # Matching is by GENERATED ID, not by name. Matching on a lowercased name prefix let
+    # two long, similarly worded channels collide, silently applying one score to both;
+    # the ids make the required one-to-one match checkable exactly.
+    ids = {f"ch{i:03d}": b for i, b in enumerate(branches)}
+    id_of = {id(b): k for k, b in ids.items()}
+
+    def _score_chunk(chunk: list[Branch]) -> dict[str, dict]:
+        payload = [{"id": id_of[id(b)], "channel": b.channel,
+                    "channel_type": b.channel_type,
+                    "mechanism": b.mechanism, "direction": b.direction, "proxy": b.proxy,
+                    "n_sd": b.n_sd, "horizon": b.horizon, "pathway": b.pathway,
+                    "source": b.source, "pathway_flag": b.pathway_note or None,
+                    "note": b.note[:200]}
+                   for b in chunk]
+        data = llm_parsed(EVALUATE_PROMPT + chr(10) + chr(10)
+                          + "Echo each channel's `id` back as `channel_id`, exactly. "
+                          + required_fields(EvaluateOut),
+                          f"SCENARIO: {scenario}\n\nAVAILABLE PANEL COLUMNS: "
+                          f"{panel_columns}\n\n"
+                          f"{channels.describe_calibration()}\n\n"
+                          f"THE SOURCE PASSAGES THE CHANNELS CITE:\n{passages[:12000]}\n\n"
+                          f"CHANNELS:\n{json.dumps(payload, indent=1)}", EvaluateOut)
+        got, dupes, unknown = {}, [], []
+        want = {id_of[id(b)] for b in chunk}
+        for s in (data.get("scores") or []):
+            cid = str(s.get("channel_id", "")).strip()
+            if cid not in ids:
+                unknown.append(cid)
+            elif cid in got:
+                dupes.append(cid)
+            elif cid in want:
+                got[cid] = s
+        if dupes or unknown:
+            raise LLMCallError(
+                f"the evaluator's response is not a one-to-one match: duplicate ids "
+                f"{dupes[:4]}, unknown ids {unknown[:4]}. One score per requested "
+                f"channel is the contract; re-run to retry the call.")
+        return got
+
+    by_id: dict[str, dict] = {}
+    for i in range(0, len(branches), EVALUATE_CHUNK):
+        by_id.update(_score_chunk(branches[i:i + EVALUATE_CHUNK]))
+    # FAIL CLOSED on coverage. An earlier version gave any unscored channel a default
+    # credibility of 0.5, so an evaluator that dropped channels - or failed entirely -
+    # produced a tree of confident-looking middling scores nobody had assigned.
+    still = [b for b in branches if id_of[id(b)] not in by_id]
+    if still:
+        by_id.update(_score_chunk(still))
+    missing = [b.channel for b in branches if id_of[id(b)] not in by_id]
+    if missing:
+        raise LLMCallError(
+            f"the evaluator scored {len(branches) - len(missing)} of {len(branches)} "
+            f"channels even after a follow-up call; unscored: "
+            f"{[m[:50] for m in missing[:5]]}. A default credibility is not a judgement, "
+            f"so the run stops - re-run to retry the evaluator calls.")
     for b in branches:
-        s = by_name.get(b.channel.strip().lower()[:60], {})
-        b.score = float(s.get("credibility", 0.5))
+        s = by_id[id_of[id(b)]]
+        score = float(s.get("credibility"))
+        if not 0.0 <= score <= 1.0 or score != score:
+            raise LLMCallError(
+                f"evaluator credibility {score!r} for '{b.channel[:50]}' is outside [0, 1]")
+        b.score = score
         if s.get("reason"):
             b.note = (b.note + " | eval: " + str(s["reason"]))[:800]
         if b.proxy and b.proxy not in panel_columns:
@@ -1812,6 +2150,29 @@ def failed_constructs() -> set[str]:
     return out
 
 
+def _profile_panel(panel: pd.DataFrame) -> pd.DataFrame:
+    """
+    WORDS FEEDS SHOCK HERE, literally. The frozen panel supplies the structured history
+    every team shares, but the seven construct columns the episode profiles rank
+    against are YOUR validated measurements from construct_scores.parquet - not the
+    instructor's. An earlier version ranked the frozen panel's own text columns, so a
+    team's prompt-engineered instrument never actually reached the Shock task it was
+    built for; the brief promised otherwise.
+    """
+    scores = config.validate_construct_scores(reportable=True)
+    scores = scores.set_index(pd.to_datetime(scores["meeting_date"])).sort_index()
+    missing = panel.index.difference(scores.index)
+    if len(missing):
+        raise RuntimeError(
+            f"{len(missing)} panel meetings carry no construct scores (first: "
+            f"{missing[0].date()}) - run BOTH Words passes before a reportable Shock "
+            f"run")
+    out = panel.copy()
+    for c in config.TEXT_FEATURES:
+        out[c] = scores.loc[out.index, c].to_numpy()
+    return out
+
+
 def reaction_profiles(panel: pd.DataFrame, expected: dict[str, dict],
                       claimed: dict[str, str] | None = None) -> dict:
     """
@@ -1863,15 +2224,20 @@ def reaction_profiles(panel: pd.DataFrame, expected: dict[str, dict],
                      "mean_abs_gap": float(cmp["mean_abs_gap"].iloc[0]),
                      "excluded_constructs": sorted(excluded),
                      "gaps": cmp.round(3).to_dict("index")}
-    (config.OUTPUTS / "reaction_profiles.json").write_text(
+    config.atomic_write_text(
+        config.OUTPUTS / "reaction_profiles.json",
         json.dumps({"episode_profiles": episode_profiles(panel).round(3).to_dict("index"),
                     "excluded_constructs": sorted(excluded),
-                    "scenarios": out}, indent=2, default=float), encoding="utf-8")
+                    "run_id": stage_run_id(),
+                    "scenarios": out}, indent=2, default=float))
     return out
 
-# ###########################################################################################
-# YOUR ORCHESTRATION BELOW THIS LINE - everything above is supplied framework
-# ###########################################################################################
+# -------------------------------------------------------------------------------------------
+# The SUPPLIED runners. You do not write control flow anywhere in this assignment: you
+# supply prompts, judgement tables and reviews above, and these runners validate and
+# execute them. run() blocks until the reviews are complete; --discover produces the
+# review template; --worked demonstrates the workflow on the unassessed scenario.
+# -------------------------------------------------------------------------------------------
 
 def _setup():
     """The FROZEN, CONSTRUCT-FREE shock model. Everyone shocks the same coefficients."""
@@ -2009,7 +2375,11 @@ def _evaluate_tree(name: str, res: dict, tree: Tree, clf, X, panel) -> dict:
             other[h] = {"model_verdict": r["model_verdict"],
                         "n_channels": r["n_channels_at_horizon"],
                         "channel_direction": r["channel_direction"]["direction"]}
-        except Exception as e:  # noqa: BLE001
+        except (ValueError, RuntimeError) as e:
+            # the expected operational outcome: nothing usable at this horizon. A
+            # KeyError, NameError or corrupt panel is a DEFECT and propagates - an
+            # earlier version recorded those as horizon "errors" too, which presented
+            # a programming fault as an ordinary empty horizon.
             other[h] = {"error": str(e)[:80]}
     for h, r in other.items():
         print(f"      {h:10s} {r.get('n_channels', 0):2d} channels -> model "
@@ -2067,7 +2437,12 @@ def _review_template(name: str, tree: Tree, summary: dict, audit: dict) -> dict:
             # b.keep is uniformly False here and useless for choosing a canonical.
             # `kept_after_pruning` recovers the pruning outcome: kept now, or kept until
             # the (review-less) grounding pass barred it.
+            # depth and parent are shown so the canonical can be chosen safely: a
+            # depth-1 canonical whose depth-0 parent is barred as a restatement
+            # leaves an orphan the strict validator refuses. Prefer a depth-0
+            # member as canonical where the group has one.
             "members": [{"channel": b.channel, "score": b.score,
+                         "depth": b.depth, "parent": b.parent,
                          "kept_after_pruning": bool(
                              b.keep or b.terminal_exclusion.startswith("grounding")),
                          "proxy": b.proxy, "n_sd": b.n_sd,
@@ -2173,18 +2548,52 @@ def run_worked() -> dict:
         REQUIRE_CHANNEL_REVIEWS, REQUIRE_PRUNING_REVIEWS = was
     return res
 
+
+def _require_complete_scores() -> None:
+    """
+    A reportable Shock run needs the full corpus scored: the reaction profiles position
+    the scenarios against episode profiles built from every meeting's constructs.
+    Delegates to THE shared contract (exact authoritative meeting set, values, sd,
+    n_calls_valid) - the same one Replay and the panel builder apply, so the three
+    consumers cannot drift apart on what "valid scores" means.
+    """
+    config.validate_construct_scores(reportable=True)
+
+
 def run() -> dict:
     if not _prompts_written():
         raise NotImplementedError(
             "All four tree-of-thought prompts must be written first. See the Shock stage of "
             "the brief.")
-    raise NotImplementedError(
-        "Assemble your own run(): loop over SCENARIOS calling _one_tree(), call "
-        "reaction_profiles() with your EXPECTED_PROFILES and CLAIMED_ANALOGUES, and "
-        "finish with write_shock_outputs() - it embeds the stage hash the submission "
-        "check verifies. Run --discover first; run() blocks until the channel reviews "
-        "and pruning reviews are complete (Python dicts or the JSON record files - see "
-        "the note above PRUNING_REVIEW_VERDICTS).")
+    _require_complete_scores()
+    t0 = time.time()
+    config.stage_begin("shock", config_hash())
+    config.ledger_reset("shock")
+    docs = context_docs.load_documents()
+    # commit the fingerprints so a clone WITHOUT the non-redistributable sources can
+    # still recompute this stage's hash and verify the declaration
+    write_context_fingerprints(docs)
+    panel, clf, X = _setup()
+    print(f"  shock model: construct-free, {X.shape[1]} features, frozen panel "
+          f"({len(panel)} meetings)")
+
+    out, trees = {}, {}
+    for name, narrative in SCENARIOS.items():
+        print(f"\n  {name}")
+        res, tree = _one_tree(name, narrative, RETRIEVAL_TERMS[name], docs, clf, X, panel)
+        out[name] = res
+        trees[name] = tree.to_dict()
+
+    print("\n  REACTION PROFILES - the Words constructs applied to the scenarios")
+    profiles = reaction_profiles(_profile_panel(panel), EXPECTED_PROFILES,
+                                 claimed=CLAIMED_ANALOGUES)
+
+    write_shock_outputs(out, trees, time.time() - t0)
+    config.ledger_commit("shock")
+    config.stage_complete("shock", config_hash())
+    print(f"\n  wrote shock.json, tot_trees.json, reaction_profiles.json "
+          f"({time.time() - t0:.0f}s)")
+    return {"scenarios": out, "reaction_profiles": profiles}
 
 
 if __name__ == "__main__":

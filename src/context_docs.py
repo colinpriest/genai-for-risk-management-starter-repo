@@ -48,9 +48,10 @@ import config
 CONTEXT_DIR = config.DATA_RAW / "context"
 SUPPORTED = {".pdf", ".html", ".htm", ".txt", ".md"}
 
-# Rough character budget for what gets pasted into a single prompt. gpt-4o-mini has a large
-# context window but a 200-page PDF dumped whole produces worse reasoning, not better -
-# the relevant passages get buried. Retrieval, not stuffing.
+# Rough character budget for what gets pasted into a single prompt. The course model has a
+# large context window but a 200-page PDF dumped whole produces worse reasoning, not better
+# - the relevant passages get buried. Retrieval, not stuffing. The budget also keeps a
+# single call inside the proxy's per-request token ceiling.
 DEFAULT_BUDGET_CHARS = 24_000
 
 
@@ -121,22 +122,40 @@ def _read_html(path: Path) -> str:
     return _normalise(soup.get_text(" "))
 
 
+def source_files(directory: Path | None = None) -> list[Path]:
+    """
+    THE one definition of "a Shock source document", used everywhere.
+
+    It excludes the folder's own instructions, the source DECLARATION and any dotfiles.
+    Those are committed to the repository; the sources are not, and are not
+    redistributable. Keeping two different notions of the set broke the source-free
+    checkout: `input_fingerprints()` had its own list that included README.md and
+    sources.json, so the fingerprint dictionary never emptied when the documents were
+    removed, its fallback never fired, and the recorded map could not match the live one
+    in any case.
+
+    Returns [] rather than raising, so a caller can ask "are the sources here?" without
+    handling an exception.
+    """
+    directory = directory or CONTEXT_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    return [f for f in sorted(directory.iterdir())
+            if f.is_file()
+            and f.suffix.lower() in SUPPORTED
+            and f.stem.lower() not in {"readme", "desktop", "sources"}
+            and not f.name.startswith(".")]
+
+
 def load_documents(directory: Path | None = None) -> dict[str, str]:
     """
-    Read every supported file in the context directory. Returns {filename: text}.
+    Read every source document in the context directory. Returns {filename: text}.
 
-    Raises if the directory is empty, because a silent empty result here would produce
+    Raises if there are none, because a silent empty result here would produce
     scenarios generated from the model's general knowledge - exactly what the Shock stage forbids -
     and nothing downstream would tell you.
     """
     directory = directory or CONTEXT_DIR
-    directory.mkdir(parents=True, exist_ok=True)
-    # Skip the folder's own instructions and any dotfiles - they are not source documents,
-    # and counting the README as a source would quietly satisfy the three-source check.
-    files = [f for f in sorted(directory.iterdir())
-             if f.suffix.lower() in SUPPORTED
-             and f.stem.lower() not in {"readme", "desktop"}
-             and not f.name.startswith(".")]
+    files = source_files(directory)
 
     if not files:
         raise FileNotFoundError(
@@ -342,7 +361,7 @@ def _declared_sources(directory: Path | None = None) -> dict[str, dict]:
             f"organisations guessed from filenames.") from None
     if not isinstance(raw, list):
         raise RuntimeError(f"{f} must be a JSON list of records, one per document.")
-    out, problems = {}, []
+    out, problems, combos = {}, [], {}
     for n, r in enumerate(raw, 1):
         if not isinstance(r, dict):
             problems.append(f"record {n} is not an object")
@@ -353,14 +372,33 @@ def _declared_sources(directory: Path | None = None) -> dict[str, dict]:
             problems.append(f"{who} is missing {gaps}")
             continue
         try:
-            datetime.strptime(str(r["retrieved"]).strip(), "%Y-%m-%d")
+            got = datetime.strptime(str(r["retrieved"]).strip(), "%Y-%m-%d")
         except ValueError:
             problems.append(f"{who}: retrieved={r['retrieved']!r} is not YYYY-MM-DD")
+            continue
+        if got.date() > datetime.now().date():
+            problems.append(f"{who}: retrieved={r['retrieved']!r} is in the future - a "
+                            f"document cannot have been downloaded on a date that has "
+                            f"not happened")
             continue
         if not str(r["url"]).strip().lower().startswith(("http://", "https://")):
             problems.append(f"{who}: url={r['url']!r} is not a URL")
             continue
-        out[str(r["file"]).strip()] = r
+        key = str(r["file"]).strip()
+        if key in out:
+            # a dict would keep only the LAST record for a duplicated filename, so an
+            # accidental copy-paste silently replaced a declaration instead of failing
+            problems.append(f"{who}: duplicate declaration for the same file")
+            continue
+        combo = (_norm_org(str(r["organisation"])),
+                 " ".join(str(r["title"]).split()).lower())
+        if combo in combos:
+            problems.append(f"{who}: declares the same organisation and title as "
+                            f"{combos[combo]!r} - one document declared twice under two "
+                            f"filenames cannot both be real")
+            continue
+        combos[combo] = key
+        out[key] = r
     if problems:
         raise RuntimeError(
             f"{len(problems)} problem(s) in {f}:" + chr(10) + "  - "

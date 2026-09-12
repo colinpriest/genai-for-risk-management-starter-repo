@@ -1582,18 +1582,46 @@ def test_discovery_template_covers_the_assessed_scenarios():
 
 
 def test_shock_envelopes_declare_their_provenance_fields():
-    """Model, seed, temperature, prompt hash, request id, usage, attempt - as documented."""
+    """Model, call index, temperature, prompt hash, request id, usage, attempt, AND the
+    request actually sent - as documented. `request` is the one that matters since the
+    move to the course proxy: the call sites name parameters the API never receives
+    (`seed` is gone from this model family), so an envelope that reports only what the
+    code intended to send is not an audit record."""
     import inspect
 
     import scenarios as sc
     src = inspect.getsource(sc.llm_parsed)
     for field in ('"temperature"', '"prompt_sha"', '"request_id"', '"usage"',
-                  '"attempt"', '"model"', '"seed"'):
+                  '"attempt"', '"model"', '"call_index"', '"request"'):
         assert field in src, f"llm_parsed envelopes omit {field}"
     import decision_replay as dr
     src2 = inspect.getsource(dr._cached_call)
-    for field in ('"temperature"', '"prompt_sha"', '"request_id"'):
+    for field in ('"temperature"', '"prompt_sha"', '"request_id"', '"request"',
+                  '"call_index"'):
         assert field in src2, f"replay envelopes omit {field}"
+    import text_features as tf
+    src3 = inspect.getsource(tf.score_once)
+    for field in ('"model"', '"call_index"', '"request"', '"usage"'):
+        assert field in src3, f"words envelopes omit {field}"
+
+
+def test_no_envelope_records_a_seed_the_api_never_received():
+    """The GPT-5 family rejects `seed`, so nothing may write one into an envelope. An
+    envelope naming a request parameter that was never transmitted is a false record,
+    and this assignment's whole claim is that a marker can check what was asked."""
+    import inspect
+
+    import decision_replay as dr
+    import scenarios as sc
+    import text_features as tf
+    for mod, fn in ((sc, sc.llm_parsed), (dr, dr._cached_call),
+                    (tf, tf.score_once)):
+        src = inspect.getsource(fn)
+        assert '"seed"' not in src, (
+            f"{mod.__name__}.{fn.__name__} still writes a 'seed' envelope field; the "
+            f"API never receives one")
+        assert "seed=" not in src, (
+            f"{mod.__name__}.{fn.__name__} still passes seed= to the client")
 
 
 # -------------------------------------------------------------------------------------------
@@ -1952,9 +1980,11 @@ def test_json_only_records_drive_the_full_review_path(tmp_path, monkeypatch):
     assert kept.evidence_status == "both" and kept.keep is True
 
 
-@pytest.mark.parametrize("setting", ["MODEL", "SAMPLING_TEMPERATURE", "SEED"])
+@pytest.mark.parametrize("setting",
+                         ["MODEL", "SAMPLING_TEMPERATURE", "CALL_INDEX_BASE"])
 def test_both_stage_hashes_cover_the_generation_settings(setting, monkeypatch):
-    """Model, temperature and seed live on config and shape every generated token."""
+    """Model, temperature and the call-index base live on config and shape every
+    generated token - the last of these because it separates the N parallel draws."""
     import decision_replay as dr
     import scenarios as sc
     s_before, r_before = sc.config_hash(), dr.config_hash()
@@ -2127,12 +2157,11 @@ ORCHESTRATION_MARKER = "# YOUR ORCHESTRATION BELOW THIS LINE"
 
 def _supplied_half(path: pathlib.Path) -> str:
     """
-    The framework region: from the SUPPLIED marker to the ORCHESTRATION marker, or to the
-    end of the file if there is no orchestration section.
+    The framework region: from the SUPPLIED marker to the end of the file (the legacy
+    ORCHESTRATION marker, if one is ever reintroduced, ends the region early).
 
-    `run()` is student work even though it sits below the supplied marker, so it is excluded
-    - otherwise the worked solution's real runner would forever differ from the starter's
-    stub and the drift test would be permanently red.
+    The runners are supplied framework now - `run()` is identical in both repositories
+    and IS compared, so a runner edit in one repository cannot drift past this test.
     """
     text = path.read_text(encoding="utf-8")
     i = text.find(SUPPLIED_MARKER)

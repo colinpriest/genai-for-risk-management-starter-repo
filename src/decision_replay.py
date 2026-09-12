@@ -59,23 +59,21 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from openai import OpenAI
 from pydantic import BaseModel
 from pydantic import Field as PField
 
 sys.path.insert(0, os.path.dirname(__file__))
 import config      # noqa: E402
+import courseapi  # noqa: E402
 import nshot       # noqa: E402
 
 load_dotenv()
-_client: OpenAI | None = None
+_client = None
 
 
-def client_() -> OpenAI:
-    global _client
-    if _client is None:
-        _client = OpenAI()
-    return _client
+def client_():
+    """The course API client (see courseapi): same shape, UNSW proxy underneath."""
+    return courseapi.client_()
 
 
 # ###########################################################################################
@@ -87,13 +85,26 @@ MEETING = "TODO: choose from replay-meeting-shortlist.md, e.g. 2010-11-02"
 K_SHOTS = 9
 SHOT_STRATEGY = "stratified"     # recent | similar | stratified | regimes
 
-# Paste your Cycle verdicts here for the A/B in step 4. Leave empty to skip the A/B.
+# YOUR Cycle verdicts, in your words, for the compulsory A/B in step 4.
+#
+# THIS IS ASSESSED AND IT IS NOT OPTIONAL. The runner calls the model twice either way -
+# once plain, once with this text - so leaving it empty does not skip anything: it spends
+# the same credit to run the A/B against nothing and reports an A/B whose treatment arm is
+# blank. The rubric marks the comparison AND what you concluded from it.
+#
+# Write one line per feature you tested, naming YOUR verdict from your own Cycle results
+# and what the model should do with it. The verdicts are the four the Cycle stage uses:
+# `reverse`, `confounded`, `untestable` and `not_ruled_out`. "Causal" is not among them -
+# correlational diagnostics on overlapping windows cannot establish it, and a guidance
+# block that claims it is asserting something your own evidence does not support.
+#
+# The SHAPE, with the features and verdicts left for you to supply:
+#
+#     CAUSAL_GUIDANCE = """Our causal testing found:
+#      - <feature> is <verdict>: <what that means mechanically, in one line>.
+#        <what the model should therefore do with it when recommending>.
+#      - <feature> is <verdict>: <...>"""
 CAUSAL_GUIDANCE = ""
-# e.g. """Our causal testing found:
-#  - slope_cash3y is REVERSE causal: the bond market forecasts the RBA, it does not move it.
-#    Do not treat a steep curve as a reason to tighten; treat it as other people's forecast.
-#  - trimmed_mean_yoy is CAUSAL: it is half the Board's mandate.
-#  - policy_stance is mostly a RECORD of the decision just taken, not a leading indicator."""
 
 RECOMMENDATION_PROMPT = """
 TODO: WRITE THE RECOMMENDATION PROMPT.
@@ -148,14 +159,14 @@ that constraint so it actually binds - and then audit whether it did.
 # is a DEFENDED agreement. The reportable run raises, not warns, until this holds.
 CLAIM_REVIEWS: dict[str, dict] = {}
 
-
 # ###########################################################################################
 # SUPPLIED BELOW THIS LINE - DO NOT MODIFY
 # ###########################################################################################
-# How many classifications you must review yourself. Requiring a DISAGREEMENT outright,
-# which an earlier version did, rewards performative contradiction: the auditing model
-# is sometimes simply right. What is required is that you looked, on the claims where
-# being wrong would matter most, and that an agreement is defended rather than assumed.
+
+# How many distinct claims must carry a human verdict before a run is reportable. The
+# reportable run RAISES below this number rather than warning: an audit that nobody checked
+# is precisely the failure this stage exists to make visible. Agreements count towards it -
+# what is required is that each reviewed classification was defended rather than assumed.
 MIN_CLAIM_REVIEWS = 3
 
 # Seeds per meeting in the strategy comparison. Three is what turns one lucky call into a
@@ -164,25 +175,79 @@ MIN_CLAIM_REVIEWS = 3
 N_SEEDS = 3
 
 
+def _require_causal_guidance() -> None:
+    """The A/B is compulsory, so its treatment arm has to exist.
+
+    THE GAP THIS CLOSES. Removing the old "leave empty to skip the A/B" comment did not
+    make the A/B happen. With `CAUSAL_GUIDANCE = ""` the guided call builds the identical
+    prompt, is served from the plain call's cache, and both recorded recommendations come
+    back with `with_causal_guidance: False` - a stage that looks complete and contains no
+    comparison. A team that genuinely has nothing to say here should say so in the report
+    and lose the A/B marks, not pass silently.
+    """
+    text = (CAUSAL_GUIDANCE or "").strip()
+    if len(text) < 40:
+        raise RuntimeError(
+            "CAUSAL_GUIDANCE is empty or too short to be a treatment arm. The A/B in "
+            "step 4 is assessed and the runner calls the model twice either way, so an "
+            "empty guidance block spends the same credit to compare a prompt with "
+            "itself. Write your Cycle verdicts there - one line per feature you tested, "
+            "in your words - and re-run. See the Replay stage of the brief.")
+
+
+def _require_complete_scores() -> None:
+    """
+    A REPORTABLE run needs the full corpus scored. Partial construct scores are a
+    legitimate mid-development state - the panel builder tolerates them so Words can be
+    iterated - but a Replay or Shock artefact produced from a partially scored corpus
+    would silently carry empty text features into its shots and profiles. Delegates to
+    THE shared contract (exact authoritative meeting set, values, sd, n_calls_valid),
+    so Replay, Shock and the panel cannot drift apart on what "valid scores" means.
+    """
+    config.validate_construct_scores(reportable=True)
+
+
+def panel_fingerprint() -> str:
+    """
+    sha256 of panel.parquet's bytes - the evidence base every shot, evidence block and
+    audit was built from. Part of the stage hash, so regenerating or editing the panel
+    after replay.json was written invalidates the artefact exactly as editing a prompt
+    would. Rebuilding the panel from the vendored inputs under the pinned library
+    versions reproduces the same bytes, so an honest rebuild does not trip it.
+    """
+    p = config.DATA_PROCESSED / "panel.parquet"
+    if not p.exists():
+        return "absent"
+    return hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+
+
 def config_hash() -> str:
     """
-    Identifies THIS Replay configuration - prompts, settings and the human judgement
-    tables. Stored in replay.json and compared by the submission check, so an artefact
-    generated under different prompts than the ones in the repository cannot pass as
-    current. Words has carried the same guarantee since its cache was rebuilt; Replay and
-    Shock used to carry none, which in an assignment about GenAI meant the marker could
-    not establish that the assessed prompts produced the submitted results.
+    Identifies THIS Replay configuration - prompts, settings, the human judgement tables,
+    AND the panel the run read. Stored in replay.json and compared by the submission
+    check, so an artefact generated under different prompts or data than the repository
+    holds cannot pass as current. Words has carried the same guarantee since its cache
+    was rebuilt; Replay and Shock used to carry none, which in an assignment about GenAI
+    meant the marker could not establish that the assessed prompts produced the submitted
+    results.
     """
     payload = json.dumps({
         "recommendation_prompt": RECOMMENDATION_PROMPT,
         "statement_prompt": STATEMENT_PROMPT,
         "audit_prompt": AUDIT_PROMPT,
+        "panel": panel_fingerprint(),
+        "min_usable_call_share": MIN_USABLE_CALL_SHARE,
+        "response_schemas": {m.__name__: hashlib.sha256(json.dumps(
+            m.model_json_schema(), sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:12] for m in (Recommendation, ClaimAudit)},
         # CAUSAL_GUIDANCE is inserted verbatim into the guided recommendation prompt - an
         # earlier version of this hash omitted it, so the entire guidance block could be
         # rewritten after artefact generation without the submission check noticing.
         "causal_guidance": CAUSAL_GUIDANCE,
         "model": config.MODEL, "temperature": config.SAMPLING_TEMPERATURE,
-        "seed": config.SEED, "n_seeds": N_SEEDS,
+        # the output ceiling changes the answer: a lower one truncates
+        "max_output_tokens": config.MAX_OUTPUT_TOKENS,
+        "call_index_base": config.CALL_INDEX_BASE, "n_seeds": N_SEEDS,
         "meeting": MEETING, "k": K_SHOTS, "strategy": SHOT_STRATEGY,
         "claim_reviews": CLAIM_REVIEWS,
         "min_claim_reviews": MIN_CLAIM_REVIEWS,
@@ -280,7 +345,14 @@ def _panel(pre_decision: bool = True) -> pd.DataFrame:
 
 
 def feasible_strategies(meeting: str, k: int | None = None) -> list[str]:
-    """Which shot strategies can actually be built for this meeting at this k."""
+    """
+    Which shot strategies can actually be built for this meeting at this k.
+
+    Only ValueError counts as infeasibility - that is what nshot raises when a strategy
+    genuinely cannot be built here. Anything else (a missing column, a corrupt panel, a
+    programming error) is a real defect and propagates: an earlier version caught every
+    exception, so a broken panel looked like a legitimate strategy limitation.
+    """
     k = K_SHOTS if k is None else k
     panel = _panel()
     out = []
@@ -288,7 +360,7 @@ def feasible_strategies(meeting: str, k: int | None = None) -> list[str]:
         try:
             nshot.select_shots(panel, pd.Timestamp(meeting), k=k, strategy=s)
             out.append(s)
-        except Exception:  # noqa: BLE001
+        except ValueError:
             pass
     return out
 
@@ -342,11 +414,72 @@ def rate_before(meeting_date: str) -> float:
 # Calling, cached and retried
 # -------------------------------------------------------------------------------------------
 
-def _cache_key(kind: str, system: str, user: str, seed_offset: int = 0) -> str:
+class LLMCallError(RuntimeError):
+    """
+    An LLM call this stage NEEDS did not produce a valid response.
+
+    Raised where a failure must not be papered over: a missing recommendation, an empty
+    statement or a failed claim audit cannot flow into replay.json as though the work
+    happened. Benchmark calls in `evaluate_all()` keep their bounded tolerance - failures
+    there are counted, reported and capped instead.
+    """
+
+
+# Errors that retrying cannot fix: bad credentials, malformed requests (including a schema
+# the endpoint rejects), and plain programming errors. Matched by name so no extra imports
+# are needed; anything else (rate limits, timeouts, connection drops, 5xx) is transient and
+# retried with backoff.
+_NON_TRANSIENT = ("AuthenticationError", "PermissionDeniedError", "BadRequestError",
+                  "NotFoundError", "UnprocessableEntityError",
+                  "TypeError", "KeyError", "AttributeError", "ValidationError"
+                  ) + courseapi.NON_TRANSIENT_ERRORS
+
+
+def _quarantine(path, why: str) -> None:
+    """Move an unusable cache file aside and say exactly what to do about it."""
+    bad = path.with_suffix(path.suffix + ".invalid")
+    try:
+        path.replace(bad)
+    except OSError:
+        bad = None
+    print(f"    CACHE QUARANTINED: {path.name} - {why}."
+          + (f" Moved to {bad.name}; " if bad else " ")
+          + "re-run to make a fresh call (an unchanged prompt re-bills nothing else).")
+
+
+def _cache_key(kind: str, system: str, user: str, seed_offset: int = 0,
+               schema: type[BaseModel] | None = None) -> str:
+    # The key covers the RESPONSE SCHEMA where one is used, not just the request: a
+    # schema edit used to leave old envelopes valid-looking, so a cached payload could
+    # bypass the validation a fresh response would have faced.
+    schema_fp = "" if schema is None else hashlib.sha256(json.dumps(
+        schema.model_json_schema(), sort_keys=True, default=str
+    ).encode("utf-8")).hexdigest()[:12]
     return hashlib.sha256(
         json.dumps([kind, system, user, config.MODEL, config.SAMPLING_TEMPERATURE,
-                    config.SEED + seed_offset], sort_keys=True
+                    config.CALL_INDEX_BASE + seed_offset, schema_fp], sort_keys=True
                    ).encode("utf-8")).hexdigest()[:16]
+
+
+def reusable_under_current_ceiling(rec: dict) -> bool:
+    """
+    THE OUTPUT-CEILING COMPATIBILITY RULE. Same rule as Words - see
+    `text_features.reusable_under_current_ceiling` for the full reasoning.
+
+    A cached SUCCESS is reusable only when the ceiling now in force is at least the one
+    it was produced under (it finished inside that allowance, so more room cannot cut it
+    short; less room might). A cached TRUNCATION stops being settled as soon as the
+    ceiling RISES, which is what makes the brief's advice - raise
+    config.MAX_OUTPUT_TOKENS and re-run - actually do something.
+    """
+    current = int(config.MAX_OUTPUT_TOKENS)
+    v = (rec.get("request") or {}).get("max_output_tokens")
+    recorded = int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    if rec.get("ok"):
+        return recorded is not None and current >= recorded
+    if "IncompleteResponseError" in str(rec.get("error", "")):
+        return recorded is not None and current <= recorded
+    return True
 
 
 def _cached_call(kind: str, system: str, user: str,
@@ -358,44 +491,108 @@ def _cached_call(kind: str, system: str, user: str,
     run without an API key, and so re-running does not re-bill work already done. The key
     covers both prompts, the model, the temperature and the seed, so editing a prompt
     produces a genuinely fresh call rather than the previous answer.
+
+    Cached payloads are RE-validated on load - against the current schema where one is
+    given, and for a non-empty text otherwise - and an invalid cache is quarantined, not
+    trusted because it once said "ok". Failures are persisted as envelopes and returned as
+    {"ok": False, ...}; a failure envelope never short-circuits a retry on the next run.
+    Non-transient errors (authentication, malformed request/schema, programming errors)
+    raise immediately - exponential backoff cannot fix a bad key.
     """
-    key = _cache_key(kind, system, user, seed_offset)
+    key = _cache_key(kind, system, user, seed_offset, schema)
     path = RAW_DIR / f"{kind}-{key}.json"
     if path.exists():
-        rec = json.loads(path.read_text())
+        try:
+            rec = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            _quarantine(path, f"unreadable ({type(e).__name__})")
+            rec = {}
         if rec.get("ok"):
-            return rec
+            payload = rec.get("payload") or {}
+            # metadata must match the request being served: a valid envelope renamed or
+            # copied over another cache path must not be accepted for it
+            expected = {"kind": kind, "model": config.MODEL,
+                        "temperature": config.SAMPLING_TEMPERATURE,
+                        "call_index": config.CALL_INDEX_BASE + seed_offset,
+                        "prompt_sha": key}
+            wrong = {k: (rec.get(k), v) for k, v in expected.items()
+                     if rec.get(k) != v}
+            if wrong:
+                _quarantine(path, f"envelope metadata does not match this request "
+                                  f"({list(wrong)})")
+            elif not reusable_under_current_ceiling(rec):
+                print(f"    re-asking {path.name}: produced under a different output "
+                      f"ceiling than the one now in force")
+            else:
+                try:
+                    if schema is not None:
+                        rec["payload"] = schema.model_validate(payload).model_dump()
+                        config.ledger_add("replay", path)
+                        return rec
+                    if str(payload.get("text", "")).strip():
+                        config.ledger_add("replay", path)
+                        return rec
+                    raise ValueError("empty text payload")
+                except Exception as e:  # noqa: BLE001 - invalid cache is quarantined
+                    _quarantine(path, f"payload no longer validates ({type(e).__name__})")
+    # THE EXPOSURE IS RECORDED HERE, before the request leaves - not after the benchmark
+    # finishes, and not at freeze time. Reaching this point means the cache could not
+    # answer, so the held-out meetings are about to be asked something new.
+    global _EXPOSURE_RECORDED
+    if _CURRENT_SAMPLE == "holdout" and not _EXPOSURE_RECORDED:
+        _EXPOSURE_RECORDED = True
+        record_holdout_exposure(f"fresh {kind} call on the holdout sample")
     last = None
     for attempt in range(config.MAX_RETRIES):
         try:
             if schema is not None:
                 r = client_().beta.chat.completions.parse(
                     model=config.MODEL, temperature=config.SAMPLING_TEMPERATURE,
-                    seed=config.SEED + seed_offset, response_format=schema,
+                    call_index=config.CALL_INDEX_BASE + seed_offset,
+                    max_tokens=config.MAX_OUTPUT_TOKENS, response_format=schema,
                     messages=[{"role": "system", "content": system},
                               {"role": "user", "content": user}])
                 payload = r.choices[0].message.parsed.model_dump()
             else:
                 r = client_().chat.completions.create(
                     model=config.MODEL, temperature=config.SAMPLING_TEMPERATURE,
-                    seed=config.SEED + seed_offset,
+                    call_index=config.CALL_INDEX_BASE + seed_offset,
+                    max_tokens=config.MAX_OUTPUT_TOKENS,
                     messages=[{"role": "system", "content": system},
                               {"role": "user", "content": user}])
                 payload = {"text": r.choices[0].message.content.strip()}
             rec = {"ok": True, "kind": kind, "payload": payload,
                    "model": config.MODEL, "temperature": config.SAMPLING_TEMPERATURE,
-                   "seed": config.SEED + seed_offset, "attempt": attempt + 1,
+                   "call_index": config.CALL_INDEX_BASE + seed_offset,
+                   "request": getattr(r, "request", None),
+                   "provenance": getattr(r, "provenance", None),
+                   "model_served": getattr(r, "model", None), "attempt": attempt + 1,
                    "prompt_sha": key, "request_id": getattr(r, "id", None),
-                   "usage": (r.usage.model_dump() if getattr(r, "usage", None) else None),
+                   "usage": getattr(r, "usage", None),
                    "timestamp": datetime.now(timezone.utc).isoformat()}
             path.write_text(json.dumps(rec, indent=1))
+            config.ledger_add("replay", path)
             return rec
         except Exception as e:  # noqa: BLE001
             last = f"{type(e).__name__}: {str(e)[:140]}"
+            if type(e).__name__ in _NON_TRANSIENT:
+                path.write_text(json.dumps(
+                    {"ok": False, "kind": kind, "error": last, "prompt_sha": key,
+                     "timestamp": datetime.now(timezone.utc).isoformat()}, indent=1))
+                raise LLMCallError(
+                    f"{kind} call failed with a non-transient error ({last}); retrying "
+                    f"cannot fix this, so the run stops here. The failure envelope is "
+                    f"{path.name}.")
             if attempt < config.MAX_RETRIES - 1:
                 time.sleep(config.RETRY_BASE_SECONDS * (2 ** attempt) + random.uniform(0, .5))
-    return {"ok": False, "kind": kind, "error": last,
-            "timestamp": datetime.now(timezone.utc).isoformat()}
+    rec = {"ok": False, "kind": kind, "error": last, "prompt_sha": key,
+           "timestamp": datetime.now(timezone.utc).isoformat()}
+    path.write_text(json.dumps(rec, indent=1))
+    # a TOLERATED failure is still part of what the artefact rests on: it shaped the
+    # usable-call denominator, the reported reliability, and possibly the chosen
+    # strategy - so it is ledgered with its expected (failed) state
+    config.ledger_add("replay", path, ok=False)
+    return rec
 
 
 def recommend(meeting: str, k: int | None = None, strategy: str | None = None,
@@ -418,6 +615,9 @@ def recommend(meeting: str, k: int | None = None, strategy: str | None = None,
             "shot_mix": nshot.shot_mix(shots),
             "ok": rec.get("ok", False), "error": rec.get("error"),
             "prompt_chars": len(user),
+            # the identity of what was actually SENT, so the A/B arms can be shown to
+            # have differed rather than assumed to have
+            "prompt_sha": hashlib.sha256(user.encode("utf-8")).hexdigest()[:16],
             "result": rec.get("payload", {})}
 
 
@@ -469,6 +669,50 @@ def holdout_sample() -> list[str]:
     return benchmark_sample()[1::2]
 
 
+# The floor on usable benchmark calls. Individual failures at temperature 1 are tolerated,
+# counted and reported; below this share of usable calls the comparison is not reportable.
+MIN_USABLE_CALL_SHARE = 0.9
+
+
+def mcnemar_exact(a_only: int, b_only: int) -> float:
+    """Exact two-sided McNemar p-value from the discordant counts.
+
+    The two strategies answered the SAME meetings, so the meetings where they agree carry
+    no information about which is better: only the discordant ones do. Under "no
+    difference" each discordant meeting is a fair coin, and this is the exact binomial
+    two-sided probability of a split at least this lopsided.
+
+    scipy is already a dependency; statsmodels' `contingency_tables.mcnemar` computes the
+    same quantity if you prefer to cite it.
+    """
+    n = a_only + b_only
+    if n == 0:
+        return 1.0
+    from scipy.stats import binomtest
+    return float(binomtest(min(a_only, b_only), n, 0.5).pvalue)
+
+
+def _paired_comparison(voted: "pd.DataFrame", strategies: list[str]) -> list[dict]:
+    """Every strategy pair, compared on the meetings where exactly one was right."""
+    import itertools
+    by = {s: g.set_index("meeting")["correct"]
+          for s, g in voted.groupby("strategy")}
+    out = []
+    for a, b in itertools.combinations(sorted(strategies), 2):
+        if a not in by or b not in by:
+            continue
+        both = by[a].index.intersection(by[b].index)
+        ra, rb = by[a].loc[both], by[b].loc[both]
+        a_only = int((ra & ~rb).sum())
+        b_only = int((~ra & rb).sum())
+        out.append({"a": a, "b": b, "n_meetings": int(len(both)),
+                    "a_only": a_only, "b_only": b_only,
+                    "accuracy_gap": round(float(ra.mean() - rb.mean()), 3),
+                    "p": round(mcnemar_exact(a_only, b_only), 4),
+                    "test": "exact McNemar, two-sided"})
+    return out
+
+
 def evaluate_all(k: int | None = None, strategies: list[str] | None = None,
                  causal_guidance: str = "", meetings: list[str] | None = None,
                  sample: str = "dev", max_workers: int = 8,
@@ -499,6 +743,8 @@ def evaluate_all(k: int | None = None, strategies: list[str] | None = None,
     strategies = strategies or list(nshot.STRATEGIES)
     if meetings is None:
         meetings = dev_sample() if sample == "dev" else holdout_sample()
+    global _CURRENT_SAMPLE, _EXPOSURE_RECORDED
+    _CURRENT_SAMPLE, _EXPOSURE_RECORDED = sample, False
     meetings, dropped = feasible_everywhere(meetings, strategies, k)
     if dropped:
         print(f"  {len(dropped)} meeting(s) dropped so every strategy is scored on the same "
@@ -508,26 +754,32 @@ def evaluate_all(k: int | None = None, strategies: list[str] | None = None,
     jobs = [(s, m, i) for s in strategies for m in meetings for i in range(n_seeds)]
 
     def _one(job):
-        strat, m, seed_i = job
+        strat, m, call_i = job
         try:
             r = recommend(m, k=k, strategy=strat, causal_guidance=causal_guidance,
-                          seed_offset=seed_i)
-        except Exception as e:  # noqa: BLE001
-            return {"strategy": strat, "meeting": m, "seed": seed_i, "skipped": True,
+                          seed_offset=call_i)
+        except LLMCallError:
+            raise  # non-transient: every remaining call would fail the same way
+        except ValueError as e:
+            # nshot's genuine infeasibility, surviving the feasible_everywhere prefilter
+            # on an edge case. Anything else - KeyError, NameError, a corrupt panel - is
+            # a DEFECT and propagates; an earlier version recorded those as ordinary
+            # call attrition, which presented a programming fault as model unreliability.
+            return {"strategy": strat, "meeting": m, "call_index": call_i, "skipped": True,
                     "invalid": False, "reason": str(e)[:80]}
         if not r["ok"]:
-            return {"strategy": strat, "meeting": m, "seed": seed_i, "skipped": True,
+            return {"strategy": strat, "meeting": m, "call_index": call_i, "skipped": True,
                     "invalid": False, "reason": f"api: {r['error']}"}
         problem = validate_recommendation(r["result"])
         if problem:
             # An incoherent answer is a FAILED response, not a wrong one. Scoring "hold,
             # 25bp" as an incorrect prediction credited the model with an attempt it did
             # not coherently make, and quietly penalised whichever strategy produced them.
-            return {"strategy": strat, "meeting": m, "seed": seed_i, "skipped": True,
+            return {"strategy": strat, "meeting": m, "call_index": call_i, "skipped": True,
                     "invalid": True, "reason": f"incoherent: {problem[:60]}"}
         got = str(r["result"].get("recommendation", "")).lower()
         act = actual_decision(m)
-        return {"strategy": strat, "meeting": m, "seed": seed_i, "skipped": False,
+        return {"strategy": strat, "meeting": m, "call_index": call_i, "skipped": False,
                 "invalid": False,
                 "recommended": got, "actual": act["word"].lower(),
                 "correct": got == act["word"].lower(),
@@ -539,10 +791,19 @@ def evaluate_all(k: int | None = None, strategies: list[str] | None = None,
     rows = []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = [ex.submit(_one, j) for j in jobs]
-        for i, f in enumerate(as_completed(futs), 1):
-            rows.append(f.result())
-            if i % 60 == 0:
-                print(f"    {i}/{len(jobs)}")
+        try:
+            for i, f in enumerate(as_completed(futs), 1):
+                rows.append(f.result())
+                if i % 60 == 0:
+                    print(f"    {i}/{len(jobs)}")
+        except BaseException:
+            # A run-wide failure (exhausted daily budget, bad credentials) makes every
+            # QUEUED call pointless. Cancel what has not started rather than letting the
+            # executor drain hundreds of doomed requests; each call that DID complete has
+            # already written its own envelope, so the next run resumes from them.
+            for pending in futs:
+                pending.cancel()
+            raise
 
     df = pd.DataFrame(rows)
     if "invalid" not in df.columns:
@@ -554,8 +815,19 @@ def evaluate_all(k: int | None = None, strategies: list[str] | None = None,
     print(f"  GenAI reliability: {n_fail}/{len(df)} calls failed after retries, "
           f"{n_bad}/{len(df)} returned an incoherent direction/size pair "
           f"({(n_fail + n_bad) / max(1, len(df)):.1%} unusable)")
+    # BOUNDED tolerance, not unbounded. Individual benchmark failures are normal at
+    # temperature 1 over hundreds of calls; a benchmark quietly built from a fraction of
+    # its intended calls is not a benchmark. The expected and achieved coverage are in the
+    # returned rows (and hence in replay.json), and below the floor the run stops.
+    usable_share = 1.0 - (n_fail + n_bad) / max(1, len(df))
+    if usable_share < MIN_USABLE_CALL_SHARE:
+        raise LLMCallError(
+            f"only {usable_share:.0%} of {len(df)} benchmark calls were usable "
+            f"(floor {MIN_USABLE_CALL_SHARE:.0%}). A strategy comparison built on this "
+            f"few calls is not reportable; fix the failures and re-run - successful "
+            f"calls are cached.")
     if not len(ok):
-        return df
+        raise LLMCallError("no usable benchmark call - nothing to compare")
 
     # PAIRED COMPLETENESS. A strategy/meeting pair missing any seed is dropped for EVERY
     # strategy, so the comparison is over identical work. Comparing a strategy with three
@@ -568,8 +840,9 @@ def evaluate_all(k: int | None = None, strategies: list[str] | None = None,
               f"across strategies: {dropped_incomplete[:4]}")
     ok = ok[ok["meeting"].isin(complete)]
     if not len(ok):
-        print("  no meeting has complete coverage across all strategies")
-        return df
+        raise LLMCallError(
+            "no meeting has complete seed coverage across all strategies - the paired "
+            "comparison cannot be built, so nothing reportable exists")
 
     def _vote(g):
         return pd.Series({
@@ -597,14 +870,79 @@ def evaluate_all(k: int | None = None, strategies: list[str] | None = None,
                                       if len(moves) else float("nan"))})
 
     summary = voted.groupby("strategy").apply(_summary, include_groups=False).round(3)
-    print(f"  sample: {sample} | {len(meetings)} paired meetings x {n_seeds} seeds, k={k}")
+
+    # TWO ESTIMATORS, BOTH NAMED AND BOTH SAVED.
+    #
+    # The assessed one is the MEETING-LEVEL MAJORITY VOTE above: the three draws for a
+    # strategy/meeting vote, and the vote is scored once. Its denominator is the number of
+    # retained meetings.
+    #
+    # The PER-DRAW estimator scores every draw separately, so its denominator is
+    # meetings x seeds. It answers a different question - how often does a single call get
+    # it right - and it is reported here because a team that averages raw rows without
+    # noticing will otherwise compare their number with a summary that was computed a
+    # different way. They do not agree, and neither is wrong; they are different estimands.
+    def _per_draw(g):
+        return pd.Series({
+            "n_draws": len(g),
+            "accuracy": g["correct"].mean(),
+            "balanced_accuracy": balanced_accuracy_score(g["actual"], g["recommended"])})
+
+    per_draw = ok.groupby("strategy").apply(_per_draw, include_groups=False).round(3)
+
+    n_meetings = len(complete)          # RETAINED, not proposed: incomplete ones are gone
+    print(f"  sample: {sample} | {n_meetings} retained paired meetings x {n_seeds} seeds, "
+          f"k={k}")
+    if len(meetings) != n_meetings:
+        print(f"    ({len(meetings) - n_meetings} of {len(meetings)} proposed meetings "
+              f"dropped for incomplete coverage)")
+    print("  ASSESSED ESTIMATOR - meeting-level majority vote, "
+          f"n={n_meetings} meetings:")
     print(summary.to_string())
+    print(f"  per-draw estimator (n={n_meetings * n_seeds} draws), reported so the two "
+          f"are not confused:")
+    print(per_draw.to_string())
     base = (voted[voted["strategy"] == strategies[0]]["actual"] == "hold").mean()
     print(f"  'always hold' would score {base:.3f} here")
-    n = len(meetings)
-    half = 1.96 * (0.25 / n) ** 0.5
-    print(f"  a 95% interval on any single accuracy is about +/-{half:.3f} on {n} meetings")
-    print(f"  differences smaller than that are sampling noise, not a ranking")
+
+    # THE COMPARISON IS PAIRED, because every strategy answers the SAME meetings.
+    #
+    # The old guidance printed 1.96*sqrt(.25/n) - the widest normal-approximation
+    # half-width for ONE accuracy - and told you to call strategies indistinguishable
+    # when their gap fell inside it. That rule is not valid for a difference. It throws
+    # away the pairing, and it is not even conservative in the right direction: five
+    # discordant meetings all favouring one strategy is a gap of 0.278 on 18 meetings -
+    # wider than the 0.231 "width" - while exact McNemar gives p = 0.0625.
+    #
+    # So the paired test is what is reported. `mcnemar_exact()` counts the meetings where
+    # exactly one of the two strategies was right and asks how surprising that split is
+    # under "no difference". The descriptive width is still printed, clearly labelled as
+    # a picture of how coarse an 18-meeting sample is, and NOT as a decision rule.
+    pairs = _paired_comparison(voted, strategies)
+    half = 1.96 * (0.25 / max(1, n_meetings)) ** 0.5
+    print(f"  paired comparison on the same meetings (exact McNemar):")
+    for row in pairs:
+        print(f"    {row['a']:11s} vs {row['b']:11s}  "
+              f"{row['a_only']:2d}-{row['b_only']:<2d} discordant  p={row['p']:.3f}")
+    print(f"  for scale, one accuracy on {n_meetings} meetings has a descriptive width of "
+          f"about +/-{half:.3f}")
+    print("  NEITHER number licenses 'these strategies perform equally'. A large p means")
+    print("  INSUFFICIENT EVIDENCE TO DISTINGUISH them on this sample - which is what to")
+    print("  write, and what the rubric credits. The meetings are also serially dependent,")
+    print("  so treat even the paired p as approximate.")
+
+    _CURRENT_SAMPLE = None
+    df.attrs["paired_comparison"] = pairs
+    df.attrs["summary_majority_vote"] = summary.reset_index().to_dict("records")
+    df.attrs["summary_per_draw"] = per_draw.reset_index().to_dict("records")
+    df.attrs["estimator_meta"] = {
+        "assessed_estimator": "meeting_level_majority_vote",
+        "n_meetings_proposed": len(meetings),
+        "n_meetings_retained": n_meetings,
+        "n_seeds": n_seeds,
+        "n_draws": n_meetings * n_seeds,
+        "rough_half_width_one_accuracy": round(half, 4),
+        "sample": sample}
     return df
 
 
@@ -697,7 +1035,9 @@ def audit_statement(statement: str, evidence: dict,
         f"EVIDENCE BLOCK:\n{json.dumps(evidence, indent=1, default=str)}\n\n"
         f"STATEMENT:\n{statement}", schema=ClaimAudit)
     if not rec.get("ok"):
-        return {"ok": False, "error": rec.get("error"), "claims": [], "counts": {}}
+        raise LLMCallError(
+            f"the claim-audit call failed ({rec.get('error')}); an unaudited statement "
+            f"must not reach replay.json, so the run stops here")
     claims = rec["payload"]["claims"]
     reviews = CLAIM_REVIEWS if reviews is None else reviews
     for c in claims:
@@ -782,7 +1122,9 @@ def feasible_everywhere(meetings: list[str], strategies: list[str],
         for s in strategies:
             try:
                 nshot.select_shots(panel, pd.Timestamp(m), k=k, strategy=s)
-            except Exception:  # noqa: BLE001
+            except ValueError:
+                # nshot's genuine "cannot build this here"; anything else is a real
+                # defect and propagates rather than masquerading as infeasibility
                 bad.append(s)
         if bad:
             dropped[m] = bad
@@ -804,7 +1146,15 @@ def generate_statement(rec: dict, evidence: dict) -> str:
         f"DECISION AND REASONING:{chr(10)}{json.dumps(rec, indent=1, default=str)}"
         f"{chr(10)}{chr(10)}EVIDENCE BLOCK - you may assert nothing beyond this:{chr(10)}"
         f"{json.dumps(evidence, indent=1, default=str)}")
-    return out.get("payload", {}).get("text", "")
+    if not out.get("ok"):
+        raise LLMCallError(
+            f"the statement call failed ({out.get('error')}); there is no statement to "
+            f"audit or to write into replay.json, so the run stops here")
+    text = str(out.get("payload", {}).get("text", "")).strip()
+    if not text:
+        raise LLMCallError("the statement call returned empty text; an empty statement "
+                           "is not auditable and must not reach replay.json")
+    return text
 
 
 def arithmetic_check(statement: str, meeting: str, rec: dict) -> dict:
@@ -844,38 +1194,335 @@ def arithmetic_check(statement: str, meeting: str, rec: dict) -> dict:
                         else "FAIL - the post-decision rate is never stated")}
 
 
-# ###########################################################################################
-# YOUR ORCHESTRATION BELOW THIS LINE - everything above is supplied framework
-# ###########################################################################################
+# -------------------------------------------------------------------------------------------
+# The SUPPLIED runner. You do not write control flow in this assignment.
+# -------------------------------------------------------------------------------------------
+
+#: Where the frozen strategy selection lives. Written by `--dev`, read by `--holdout`.
+SELECTION_STAMP = config.OUTPUTS / "replay_selection.json"
+
+
+def selection_config_hash() -> str:
+    """EVERYTHING that must not move between choosing on development and reporting on
+    the holdout.
+
+    Not just the prompts: anything that changes what a holdout draw would return, or
+    which meetings it would run on, lets a team keep asking the holdout a slightly
+    different question until they like the answer. An earlier version covered only the
+    prompts, the strategy, k and the seed count, so shifting `CALL_INDEX_BASE` produced a
+    completely fresh set of holdout draws while the freeze still verified.
+    """
+    payload = json.dumps({
+        "recommendation_prompt": RECOMMENDATION_PROMPT,
+        "statement_prompt": STATEMENT_PROMPT,
+        "audit_prompt": AUDIT_PROMPT,
+        "strategy": SHOT_STRATEGY, "k": K_SHOTS, "n_seeds": N_SEEDS,
+        "model": config.MODEL, "temperature": config.SAMPLING_TEMPERATURE,
+        # which DRAWS: moving the base re-rolls every call in the benchmark
+        "call_index_base": config.CALL_INDEX_BASE,
+        # what the model was allowed to produce
+        "max_output_tokens": config.MAX_OUTPUT_TOKENS,
+        # which MEETINGS, and the evidence underneath them
+        "dev_sample": dev_sample(), "holdout_sample": holdout_sample(),
+        "panel": panel_fingerprint(),
+        "min_usable_call_share": MIN_USABLE_CALL_SHARE,
+    }, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def _read_selection() -> dict:
+    if not SELECTION_STAMP.exists():
+        return {}
+    try:
+        return json.loads(SELECTION_STAMP.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def freeze_selection(note: str = "", revalidate: bool = False) -> dict:
+    """Record the strategy chosen on development, BEFORE the holdout is touched.
+
+    A FREEZE IS NOT AN EXPOSURE. Freezing costs nothing and changes nothing about the
+    held-out meetings; what costs is asking them a question. `exposure_number` therefore
+    counts HOLDOUT exposures, recorded by `record_holdout_exposure()` at the moment a
+    fresh holdout draw is about to be requested. An earlier version incremented it on
+    every development freeze, so a team that iterated twice and never touched the holdout
+    reported "exposure 2" and looked as though they had.
+
+    OVERWRITING A FREEZE THE HOLDOUT HAS ALREADY SEEN NEEDS `revalidate=True`. Otherwise
+    re-freezing after a disappointing holdout result would be the whole problem, silently.
+    """
+    old = _read_selection()
+    exposures = int(old.get("exposure_number", 0))
+    if old and exposures > 0 and old.get("config_hash") != selection_config_hash() \
+            and not revalidate:
+        raise RuntimeError(
+            f"the holdout has already been run {exposures} time(s) against the selection "
+            f"frozen on {str(old.get('frozen_at'))[:10]}, and this configuration differs "
+            f"from it. Re-freezing now would mean choosing on the held-out sample.\n"
+            f"If you genuinely need a second exposure, ask for it and declare it in the "
+            f"report:\n"
+            f"    python src/decision_replay.py --dev --revalidate")
+    history = old.get("history", [])
+    if old:
+        history = history + [{k: old.get(k) for k in
+                              ("config_hash", "strategy", "k", "frozen_at",
+                               "exposure_number")}]
+    rec = {"config_hash": selection_config_hash(), "strategy": SHOT_STRATEGY,
+           "k": K_SHOTS, "n_seeds": N_SEEDS,
+           "call_index_base": config.CALL_INDEX_BASE,
+           "max_output_tokens": config.MAX_OUTPUT_TOKENS,
+           "frozen_at": datetime.now(timezone.utc).isoformat(),
+           # a fresh freeze has seen the holdout zero times
+           "exposure_number": 0,
+           "exposures": [],
+           "history": history,
+           "note": note,
+           "revalidated": bool(revalidate)}
+    config.atomic_write_text(SELECTION_STAMP, json.dumps(rec, indent=1))
+    return rec
+
+
+def record_holdout_exposure(reason: str = "fresh holdout draw") -> dict:
+    """Persist an exposure BEFORE the first new holdout call of this freeze.
+
+    Written to disk before the request leaves, so a run that crashes mid-benchmark still
+    leaves the evidence that the holdout was asked. Cached replay of an exposure already
+    recorded is free and does not count again - re-running the stage from committed
+    envelopes asks the held-out meetings nothing new.
+    """
+    rec = _read_selection()
+    if not rec:
+        raise RuntimeError("no frozen selection to record an exposure against")
+    rec["exposure_number"] = int(rec.get("exposure_number", 0)) + 1
+    rec.setdefault("exposures", []).append({
+        "at": datetime.now(timezone.utc).isoformat(),
+        "config_hash": selection_config_hash(), "reason": reason})
+    config.atomic_write_text(SELECTION_STAMP, json.dumps(rec, indent=1))
+    print(f"    HOLDOUT EXPOSURE {rec['exposure_number']} recorded ({reason})")
+    return rec
+
+
+#: Which sample the benchmark is currently running, so `_cached_call` can record an
+#: exposure at the moment a fresh HOLDOUT request is about to be made.
+_CURRENT_SAMPLE: str | None = None
+_EXPOSURE_RECORDED = False
+
+
+def _require_frozen_selection() -> None:
+    """The holdout may only be run against a selection frozen on development.
+
+    THE GAP THIS CLOSES. `run()` used to call development and holdout back to back, with
+    the strategy already chosen in the file. Editing a prompt or k and re-running spent the
+    holdout again - every time - so "report on the holdout once" was a convention the code
+    did nothing to keep. Words has always had this workflow; Replay now does too.
+    """
+    if not SELECTION_STAMP.exists():
+        raise RuntimeError(
+            "the holdout has no frozen selection to report on. Run the development "
+            "sample and freeze what you chose first:\n"
+            "    python src/decision_replay.py --dev\n"
+            "then re-run. The freeze records the prompts, strategy, k and seed count that "
+            "the holdout result will belong to.")
+    rec = json.loads(SELECTION_STAMP.read_text(encoding="utf-8"))
+    if rec.get("config_hash") != selection_config_hash():
+        raise RuntimeError(
+            f"the frozen selection no longer matches this configuration - the prompts, "
+            f"strategy, k, seed count, draw indices, output ceiling, benchmark samples or "
+            f"panel have moved since it was frozen on "
+            f"{str(rec.get('frozen_at'))[:10]} (frozen {rec.get('strategy')!r} at "
+            f"k={rec.get('k')}, hash {rec.get('config_hash')}; now "
+            f"{selection_config_hash()}).\n"
+            f"Running the holdout now would be choosing on it. Either restore the frozen "
+            f"configuration, or re-select on development and declare the second exposure:\n"
+            f"    python src/decision_replay.py --dev --revalidate\n"
+            f"A second exposure is a defensible choice you must state in the report, not a "
+            f"silent one.")
+    if rec.get("exposure_number", 1) > 1:
+        print(f"    NOTE: this is holdout exposure {rec['exposure_number']}. Your report "
+              f"must say why the selection was re-frozen.")
+
+
+def run_dev(revalidate: bool = False, note: str = "") -> pd.DataFrame:
+    """Development sample only, then freeze the selection. Costs no holdout exposure.
+
+    `note` is recorded verbatim in the freeze. Use it when the record needs a caveat a
+    marker should read - for instance that the holdout had already been run before the
+    freeze existed, which no amount of re-running can undo.
+    """
+    if not _prompts_written():
+        raise NotImplementedError(
+            "Set MEETING and write RECOMMENDATION_PROMPT and STATEMENT_PROMPT first.")
+    print("  CHOOSING THE STRATEGY - development sample (the holdout is NOT touched)")
+    dev = evaluate_all(sample="dev")
+    rec = freeze_selection(note=note, revalidate=revalidate)
+    seen = len(rec.get("history", []))
+    print(f"\n  FROZEN: {rec['strategy']!r} at k={rec['k']}, config {rec['config_hash']}")
+    print(f"  holdout exposures under this freeze: {rec['exposure_number']}"
+          + (f" (superseding {seen} earlier freeze(s))" if seen else ""))
+    print(f"  written to {SELECTION_STAMP.name}. Now run the full stage:")
+    print("      python src/decision_replay.py")
+    return dev
+
 
 def run() -> dict:
     """
-    YOURS TO ASSEMBLE. Every piece it needs is supplied; the ORDER and the CONCLUSIONS are
-    the assessed part.
+    The SUPPLIED Replay runner. You do not assemble control flow: you set MEETING, K_SHOTS,
+    SHOT_STRATEGY and CAUSAL_GUIDANCE, write the two prompts, and fill CLAIM_REVIEWS after
+    the audit prints its claims. The runner validates those inputs, refuses to write
+    replay.json from any failed or unreviewed state, and records the statement's hash so
+    replay_statement.md cannot be swapped afterwards.
 
-    A working run() calls, roughly in this order:
+    ORDER OF WORK. Choose on development first and freeze it:
 
-        feasible_strategies(MEETING)     which strategies can be built here at all
-        evaluate_all(sample="dev")       choose k and the strategy
-        evaluate_all(sample="holdout")   report it ONCE, as it falls
-        recommend(MEETING)               with and without CAUSAL_GUIDANCE, for the A/B
-        validate_recommendation(...)     reject an incoherent direction/size pair
-        evidence_block(MEETING, rec)     panel-derived evidence, not the model's reasoning
-        generate_statement(rec, ev)      your STATEMENT_PROMPT
-        audit_statement(stmt, ev)        structured claim categories
-        arithmetic_check(stmt, ...)      deterministic, not delegated to an LLM
-        actual_decision(MEETING)         the comparison - LAST, never before you commit
+        python src/decision_replay.py --dev      development only, then freeze
+        python src/decision_replay.py            the full stage, including the holdout
 
-    Write outputs/replay.json and outputs/replay_statement.md. See the brief, Replay stage.
+    The holdout refuses to run against a selection that has changed since the freeze.
     """
     if not _prompts_written():
         raise NotImplementedError(
             "Set MEETING and write RECOMMENDATION_PROMPT and STATEMENT_PROMPT first. "
             "See the brief, Replay stage.")
-    raise NotImplementedError(
-        "Assemble run() from the sequence in this docstring. Every helper it names is "
-        "supplied and tested; the orchestration and the conclusions are what is assessed.")
+    _require_causal_guidance()
+    _require_complete_scores()
+
+    t0 = time.time()
+    config.stage_begin("replay", config_hash())
+    config.ledger_reset("replay")
+    feasible = feasible_strategies(MEETING)
+    print(f"  meeting {MEETING}, k={K_SHOTS}")
+    print(f"  strategies feasible here: {feasible}")
+    if SHOT_STRATEGY not in feasible:
+        raise RuntimeError(f"{SHOT_STRATEGY!r} cannot be built for {MEETING} at k={K_SHOTS}; "
+                           f"feasible: {feasible}")
+
+    print("\n  CHOOSING THE STRATEGY - development sample")
+    dev = evaluate_all(sample="dev")
+
+    print("\n  REPORTING THE STRATEGY - holdout sample, run once")
+    _require_frozen_selection()
+    hold = evaluate_all(sample="holdout")
+
+    print(f"\n  DEEP REPLAY of {MEETING} with strategy {SHOT_STRATEGY!r}")
+    plain = recommend(MEETING)
+    guided = recommend(MEETING, causal_guidance=CAUSAL_GUIDANCE)
+    # The two arms must actually have differed. With empty guidance `recommend()` builds
+    # an identical prompt, the second call is served from the first one's cache, and the
+    # stage used to report an A/B whose treatment arm never existed.
+    if plain.get("prompt_sha") and plain.get("prompt_sha") == guided.get("prompt_sha"):
+        raise RuntimeError(
+            "the two A/B arms sent the SAME prompt, so there is no comparison to report. "
+            "CAUSAL_GUIDANCE is what distinguishes them; see the Replay stage of the "
+            "brief.")
+    actual = actual_decision(MEETING)
+    print(f"    shot mix: {plain['shot_mix']}")
+    for tag, r in (("without causal guidance", plain), ("with causal guidance", guided)):
+        got = r["result"].get("recommendation")
+        print(f"    {tag:24s} -> {got} {r['result'].get('size_bp')}bp "
+              f"({r['result'].get('confidence')})  "
+              f"{'CORRECT' if got == actual['word'].lower() else 'wrong'}")
+    print(f"    actual: {actual['label']}")
+
+    # NOTHING REPORTABLE FROM A FAILED CALL. Both deep recommendations must have come
+    # back valid before anything downstream is built - a failed call is not a "hold with
+    # no reasoning", and replay.json must not be written from one.
+    for tag, r in (("plain", plain), ("guided", guided)):
+        if not r["ok"]:
+            raise LLMCallError(
+                f"the {tag} deep-replay recommendation failed ({r['error']}); "
+                f"replay.json is not written from a failed call - re-run to retry it")
+
+    chosen = guided if CAUSAL_GUIDANCE else plain
+    evidence = evidence_block(MEETING, chosen["result"])
+    statement = generate_statement(chosen["result"], evidence)  # raises if failed or empty
+    coherent = validate_recommendation(chosen["result"])
+    audit = audit_statement(statement, evidence)                # raises if the call failed
+    if audit.get("n_reviewed_by_human", 0) < MIN_CLAIM_REVIEWS:
+        raise RuntimeError(
+            f"only {audit.get('n_reviewed_by_human', 0)} audited claims carry a human "
+            f"review; {MIN_CLAIM_REVIEWS} are required before the artefact is written - "
+            f"fill CLAIM_REVIEWS for the three highest-risk classifications first")
+    arith = arithmetic_check(statement, MEETING, chosen["result"])
+    if not arith.get("checked"):
+        raise RuntimeError(f"the deterministic arithmetic check could not run "
+                           f"({arith.get('reason')}); an unchecked statement must not "
+                           f"reach replay.json")
+    print(f"\n    statement: {len(statement.split())} words")
+    print(f"    arithmetic: {arith['verdict']} "
+          f"(before {arith.get('rate_before')}, expected {arith.get('expected_after')}, "
+          f"quoted {arith.get('rates_quoted')})")
+    print(f"    coherence: {coherent or 'direction and size agree'}")
+    print(f"    claim audit: {audit.get('n_claims', 0)} claims - {audit.get('counts', {})}")
+    print(f"    human review: {audit.get('n_reviewed_by_human', 0)} reviewed, "
+          f"{audit.get('n_challenged_by_human', 0)} challenged")
+
+    out = {
+        "meeting": MEETING, "k": K_SHOTS, "strategy": SHOT_STRATEGY,
+        "feasible_strategies": feasible,
+        "dev_sample": dev.to_dict("records"),
+        "holdout_sample": hold.to_dict("records"),
+        # BOTH estimators, committed rather than printed. The raw rows above are per
+        # DRAW; a table that averages them is answering a different question from the
+        # assessed meeting-level vote, and the two were silently conflated once. Each
+        # block names its estimator, its denominator and its seed count.
+        # the freeze/exposure record, bound into the artefact so a marker reads the two
+        # together rather than having to trust a separate file
+        "selection": _read_selection(),
+        "benchmark_summary": {
+            "dev": {
+                "assessed": dev.attrs.get("summary_majority_vote"),
+                "per_draw": dev.attrs.get("summary_per_draw"),
+                "paired_comparison": dev.attrs.get("paired_comparison"),
+                **(dev.attrs.get("estimator_meta") or {})},
+            "holdout": {
+                "assessed": hold.attrs.get("summary_majority_vote"),
+                "per_draw": hold.attrs.get("summary_per_draw"),
+                "paired_comparison": hold.attrs.get("paired_comparison"),
+                **(hold.attrs.get("estimator_meta") or {})}},
+        "recommendation_plain": plain,
+        "recommendation_guided": guided,
+        "actual": actual,
+        "evidence_block": evidence,
+        "statement_words": len(statement.split()),
+        # the statement's identity, whitespace-normalised: replay_statement.md must
+        # contain THIS statement, not one with the same word count
+        "statement_sha256": hashlib.sha256(
+            " ".join(statement.split()).encode("utf-8")).hexdigest(),
+        "claim_audit": audit,
+        "recommendation_coherent": coherent is None,
+        "coherence_problem": coherent,
+        "arithmetic_check": arith,
+        "claim_reviews": CLAIM_REVIEWS,
+        "config_hash": config_hash(),
+        "wall_seconds": round(time.time() - t0, 1),
+    }
+    config.atomic_write_text(config.OUTPUTS / "replay.json",
+                             json.dumps(out, indent=2, default=str))
+    config.atomic_write_text(
+        config.OUTPUTS / "replay_statement.md",
+        f"# Replay statement - {MEETING}\n\n"
+        f"Generated by {config.MODEL} from a {K_SHOTS}-shot '{SHOT_STRATEGY}' prompt.\n"
+        f"Actual decision: **{actual['label']}**. "
+        f"Recommended: **{chosen['result'].get('recommendation')} "
+        f"{chosen['result'].get('size_bp')}bp**.\n\n"
+        f"---\n\n{statement}\n\n---\n\n"
+        f"## Deterministic arithmetic check\n\n```\n"
+        f"{json.dumps(arith, indent=1)}\n```\n\n"
+        f"## Claim audit against panel evidence\n\n{audit}\n")
+    config.ledger_commit("replay")
+    config.stage_complete("replay", config_hash())
+    return out
 
 
 if __name__ == "__main__":
-    run()
+    if "--dev" in sys.argv:
+        # Development sample only, then freeze the selection. The holdout is untouched,
+        # so iterate here as often as the budget allows.
+        _note = ""
+        for _a in sys.argv:
+            if _a.startswith("--note="):
+                _note = _a.split("=", 1)[1]
+        run_dev(revalidate="--revalidate" in sys.argv, note=_note)
+    else:
+        run()

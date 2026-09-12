@@ -47,11 +47,25 @@ Then run the contract tests:
 python -m pytest tests/ -q
 ```
 
+**If an import fails, check the install first.** This one is fast and offline, and tells
+you whether every package the code imports is actually declared:
+
+```bash
+python -m pytest tests/test_dependencies.py -q
+```
+
 There is also a slower end-to-end check that copies the repository somewhere clean and runs
 it from scratch. Worth running once before you submit:
 
 ```bash
 python -m pytest tests/test_clean_checkout.py -q -m clean_install
+```
+
+And a genuine install test, which builds a fresh virtual environment and installs only the
+declared requirements. It downloads packages, so it is opt-in:
+
+```bash
+python -m pytest tests/test_dependencies.py -q -m slow_install
 ```
 
 That suite **passes on this untouched starter by design** — it proves the environment, not
@@ -93,11 +107,37 @@ strategy choices, adjudications, and interpretation.** Everything else is built.
 |---|---|---|
 | `src/cycle_model.py` | Cycle | The causal claims and your verdicts |
 | `src/text_features.py` | Words | The system prompt and **four of the seven** construct rubrics |
-| `src/decision_replay.py` | Replay | The two prompts, the meeting, k, the strategy, **`CLAIM_REVIEWS`** and `run()` |
-| `src/scenarios.py` | Shock | The four prompts, `PROXY_JUDGEMENTS`, `COHERENCE`, `PATHWAY_ADJUDICATIONS`, **`CHANNEL_REVIEWS`** (see below), **`DIRECTION_WEIGHTS`** and their reasons, **`ADVERSARIAL_RESPONSES`**, `EXPECTED_PROFILES` and `run()` |
+| `src/decision_replay.py` | Replay | The two prompts, the meeting, k, the strategy and **`CLAIM_REVIEWS`** |
+| `src/scenarios.py` | Shock | The four prompts, `PROXY_JUDGEMENTS`, `COHERENCE`, `PATHWAY_ADJUDICATIONS`, **`CHANNEL_REVIEWS`** (see below), **`DIRECTION_WEIGHTS`** and their reasons, **`ADVERSARIAL_RESPONSES`** and `EXPECTED_PROFILES` |
+
+**You write no control flow.** Every stage's runner is supplied — `python src/decision_replay.py`
+and `python src/scenarios.py` validate your prompts, tables and reviews and execute them,
+refusing to write an artefact from any failed or unreviewed state. Your work is the
+prompts, the choices, the reviews and the judgement they encode — the parts that are
+marked — not pipeline plumbing.
 
 Stubs raise `NotImplementedError`. `text_features.py` and `scenarios.py` additionally refuse
 to run until their prompts are written, so you cannot spend API credit on placeholders.
+
+**The order the runners expect**, because two of them have a cheap mode you should use
+first:
+
+```bash
+python src/text_features.py --pilot     # 25 fixed documents - iterate on rubrics here
+python src/text_features.py             # the frozen development pass, once
+python src/text_features.py --validate  # the held-out episodes, once
+
+python src/decision_replay.py --dev     # choose a strategy, then FREEZE it
+python src/decision_replay.py           # the full stage, including the holdout
+
+python src/scenarios.py --discover      # the review template for your own scenarios
+python src/scenarios.py                 # the full stage, after the reviews are written
+```
+
+`--offline` works on any Words command and replays committed envelopes without calling the
+service. The Replay holdout **refuses to run** if the prompts, `k` or the strategy have
+changed since `--dev` froze them: re-freeze and declare the second exposure, or restore
+what you froze.
 
 Three of the seven Words rubrics are **supplied as locked exemplars**, one per scale type.
 They are hash-checked and the run aborts if they are edited. If you believe one is genuinely
@@ -153,8 +193,19 @@ complete example sit above the SUPPLIED line in `src/scenarios.py`.
 
 ## Four rules
 
-**1. Every accuracy claim must come through `evaluation.rolling_origin()`.** A random split
-or k-fold leaks the future into the past on this data, and costs **20 marks**.
+**1. Every accuracy claim must come through the SUPPLIED protocol for that kind of claim.**
+A random split or k-fold leaks the future into the past on this data, and costs **20 marks**
+— but so does training on labels that had not yet resolved, or choosing a strategy on the
+sample you then report.
+
+There is more than one protocol because the stages predict different things:
+
+- **Cycle** classifier accuracy → `evaluation.rolling_origin()`, with the label-availability
+  embargo. It refuses to run without one.
+- **Replay** strategy accuracy → the supplied paired benchmark `decision_replay.evaluate_all()`,
+  with its per-target cut-offs. Choose on `dev_sample()`, freeze with
+  `python src/decision_replay.py --dev`, then report on `holdout_sample()`. It is not a
+  rolling-origin fit, and re-deriving it as one is wrong, not safer.
 
 The model card and the Shock model are both fitted on the **129 meetings whose labels had
 resolved by 2018-12-31**, not on the full sample — a partial dependence has no out-of-sample

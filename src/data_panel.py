@@ -70,6 +70,32 @@ PERSISTENCE_FEATURES = ["trailing_change_182d", "meetings_since_change",
 def meeting_calendar() -> pd.DataFrame:
     """One row per RBA monetary policy meeting, from the supplied calendar."""
     dates = pd.read_csv(config.MEETING_CALENDAR, parse_dates=["meeting_date"])
+    # REQUIRED-INPUT CONTRACT: the calendar is vendored, so a short, duplicated or
+    # gap-ridden calendar is a corrupt input, not a configuration.
+    problems = []
+    if "meeting_date" not in dates.columns or dates["meeting_date"].isna().any():
+        problems.append("meeting_date column missing or carries unparseable dates")
+    else:
+        md = dates["meeting_date"]
+        if md.duplicated().any():
+            problems.append("duplicated meeting dates")
+        if len(md) != config.CORPUS_MEETINGS:
+            problems.append(f"{len(md)} meetings - the frozen corpus has "
+                            f"{config.CORPUS_MEETINGS}")
+        if md.min() > pd.Timestamp(config.CORPUS_START) + pd.Timedelta(days=60):
+            problems.append(f"first meeting {md.min().date()} is far past the corpus "
+                            f"start - early rows are missing")
+        if md.max() != pd.Timestamp(config.CORPUS_LAST_MEETING):
+            problems.append(f"last meeting {md.max().date()} is not the frozen corpus "
+                            f"end {config.CORPUS_LAST_MEETING} - the calendar is "
+                            f"truncated or extended")
+        gaps = md.sort_values().diff().dt.days.dropna()
+        if len(gaps) and gaps.max() > 120:
+            problems.append(f"a {int(gaps.max())}-day gap between meetings - rows are "
+                            f"missing")
+    if problems:
+        raise RuntimeError(f"meeting calendar failed its input contract: {problems}. "
+                           f"Restore data/raw and re-run.")
     cal = pd.DataFrame(index=pd.DatetimeIndex(sorted(dates["meeting_date"]),
                                               name="meeting_date"))
     cal["minutes_published"] = cal.index + pd.Timedelta(
@@ -198,6 +224,59 @@ def add_targets(m: pd.DataFrame, rates_daily: pd.DataFrame,
     return out
 
 
+# Rolling-window features legitimately start blank while their window warms up. Each
+# feature's first usable value must appear within its window plus a grace period; a
+# feature whose values only begin years later is a truncated column, not a warm-up.
+_MARKET_WARMUP_DAYS = {"rv_5": 5, "rv_21": 21, "rv_63": 63, "parkinson_21": 21,
+                       "downside_21": 21, "aud_vol_21": 21, "aud_ret": 1, "vix": 0}
+
+
+def _check_market(market: pd.DataFrame) -> None:
+    """
+    REQUIRED-INPUT CONTRACT for the vendored market file, PER FEATURE. A frame whose
+    index spanned the corpus once passed while one required column held only its final
+    twenty observations - dataframe-level coverage says nothing about a column.
+    """
+    problems = [c for c in MARKET_FEATURES if c not in market.columns]
+    if len(market) < 4000:
+        problems.append(f"only {len(market)} daily rows")
+    if not market.index.is_unique:
+        problems.append("duplicated dates")
+    if len(market):
+        if market.index.min() > (pd.Timestamp(config.CORPUS_START)
+                                 + pd.Timedelta(days=7)):
+            problems.append(f"market data starts {market.index.min().date()}, after "
+                            f"the corpus start")
+        gap = market.index.to_series().diff().dt.days.max()
+        if gap and gap > 10:
+            problems.append(f"a {int(gap)}-day hole inside the market series")
+        start = pd.Timestamp(config.CORPUS_START)
+        end = pd.Timestamp(config.CORPUS_LAST_MEETING)
+        for c in MARKET_FEATURES:
+            if c not in market.columns:
+                continue
+            col = market[c].dropna()
+            if col.empty:
+                problems.append(f"{c} is empty")
+                continue
+            if not np.isfinite(col.to_numpy()).all():
+                problems.append(f"{c} contains non-finite values")
+            warmup = _MARKET_WARMUP_DAYS.get(c, 0)
+            if col.index.min() > start + pd.Timedelta(days=2 * warmup + 30):
+                problems.append(f"{c} first usable value {col.index.min().date()} is "
+                                f"far past its warm-up window")
+            if col.index.max() < end - pd.Timedelta(days=7):
+                problems.append(f"{c} ends {col.index.max().date()}, before the last "
+                                f"meeting {config.CORPUS_LAST_MEETING}")
+            in_corpus = market.loc[start:end, c]
+            if len(in_corpus) and in_corpus.isna().mean() > 0.20:
+                problems.append(f"{c} is {in_corpus.isna().mean():.0%} missing inside "
+                                f"the corpus window")
+    if problems:
+        raise RuntimeError(f"market data failed its input contract: {problems}. "
+                           f"Restore data/raw and re-run.")
+
+
 def _asof_daily(daily: pd.DataFrame, cols: list[str],
                 dates: pd.DatetimeIndex, label: str) -> pd.DataFrame:
     """
@@ -237,7 +316,10 @@ def load_text() -> pd.DataFrame | None:
     if not config.CONSTRUCT_SCORES.exists():
         print("  (no construct scores yet - text tier will be empty until Words is run)")
         return None
-    t = pd.read_parquet(config.CONSTRUCT_SCORES)
+    # THE construct-score contract, shared with Replay and Shock, at the point of
+    # consumption. The panel may build from a partial (development-only) table, so
+    # reportable=False here; the reportable entry points demand the full meeting set.
+    t = config.validate_construct_scores(reportable=False)
     t["meeting_date"] = pd.to_datetime(t["meeting_date"])
     return t.set_index("meeting_date").sort_index()
 
@@ -275,6 +357,7 @@ def run() -> pd.DataFrame:
     market = pd.read_parquet(config.MARKET_DATA)
     market["date"] = pd.to_datetime(market["date"])
     market = market.set_index("date").sort_index()
+    _check_market(market)
 
     panel = (m
              .join(_asof_daily(rates, RATE_FEATURES, dates, "rates"), how="left")
@@ -337,6 +420,21 @@ def run() -> pd.DataFrame:
 
     panel.reset_index().to_parquet(config.DATA_PROCESSED / "panel.parquet", index=False)
     (config.DATA_PROCESSED / "tiers.json").write_text(json.dumps(tiers, indent=1))
+    # PANEL PROVENANCE: which construct-score table this panel's text tier was built
+    # from, by content hash. The submission suite compares it against the score file on
+    # disk, so editing the scores after the panel was built - even consistently across
+    # the partials and the combined table - leaves a panel that visibly rests on a
+    # table that no longer exists.
+    import hashlib
+    from datetime import datetime, timezone
+    config.atomic_write_text(
+        config.DATA_PROCESSED / "panel.provenance.json",
+        json.dumps({
+            "construct_scores_sha256":
+                (hashlib.sha256(config.CONSTRUCT_SCORES.read_bytes()).hexdigest()
+                 if config.CONSTRUCT_SCORES.exists() else None),
+            "n_meetings": len(panel),
+            "written_at": datetime.now(timezone.utc).isoformat()}, indent=1))
     return panel
 
 

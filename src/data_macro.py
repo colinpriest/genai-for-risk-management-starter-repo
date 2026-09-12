@@ -17,6 +17,7 @@ WRITES data/processed/macro_asof.parquet   (one row per RBA meeting)
 """
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 import config
@@ -144,6 +145,60 @@ def load_series() -> pd.DataFrame:
     if len(gpr):
         rows.append(gpr)
     long = pd.concat(rows, ignore_index=True)
+
+    # REQUIRED-INPUT CONTRACT. The warnings above are diagnostics; this is the gate.
+    # Every declared series is vendored and required - a missing one means a corrupt or
+    # renamed input, and a panel quietly built without it would flow into every
+    # downstream stage looking complete.
+    expected = ({name for m in SERIES.values() for name, _ in m.values()}
+                | set(GPR_SERIES.values()))
+    problems = sorted(expected - set(long["series"]))
+    vals = long["value"].to_numpy(dtype=float)
+    if not np.isfinite(vals).all():
+        bad = long.loc[~np.isfinite(long["value"].astype(float)), "series"].unique()
+        problems.append(f"non-finite values in {sorted(bad)[:4]}")
+    thin = long.groupby("series").size()
+    thin = thin[thin < 20]
+    if len(thin):
+        problems.append(f"series with under 20 observations: {sorted(thin.index)[:4]}")
+    # CHRONOLOGICAL COVERAGE per series, not just volume: twenty observations dated
+    # 1900-1904 once passed. Quarterly GDP with its 65-day lag can trail the last
+    # meeting by ~5 months, so the end tolerance is generous but bounded. Two vendored
+    # series have KNOWN, documented gaps the as-of join already handles - they are
+    # exempted BY NAME, and the exemption is BOUNDED at the documented endpoint (with a
+    # quarter's tolerance), so a differently-truncated fake in either series still
+    # fails, as does a new gap in any other series:
+    #   consumer_sentiment   the H3 series begins 2010-01; must start by ~2010-03
+    #   infexp_union_1y      discontinued after 2023-09; must still reach ~2023-06
+    KNOWN_LIMITED = {"consumer_sentiment": ("starts_by", pd.Timestamp("2010-03-31")),
+                     "infexp_union_1y": ("ends_from", pd.Timestamp("2023-06-30"))}
+    span = long.groupby("series")["period_end"].agg(["min", "max"])
+    for name, row in span.iterrows():
+        kind, bound = KNOWN_LIMITED.get(name, (None, None))
+        if kind == "starts_by":
+            if row["min"] > bound:
+                problems.append(f"{name} starts {row['min'].date()}, past its "
+                                f"documented {bound.date()} onset")
+        elif row["min"] > pd.Timestamp(config.CORPUS_START):
+            problems.append(f"{name} starts {row['min'].date()}, after the corpus "
+                            f"start")
+        if kind == "ends_from":
+            if row["max"] < bound:
+                problems.append(f"{name} ends {row['max'].date()}, before its "
+                                f"documented {bound.date()} discontinuation window")
+        elif row["max"] < (pd.Timestamp(config.CORPUS_LAST_MEETING)
+                           - pd.Timedelta(days=200)):
+            problems.append(f"{name} ends {row['max'].date()}, long before the last "
+                            f"meeting")
+    if (pd.to_datetime(long["published_on"])
+            < pd.to_datetime(long["period_end"])).any():
+        problems.append("a series is stamped as published BEFORE the period it "
+                        "describes ended - the publication-lag stamping is broken")
+    if problems:
+        raise RuntimeError(
+            f"macro inputs failed their contract: {problems}. The raw files are "
+            f"vendored, so this is a corrupt or renamed input, not a normal condition "
+            f"- restore data/raw and re-run.")
 
     # Convert level series to year-on-year growth before the as-of join, so the growth rate
     # inherits the correct publication date.

@@ -1,7 +1,7 @@
 """
 Shock scenario machinery. SUPPLIED - do not modify.
 
-The tree-of-thought session runs IN THIS PIPELINE, against gpt-4o-mini, with your four
+The tree-of-thought session runs IN THIS PIPELINE, against the course model, with your four
 prompts and the context passages your retrieval terms pull from the documents you
 downloaded. Nothing happens in a chat window and nothing is transcribed by hand:
 `scenarios.py` records every branch as it is generated, and this module is the machinery
@@ -1123,8 +1123,8 @@ def _apply_terminal_exclusions(branches: list["Branch"]) -> int:
     credibility score, and replayed neither the channel reviews nor the grounding bar.
     A minimal probe made the point: a branch with keep=False, a recorded human
     rejection and evidence_status="neither" came back with keep=True after
-    `adjudicate_tree(..., threshold=0.5)`. In the marker trees the 0.3 rung of the
-    sweep reinstated five unsupported Taiwan branches and 21 unsupported Hormuz ones.
+    `adjudicate_tree(..., threshold=0.5)`. On real trees the lower rungs of a
+    sensitivity sweep reinstated a batch of unsupported branches in both scenarios.
     Their proxies had been erased, so the classifier probability was unaffected - but
     `channel_direction()` tallies surviving UNMODELLABLE branches too, so they moved
     the qualitative direction, which is the output the report leads with.
@@ -1223,9 +1223,10 @@ def prune_sweep(tree: Tree, clf, X: pd.DataFrame, panel: pd.DataFrame,
     WHAT IT DOES NOT DO, stated plainly because the name invites the wrong reading. Expansion
     happened once, on the branches that survived the HEADLINE threshold. This re-prunes the
     tree that produced, so at a lower threshold it can reinstate a first-order branch whose
-    second-order consequences were never generated - four such branches in Taiwan, eight in
-    Hormuz. It answers "what would this tree have concluded under a different threshold",
-    not "what would the analysis have concluded". Report it as the former.
+    second-order consequences were never generated. Your sweep will report how many; the
+    point is that they are branches whose downstream consequences do not exist. It answers
+    "what would this tree have concluded under a different threshold", not "what would the
+    analysis have concluded". Report it as the former.
 
     RUNS ON A DEEP COPY, AND REPLAYS THE WHOLE ADJUDICATION PIPELINE. Two separate faults
     made the previous version untrustworthy:
@@ -1478,9 +1479,10 @@ def _evaluate_corner(clf, X, panel, shocks, base_row: int = -1) -> dict:
     One corner, evaluated FROM THE SELECTED BASE ROW.
 
     An earlier version resolved `base_row` in `focused_corners()` and then never passed it
-    here, so every corner silently used the default of -1 - the latest meeting. The headline
-    said Hormuz was `stable` from the neutral row while all five corners reported `easing`
-    from the latest one, and the report repeated the contradiction.
+    here, so every corner silently used the default of -1 - the latest meeting. A headline
+    computed from the neutral row was therefore reported next to corners computed from a
+    different starting state, and the two disagreed. Both numbers were correct; they were
+    answers to different questions, and nothing said so.
     """
     row, applied = apply_shock(X, panel, shocks, row_index=base_row)
     base = predict_state(clf, X.iloc[[base_row]])

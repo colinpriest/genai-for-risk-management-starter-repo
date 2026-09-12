@@ -36,11 +36,16 @@ sys.path.insert(0, str(REPO / "src"))
 # repository, and a checkout missing them is broken.
 GENERATED = [
     "data/processed/panel.parquet",
+    "data/processed/panel.provenance.json",
     "data/processed/tiers.json",
     "data/processed/macro_asof.parquet",
     "data/processed/construct_scores.parquet",
+    "data/processed/construct_scores.provenance.json",
     "data/processed/construct_scores_dev.parquet",
+    "data/processed/construct_scores_dev.provenance.json",
     "data/processed/construct_scores_validation.parquet",
+    "data/processed/construct_scores_validation.provenance.json",
+    "outputs/.stage_status",
     "data/processed/llm_raw",
     "data/processed/replay_raw",
     "data/processed/shock_raw",

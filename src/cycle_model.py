@@ -22,9 +22,11 @@ WHAT YOU DO
      All three outcomes earn marks.
 
 THE POINT
-    The model is a good predictor and not a causal model. An LLM will produce a fluent
-    economic mechanism for any feature you show it, including one that is noise, and it will
-    give you no signal about which of those it just did. Telling the difference is the skill.
+    The model is not a causal model - and, once the label embargo is applied, not much of a
+    predictor either: it scores 0.570 against a 0.656 current-decision baseline. Neither
+    fact stops an LLM producing a fluent economic mechanism for any feature you show it,
+    including one that is noise, and it will give you no signal about which it just did.
+    Telling the difference is the skill, and it is independent of whether the model works.
 
     At least one of the top features in this model cannot possibly be causal. Find it.
 
@@ -115,6 +117,33 @@ def _panel() -> pd.DataFrame:
     return p.set_index("meeting_date").sort_index()
 
 
+def _file_fp(path) -> str:
+    import hashlib
+    import pathlib
+    p = pathlib.Path(path)
+    return (hashlib.sha256(p.read_bytes()).hexdigest()[:16] if p.exists() else "absent")
+
+
+def config_hash() -> str:
+    """
+    Identifies THIS Cycle configuration: the transcribed claims, the recorded verdicts,
+    and the model-card evidence they were tested against. Stored in cycle.json and
+    compared by the submission check - editing a claim or a verdict after the run leaves
+    a stale artefact that no longer passes as current.
+    """
+    import hashlib
+    payload = json.dumps({
+        "claims": [{"feature": c.feature, "mechanism": c.mechanism,
+                    "claimed": c.claimed, "confounders": list(c.confounders),
+                    "note": getattr(c, "note", "")} for c in CLAIMS],
+        "verdicts": VERDICTS,
+        "panel": _file_fp(config.DATA_PROCESSED / "panel.parquet"),
+        "model_card_performance": _file_fp(config.MODEL_CARD / "performance.json"),
+        "model_card_importances": _file_fp(config.MODEL_CARD / "importances.parquet"),
+    }, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
 def show_model() -> None:
     """What the supplied model looks like. Start here."""
     model_card.summary()
@@ -129,6 +158,7 @@ def run() -> dict:
             "CLAIMS is empty. Run your ChatGPT session first, transcribe at least five "
             "causal proposals, then re-run. See the brief, Cycle stage.")
 
+    config.stage_begin("cycle", config_hash())
     print("=" * 78)
     show_model()
     print("\n" + "=" * 78)
@@ -166,8 +196,11 @@ def run() -> dict:
     out = {"claims": results,
            "verdicts": VERDICTS,
            "top5_features": top5,
-           "top5_uncovered": uncovered}
-    (config.OUTPUTS / "cycle.json").write_text(json.dumps(out, indent=2, default=float))
+           "top5_uncovered": uncovered,
+           "config_hash": config_hash()}
+    config.atomic_write_text(config.OUTPUTS / "cycle.json",
+                             json.dumps(out, indent=2, default=float))
+    config.stage_complete("cycle", config_hash())
     return out
 
 

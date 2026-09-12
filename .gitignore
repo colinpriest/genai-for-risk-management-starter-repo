@@ -1,4 +1,18 @@
+# CREDENTIALS. Never commit any of these. `.env` holds your UNSW proxy access code and
+# your zID; a committed access code has to be revoked by IT, and git history keeps it
+# even after you delete the file. The variants are listed because `.env` alone let
+# `.env.local`, `.env.backup` and `env.txt` through.
 .env
+.env.*
+!.env.example
+*.env
+env.txt
+secrets.json
+credentials.json
+*.pem
+*.key
+!constraints.txt
+
 __pycache__/
 *.pyc
 .pytest_cache/
