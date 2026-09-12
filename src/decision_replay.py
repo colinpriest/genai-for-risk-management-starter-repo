@@ -518,7 +518,17 @@ def _cached_call(kind: str, system: str, user: str,
                         "prompt_sha": key}
             wrong = {k: (rec.get(k), v) for k, v in expected.items()
                      if rec.get(k) != v}
-            if wrong:
+            # THE SAME CONTRACT WORDS APPLIES. This loader compared the request-side
+            # fields and the payload schema, and nothing else - so a cache edited to name
+            # a different served model, with `provenance.response_status` set to
+            # `incomplete`, was reused: an answer from another deployment that the
+            # service had not finished, scored as a completed result.
+            contradictions = courseapi.envelope_contradictions(
+                rec, prompt_hash=key, prompt_field="prompt_sha")
+            if contradictions:
+                _quarantine(path, "envelope contradicts itself or this run: "
+                                  + "; ".join(contradictions))
+            elif wrong:
                 _quarantine(path, f"envelope metadata does not match this request "
                                   f"({list(wrong)})")
             elif not reusable_under_current_ceiling(rec):
@@ -579,7 +589,15 @@ def _cached_call(kind: str, system: str, user: str,
                    "provenance": getattr(r, "provenance", None),
                    "model_served": getattr(r, "model", None), "attempt": attempt + 1,
                    "prompt_sha": key, "request_id": getattr(r, "id", None),
-                   "usage": getattr(r, "usage", None),
+                   # THE WHOLE CALL'S BILL, not just the last response's - and the
+                   # version marker, absent from this writer while Words carried one, so
+                   # evidence written a minute ago classified itself as "legacy".
+                   "usage": getattr(r, "call_usage", None) or getattr(r, "usage", None),
+                   "usage_final_response": getattr(r, "usage", None),
+                   "transport_requests": (getattr(r, "provenance", None) or {}
+                                          ).get("transport_requests"),
+                   "config_hash": config_hash(),
+                   "envelope_version": courseapi.ENVELOPE_VERSION,
                    "timestamp": datetime.now(timezone.utc).isoformat()}
             path.write_text(json.dumps(rec, indent=1))
             config.ledger_add("replay", path)
@@ -967,8 +985,15 @@ def evaluate_all(k: int | None = None, strategies: list[str] | None = None,
         close_holdout_exposure(_EXPOSURE_EVENT.get("event_id"),
                                f"{sample} benchmark completed on {n_meetings} meetings")
     _CURRENT_SAMPLE = None
-    df.attrs["exposure_event_id"] = (
-        _EXPOSURE_EVENT or {}).get("event_id") if _EXPOSURE_EVENT else None
+    # A CACHE-ONLY REPLAY ASKS THE HOLDOUT NOTHING, and therefore records no new event -
+    # but the result it reports still BELONGS to the exposure that produced the
+    # envelopes, and writing `null` there severed the report from its own evidence.
+    # Re-running the stage from committed caches must keep naming that exposure.
+    event_id = (_EXPOSURE_EVENT or {}).get("event_id")
+    if event_id is None and sample == "holdout":
+        event_id = originating_exposure_id()
+    df.attrs["exposure_event_id"] = event_id
+    df.attrs["exposure_was_fresh"] = _EXPOSURE_EVENT is not None
     df.attrs["evidence_status"] = evidence_status()
     df.attrs["paired_comparison"] = pairs
     df.attrs["summary_majority_vote"] = summary.reset_index().to_dict("records")
@@ -1305,21 +1330,74 @@ def _event_id(freeze_id: str, sequence: int, at: str) -> str:
         f"{freeze_id}|{sequence}|{at}".encode("utf-8")).hexdigest()[:12]
 
 
+#: Fields an `open` event must carry to count as a record of anything.
+_OPEN_EVENT_FIELDS = ("type", "event_id", "sequence", "at", "freeze_id",
+                      "selection_config_hash")
+
+
 def exposure_events() -> list[dict]:
-    """Every event ever appended, oldest first. Unreadable lines are kept as errors
-    rather than skipped: a log with a damaged line must not read as a shorter history."""
+    """Every event ever appended, oldest first. Damaged lines are kept as damage.
+
+    A LINE THAT WILL NOT PARSE IS NOT AN ABSENT LINE. Skipping it, or turning it into a
+    harmless marker the counters ignore, makes a corrupted log read as a SHORTER history -
+    so damaging one line was a way to reduce the recorded exposure count and buy another
+    look at the held-out sample. `log_damage()` is what callers must consult before
+    trusting any count derived from this list.
+    """
     if not EXPOSURE_LOG.exists():
         return []
     events = []
-    for line in EXPOSURE_LOG.read_text(encoding="utf-8").splitlines():
+    for n, line in enumerate(
+            EXPOSURE_LOG.read_text(encoding="utf-8").splitlines(), start=1):
         line = line.strip()
         if not line:
             continue
         try:
-            events.append(json.loads(line))
-        except json.JSONDecodeError:
-            events.append({"type": "unreadable", "raw": line[:200]})
+            parsed = json.loads(line)
+        except json.JSONDecodeError as exc:
+            events.append({"type": "damaged", "line_number": n,
+                           "problem": f"not JSON ({exc.msg})"})
+            continue
+        if not isinstance(parsed, dict):
+            events.append({"type": "damaged", "line_number": n,
+                           "problem": f"a {type(parsed).__name__}, not an event object"})
+            continue
+        if parsed.get("type") == "open":
+            missing = [f for f in _OPEN_EVENT_FIELDS if parsed.get(f) is None]
+            if missing:
+                parsed = dict(parsed, type="damaged", line_number=n,
+                              problem=f"an exposure event missing {missing}")
+        elif parsed.get("type") not in ("close",):
+            parsed = dict(parsed, type="damaged", line_number=n,
+                          problem=f"unknown event type {parsed.get('type')!r}")
+        events.append(parsed)
     return events
+
+
+def log_damage(events: list[dict] | None = None) -> list[str]:
+    """Every damaged line in the log, described. Empty means the history is readable."""
+    events = exposure_events() if events is None else events
+    return [f"line {e.get('line_number', '?')}: {e.get('problem', 'unreadable')}"
+            for e in events if e.get("type") == "damaged"]
+
+
+def require_readable_log() -> None:
+    """Refuse to derive an exposure COUNT from a history that does not parse.
+
+    The count is what authorises another look at the holdout. A damaged log whose
+    damage is ignored answers "zero exposures so far" to a question it cannot answer.
+    """
+    damage = log_damage()
+    if damage:
+        raise RuntimeError(
+            f"{EXPOSURE_LOG.name} has {len(damage)} damaged line(s), so the number of "
+            f"holdout exposures it records cannot be read:\n  "
+            + "\n  ".join(damage)
+            + f"\nThis file is append-only evidence and the count in it decides whether "
+              f"the held-out sample may be asked anything more. Restore it from version "
+              f"control rather than editing or deleting it; if it is genuinely "
+              f"unrecoverable, say so in the report and re-freeze with "
+              f'--revalidate --note="...".')
 
 
 def _append_event(event: dict) -> dict:
@@ -1356,6 +1434,22 @@ def open_exposure(freeze_id: str) -> dict | None:
     return None
 
 
+def originating_exposure_id(freeze_id: str | None = None) -> str | None:
+    """The exposure whose requests produced the evidence this freeze reports on.
+
+    The LAST event recorded against this freeze - open or closed. A run served entirely
+    from cache creates no event, and must still be able to say which exposure its numbers
+    came from; `None` means this freeze has never asked the holdout anything, which is a
+    different statement and is left as one.
+    """
+    if freeze_id is None:
+        freeze_id = (_read_selection() or {}).get("freeze_id")
+    if not freeze_id:
+        return None
+    mine = [e for e in exposures_recorded() if e.get("freeze_id") == freeze_id]
+    return mine[-1].get("event_id") if mine else None
+
+
 def freeze_selection(note: str = "", revalidate: bool = False,
                      prior_exposure: bool = False) -> dict:
     """Record the strategy chosen on development, BEFORE the holdout is touched.
@@ -1383,6 +1477,7 @@ def freeze_selection(note: str = "", revalidate: bool = False,
     to read. It also requires a note saying so.
     """
     old = _read_selection()
+    require_readable_log()
     recorded = len(exposures_recorded())
     same_configuration = bool(old) and old.get("config_hash") == selection_config_hash()
 
@@ -1508,6 +1603,7 @@ def record_holdout_exposure(reason: str = "fresh holdout draw") -> dict:
     rec = _read_selection()
     if not rec:
         raise RuntimeError("no frozen selection to record an exposure against")
+    require_readable_log()
     freeze_id = rec.get("freeze_id") or _freeze_id(
         str(rec.get("config_hash")), str(rec.get("frozen_at")))
     if rec.get("config_hash") != selection_config_hash():
@@ -1596,6 +1692,7 @@ def _require_frozen_selection() -> None:
             f"    python src/decision_replay.py --dev --revalidate\n"
             f"A second exposure is a defensible choice you must state in the report, not a "
             f"silent one.")
+    require_readable_log()
     recorded = len(exposures_recorded())
     status = evidence_status()
     if recorded > 1 or status in ("retrospective", "previously_exposed"):

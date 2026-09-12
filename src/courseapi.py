@@ -64,7 +64,20 @@ __all__ = ["client_", "CourseClient", "ShimResponse", "normalise_usage",
            "FAILURE_CATEGORIES", "SETTLED_CATEGORIES", "RUN_LEVEL_CATEGORIES",
            "failure_category", "describe_failure", "transport_budget_spent",
            "transport_attempts", "failed_attempt_usage", "ENVELOPE_VERSION",
-           "effective_request"]
+           "effective_request", "RunConfigurationError", "call_usage",
+           "ENVELOPE_CONTRACT", "envelope_contradictions", "envelope_generation"]
+
+
+class RunConfigurationError(unsw_ai.UNSWAIError):
+    """How this RUN is set up is wrong - not what this request asked for.
+
+    The distinction decides whether the failure is cached. `ParameterNotSupportedError`
+    was doing both jobs: it is the right answer for "this request carried a parameter the
+    API will not take", which is that request's problem and settles, and it was also the
+    answer for "this client has model fallback enabled", which is the run's problem and
+    must not settle. Raised as the second, it wrote five settled failures per document,
+    and fixing the configuration then produced zero fresh calls and zero valid draws.
+    """
 
 
 class IncompleteResponseError(unsw_ai.UNSWAIError):
@@ -124,6 +137,7 @@ FAILURE_CATEGORIES = (
     "daily_quota",       # the daily allowance is gone; waiting is the only fix
     "credentials",       # missing/wrong access code or header
     "deployment",        # the model is not deployed on this proxy
+    "run_configuration", # how THIS RUN is set up is wrong; fix it and resume
     "unreachable",       # the proxy itself did not answer
     "transport",         # timeout, dropped connection, 5xx
     "programming",       # a bug in this repository, not a service failure
@@ -137,7 +151,6 @@ _CATEGORY_BY_NAME = {
     "ValidationError": "schema",
     "RequestTooLargeError": "request_rejected",
     "ParameterNotSupportedError": "request_rejected",
-    "UnsupportedModeError": "request_rejected",
     "BadRequestError": "request_rejected",
     "UnprocessableEntityError": "request_rejected",
     "QuotaExceededError": "rate_limit",
@@ -150,7 +163,20 @@ _CATEGORY_BY_NAME = {
     "PermissionDeniedError": "credentials",
     "ModelNotAvailableError": "deployment",
     "NotFoundError": "deployment",
+    # HOW THE RUN IS CONFIGURED, not what this request asked for. Both are raised before
+    # any HTTP request leaves, both are fixed by editing settings, and both must therefore
+    # abort rather than settle - see RUN_LEVEL_CATEGORIES.
+    "RunConfigurationError": "run_configuration",
+    "UnsupportedModeError": "run_configuration",
+    "UnsupportedEndpointError": "run_configuration",
     "ProxyUnreachableError": "unreachable",
+    # TRANSIENT TRANSPORT, under BOTH spellings. The wrapper translates the SDK's
+    # exceptions into its own before this adapter ever sees them, so a map that listed
+    # only the SDK names classified every timeout and 5xx as `unknown`, marked its budget
+    # spent, and stopped the stage retry that those failures exist to get. The
+    # completeness test below keeps this table in step with the wrapper.
+    "ProxyTimeoutError": "transport",
+    "UpstreamServiceError": "transport",
     "APIConnectionError": "transport",
     "APITimeoutError": "transport",
     "InternalServerError": "transport",
@@ -183,6 +209,12 @@ SETTLED_CATEGORIES = (
 #: fault produces zero fresh calls and zero valid draws.
 RUN_LEVEL_CATEGORIES = (
     "credentials", "deployment", "daily_quota", "unreachable", "programming",
+    # A forbidden model fallback, an unserviceable instructor mode and an endpoint the
+    # proxy does not expose are all properties of the RUN. Classifying them as
+    # `request_rejected` made them settled document outcomes: five draws were written as
+    # settled failures, and correcting the client configuration then produced zero fresh
+    # calls and zero valid draws, exactly as a mistyped access code once did.
+    "run_configuration",
 )
 
 #: The only category a stage is right to re-ask itself: nothing below the stage
@@ -290,6 +322,146 @@ def describe_failure(exc: BaseException, *, request: dict | None = None) -> dict
 #: missing", and inventing values for the first case is how false provenance gets
 #: into a report. See text_features._envelope_generation.
 ENVELOPE_VERSION = 2
+
+#: Versions this code knows how to read. An envelope declaring anything else is a record
+#: from a future contract, and guessing at it is worse than refusing it.
+SUPPORTED_ENVELOPE_VERSIONS = (2,)
+
+# --------------------------------------------------------------------------- #
+# THE ENVELOPE CONTRACT - ONE DEFINITION, ALL THREE STAGES
+#
+# Words, Replay and Shock each grew their own idea of what an envelope contains
+# and what a loader checks, and the differences were not design: Replay and Shock
+# wrote no version at all, so evidence written five minutes ago was classified as
+# "legacy", and their loaders never compared the served model or the response
+# status, so a cache edited to name a different deployment and an `incomplete`
+# status was reused by both. The contract below is what every writer promises and
+# every loader checks.
+#
+# THE THREE CASES ARE DIFFERENT, and pretending otherwise is how the previous
+# version made promises it could not keep:
+#
+#   success           a completed, parsed answer: full response-side provenance
+#   response_failure  a response arrived and was rejected (truncated, filtered,
+#                     refused, nonterminal, schema): status is known, no payload
+#   pretransport      the request never left, or never got an answer (bad
+#                     credentials, forbidden fallback, timeout, 429): there is no
+#                     response id and no served model, and inventing one would be
+#                     a fabricated audit trail
+#
+# Free-text calls cut across all three: they have no response schema, so
+# `response_schema_sha256_16` is absent from their provenance and is not required
+# of any case here.
+# --------------------------------------------------------------------------- #
+
+ENVELOPE_CONTRACT = {
+    "success": {
+        "required": ("envelope_version", "ok", "call_index", "config_hash", "request",
+                     "model", "temperature", "provenance", "model_served", "usage",
+                     "transport_requests", "timestamp"),
+        "forbidden": ("failure",),
+    },
+    "response_failure": {
+        "required": ("envelope_version", "ok", "call_index", "config_hash", "request",
+                     "model", "temperature", "failure", "transport_requests",
+                     "timestamp"),
+        "forbidden": (),
+    },
+    "pretransport": {
+        "required": ("envelope_version", "ok", "call_index", "config_hash", "request",
+                     "model", "temperature", "failure", "timestamp"),
+        "forbidden": (),
+    },
+}
+
+#: Failure categories that mean NO RESPONSE EVER ARRIVED, so response-side fields
+#: (served model, response status, response id, usage) are genuinely unavailable.
+PRETRANSPORT_CATEGORIES = (
+    "credentials", "deployment", "run_configuration", "unreachable", "transport",
+    "rate_limit", "daily_quota", "request_rejected", "programming", "unknown",
+)
+
+
+def envelope_case(call: dict) -> str:
+    """Which contract case this record is: success, response_failure or pretransport."""
+    if call.get("ok"):
+        return "success"
+    category = (call.get("failure") or {}).get("category")
+    return "pretransport" if category in PRETRANSPORT_CATEGORIES else "response_failure"
+
+
+def envelope_generation(call: dict) -> str:
+    """"current" if written under the versioned contract, else "legacy".
+
+    "legacy" means ONLY "written before this contract existed" - which includes records
+    from the first proxy implementation, not just pre-proxy ones. It is not a statement
+    about which service produced them, and nothing back-fills their missing fields.
+    """
+    v = call.get("envelope_version")
+    return "current" if isinstance(v, int) and not isinstance(v, bool) else "legacy"
+
+
+def envelope_contradictions(call: dict, *, config_hash: str | None = None,
+                            prompt_hash: str | None = None,
+                            prompt_field: str = "prompt_hash") -> list[str]:
+    """Fields inside one envelope that disagree with each other or with this run.
+
+    A MATCHING CONFIG HASH IS NOT PROVENANCE. It says the run was configured the same
+    way; it says nothing about what the envelope itself claims. ONLY FIELDS THAT ARE
+    PRESENT are checked - absence in a legacy record means the field did not exist when
+    it was written, and inventing a value now is exactly the false provenance this
+    validation exists to prevent. Absence in a CURRENT record is a defect, and the
+    required-field check below catches it.
+    """
+    bad: list[str] = []
+
+    def check(field, actual, expected):
+        if actual is not None and expected is not None and actual != expected:
+            bad.append(f"{field}={actual!r}, but this run is {expected!r}")
+
+    version = call.get("envelope_version")
+    if version is not None:
+        if isinstance(version, bool) or not isinstance(version, int):
+            bad.append(f"envelope_version={version!r} is not an integer")
+        elif version not in SUPPORTED_ENVELOPE_VERSIONS:
+            bad.append(f"envelope_version={version} is not one of "
+                       f"{list(SUPPORTED_ENVELOPE_VERSIONS)}; this evidence was written "
+                       f"by a newer contract than this code can read")
+
+    check("model", call.get("model"), config.MODEL)
+    check("temperature", call.get("temperature"), config.SAMPLING_TEMPERATURE)
+    check(prompt_field, call.get(prompt_field), prompt_hash)
+    req = call.get("request") or {}
+    check("request.model", req.get("model"), config.MODEL)
+    check("request.temperature", req.get("temperature"), config.SAMPLING_TEMPERATURE)
+    if config_hash is not None:
+        check("config_hash", call.get("config_hash"), config_hash)
+
+    prov = call.get("provenance") or {}
+    # NO SILENT MODEL SUBSTITUTION, on the way back in as well as on the way out. An
+    # envelope whose served model differs from the one it requested records an answer
+    # some other deployment produced.
+    served = call.get("model_served") or prov.get("model_served")
+    requested = prov.get("model_requested") or call.get("model") or config.MODEL
+    if served is not None and served != requested:
+        bad.append(f"model_served={served!r} but model_requested={requested!r}: "
+                   f"this answer came from a different deployment")
+    status = prov.get("response_status")
+    if call.get("ok") and status is not None and status != "completed":
+        bad.append(f"marked ok with response_status={status!r}: an unfinished response "
+                   f"is a fragment, not a result")
+
+    if envelope_generation(call) == "current" and not bad:
+        case = envelope_case(call)
+        spec = ENVELOPE_CONTRACT[case]
+        missing = [f for f in spec["required"] if call.get(f) is None]
+        if missing:
+            bad.append(f"declares envelope_version {version} as a {case} record but is "
+                       f"missing {missing}")
+        present = [f for f in spec["forbidden"] if call.get(f) is not None]
+        if present:
+            bad.append(f"a {case} record must not carry {present}")
+    return bad
 
 
 #: Everything this adapter is willing to be handed. Anything else raises rather
@@ -465,15 +637,43 @@ _REPAIRABLE_ERRORS = (
     "JSONDecodeError", "StructuredOutputError",
 )
 
-#: Counts REAL HTTP requests for the logical call in flight on this thread.
-#: Incremented once per instructor attempt, which is one request each. Reset by
-#: `_guarded`, so it spans the wrapper's 429 retries and instructor's repairs -
-#: everything one call to `.parse()` costs.
+#: THE PER-CALL ACCOUNT for the logical call in flight on this thread: how many real HTTP
+#: requests it has cost, and every usage figure the service actually returned along the
+#: way. Reset by `_guarded`, so it spans the wrapper's 429 retries AND instructor's
+#: repairs - everything one call to `.parse()` costs.
+#:
+#: USAGE IS ACCUMULATED, NOT OVERWRITTEN. Keeping only the last response's usage reported
+#: 20 tokens for a call that made two billed attempts of 20 - understating the run against
+#: a shared allowance, which is the wrong direction to be wrong in. Attempts whose usage
+#: the service never reported (a timeout, a dropped connection) are counted separately and
+#: labelled, rather than being silently treated as zero.
 _http = threading.local()
 
 
-def _http_reset() -> None:
+def _account_reset() -> None:
     _http.count = 0
+    _http.usage = []
+    _http.unknown = 0
+    _http.seen = []
+    _http.accounted = False
+
+
+def _account_attempt_start() -> None:
+    """Begin an attempt whose cost is not yet known."""
+    _http.accounted = False
+
+
+def _account_attempt_unknown() -> None:
+    """Close an attempt that produced no usable response, ONCE.
+
+    Both the repair policy and the guard's error handler look for a response, and both
+    used to record 'cost unknown' when they did not find one - so a single free-text
+    truncation, already accounted from its own response, was also counted as an attempt
+    of unknown cost and reported `attempts_unknown: 1` beside the figure it knew.
+    """
+    if not getattr(_http, "accounted", False):
+        _account_usage(None)
+        _http.accounted = True
 
 
 def _http_count() -> int:
@@ -481,7 +681,107 @@ def _http_count() -> int:
 
 
 def _http_tick(_retry_state=None) -> None:
+    """One real HTTP request is about to be made: count it, and open its attempt.
+
+    THE ATTEMPT BOUNDARY IS THE REQUEST, not the adapter call. Opening it once per
+    adapter call meant the wrapper's five internal 429 retries shared a single attempt
+    slot, so four of the five billed-but-unreported requests vanished from the account.
+    """
     _http.count = _http_count() + 1
+    _http.accounted = False
+
+
+def _account_usage(usage: dict | None) -> None:
+    """Record what one attempt cost, or that its cost is unknown."""
+    if usage:
+        getattr(_http, "usage", []).append(dict(usage))
+    else:
+        _http.unknown = int(getattr(_http, "unknown", 0) or 0) + 1
+
+
+#: Token fields that are sums over a call, and may therefore be added across attempts.
+_ADDITIVE_USAGE = ("input_tokens", "output_tokens", "total_tokens", "prompt_tokens",
+                   "completion_tokens", "reasoning_tokens", "cached_input_tokens")
+
+
+def call_usage() -> dict | None:
+    """Everything this logical call is known to have cost, across every attempt.
+
+    `attempts_counted` and `attempts_unknown` are carried with the totals so a reader can
+    tell "this is the whole bill" from "this is the part of the bill we were told about".
+    """
+    records = list(getattr(_http, "usage", []) or [])
+    unknown = int(getattr(_http, "unknown", 0) or 0)
+    if not records and not unknown:
+        return None                      # nothing was attempted; there is no bill
+    if not records:
+        # ATTEMPTS WHOSE COST WAS NEVER REPORTED. The token keys are ABSENT rather than
+        # zero: a 429 that cost five requests did not cost zero tokens, it cost an amount
+        # nobody told us, and a record of zeros would be read as the former.
+        return {"attempts_counted": 0, "attempts_unknown": unknown,
+                "tokens_known": False, "is_complete": False}
+    total = {k: 0 for k in _ADDITIVE_USAGE}
+    for rec in records:
+        for k in _ADDITIVE_USAGE:
+            v = rec.get(k)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                total[k] += int(v)
+    total["attempts_counted"] = len(records)
+    total["attempts_unknown"] = unknown
+    total["tokens_known"] = True
+    total["is_complete"] = unknown == 0
+    return total
+
+
+def merge_usage(*records: dict | None) -> dict | None:
+    """Add up usage the service actually reported, keeping the unknown count honest.
+
+    Used where a stage retries around the adapter: each adapter call reports its own
+    total, and the stage's envelope has to carry the sum rather than the last one.
+    """
+    known = [r for r in records if r]
+    if not known:
+        return None
+    total = {k: 0 for k in _ADDITIVE_USAGE}
+    counted = unknown = 0
+    for rec in known:
+        for k in _ADDITIVE_USAGE:
+            v = rec.get(k)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                total[k] += int(v)
+        counted += int(rec.get("attempts_counted", 1) or 0)
+        unknown += int(rec.get("attempts_unknown", 0) or 0)
+    total["attempts_counted"] = counted
+    total["attempts_unknown"] = unknown
+    total["tokens_known"] = any(r.get("tokens_known", True) for r in known)
+    total["is_complete"] = unknown == 0
+    if not total["tokens_known"]:
+        for k in _ADDITIVE_USAGE:
+            total.pop(k, None)
+    return total
+
+
+def _account_response(raw: Any, *, attempted: bool = True) -> None:
+    """Record one attempt's usage exactly once.
+
+    Keyed on the response OBJECT, because the same attempt is seen twice - once by the
+    repair policy deciding whether to re-ask, and again by `_guarded` translating the
+    final failure - and counting it twice would overstate the bill as surely as keeping
+    only the last understates it.
+    """
+    seen = getattr(_http, "seen", None)
+    if seen is None:
+        seen = _http.seen = []
+    if raw is None:
+        if attempted:
+            _account_attempt_unknown()
+        return
+    if id(raw) in seen:
+        _http.accounted = True            # this attempt is already on the account
+        return
+    seen.append(id(raw))
+    _http.accounted = True
+    _account_usage(normalise_usage(getattr(raw, "usage", None)))
 
 
 def _repair_policy():
@@ -505,6 +805,7 @@ def _repair_policy():
         outcome = retry_state.outcome
         exc = outcome.exception() if outcome is not None else None
         if exc is None or isinstance(exc, unsw_ai._DETERMINISTIC_FAILURES):
+            _account_response(getattr(unsw_ai._recent, "response", None))
             return False
         # ONLY a schema failure is repairable. A dropped connection is transport
         # and belongs to the stage's backoff; a 429 belongs to the wrapper. Asking
@@ -512,6 +813,9 @@ def _repair_policy():
         if not any(k.__name__ in _REPAIRABLE_ERRORS for k in type(exc).__mro__):
             return False
         raw = getattr(unsw_ai._recent, "response", None)
+        # THIS ATTEMPT IS BILLED WHETHER OR NOT IT IS REPAIRED, so account for it here -
+        # this is the only place a repaired-away attempt is ever visible.
+        _account_response(raw)
         # A REFUSAL IS A COMPLETED ANSWER. The status says `completed` and the
         # body parses as nothing, so a status-only test read it as repairable and
         # spent a second request to be refused again in the same words.
@@ -570,6 +874,11 @@ class ShimResponse:
         self.request = dict(request or {})
         self.provenance = dict(provenance or {})
         self.raw = raw
+        #: What the WHOLE logical call cost, across instructor's repairs and the
+        #: wrapper's retries. `.usage` is this response's own figure, as on an SDK
+        #: response; `.call_usage` is the bill. A success reached after one repaired
+        #: attempt costs both attempts, and recording only the second understated it.
+        self.call_usage = call_usage()
 
 
 class _Completions:
@@ -635,7 +944,7 @@ class _Completions:
         fallbacks = tuple(
             getattr(getattr(client, "settings", None), "fallback_models", ()) or ())
         if fallbacks:
-            raise unsw_ai.ParameterNotSupportedError(
+            raise RunConfigurationError(
                 f"model fallback is enabled ({list(fallbacks)}), and the assessed "
                 f"pipeline forbids it: a silent substitution would put {requested!r} in "
                 f"the reproducibility envelope while another model produced the answer. "
@@ -666,11 +975,11 @@ class _Completions:
         connection, a 5xx - leave here unspent, because nothing below the stage
         retried them and each stage attempt is one more request rather than five.
         """
+        _account_reset()
         client = unsw_ai.get_client(req["model"])
         self._no_substitution(client, req["model"])
         settings = client.settings
         retries = 0 if wrapper_retries else unsw_ai.DEFAULT_RATE_LIMIT_RETRIES
-        _http_reset()
         for attempt in range(retries + 1):
             # The wrapper stashes each raw response on a THREAD-LOCAL. Clear it
             # first: a request that fails before any response arrives (a 429, a
@@ -681,7 +990,8 @@ class _Completions:
             try:
                 if not wrapper_retries:
                     _http_tick()      # the raw path is one request per attempt
-                return fn(), attempt + 1
+                value = fn()      # accounts for its own response before returning
+                return value, attempt + 1
             except Exception as exc:  # noqa: BLE001 - re-raised below
                 # A response that came back 200-but-unfinished makes instructor
                 # fail while parsing, and the useful verdict is on the response
@@ -689,7 +999,8 @@ class _Completions:
                 # and completion filtering surface as themselves instead of as a
                 # schema ValueError.
                 recent = getattr(unsw_ai._recent, "response", None)
-                spent_usage = normalise_usage(getattr(recent, "usage", None))
+                _account_response(recent)
+                spent_usage = call_usage()
                 try:
                     if recent is not None:
                         validate_response(recent, settings)
@@ -711,7 +1022,7 @@ class _Completions:
     def _stamped(exc: BaseException, usage: dict | None) -> BaseException:
         """Attach the transport cost and the budget verdict before re-raising."""
         return stamp_transport(
-            exc, attempts=_http_count() or 1,
+            exc, attempts=_http_count(),
             budget_spent=failure_category(exc) not in STAGE_RETRYABLE_CATEGORIES,
             usage=usage)
 
@@ -727,12 +1038,21 @@ class _Completions:
                               max_tokens=max_tokens)
         req = self._transmitted(model, temperature, max_tokens)
         client = unsw_ai.get_client(req["model"])
+
+        # VALIDATION HAPPENS INSIDE THE GUARD, so a truncated free-text answer is
+        # accounted for like any other failure. Validating after `_guarded` returned
+        # meant the resulting IncompleteResponseError carried neither the transport
+        # count nor the usage the service had just reported - the one failure path that
+        # knew exactly what it had cost was the one that threw the figure away.
+        def _ask():
+            raw = client.client.responses.create(input=list(messages), **req)
+            _account_response(raw)
+            validate_response(raw, client.settings)
+            return raw
+
         # The raw SDK path has no wrapper guard of its own, so the retry budget
         # belongs to _guarded here.
-        raw, attempts = self._guarded(
-            lambda: client.client.responses.create(input=list(messages), **req),
-            req, wrapper_retries=False)
-        validate_response(raw, client.settings)
+        raw, attempts = self._guarded(_ask, req, wrapper_retries=False)
         return ShimResponse(
             content=raw.output_text, raw=raw, model=req["model"], request=req,
             provenance=self._provenance(req, messages, raw, attempts=attempts))
@@ -749,12 +1069,15 @@ class _Completions:
         # repair loop used to re-ask three times for a body the service had cut
         # short, arriving at the same refusal each time. The wrapper's own 429
         # budget is untouched - that is a different failure with its own policy.
-        (parsed, raw), attempts = self._guarded(
-            lambda: client.chat.completions.create_with_completion(
+        def _ask():
+            parsed, raw = client.chat.completions.create_with_completion(
                 response_model=response_format, messages=list(messages),
-                max_retries=_repair_policy(), **req),
-            req, wrapper_retries=True)
-        validate_response(raw, client.settings)
+                max_retries=_repair_policy(), **req)
+            _account_response(raw)
+            validate_response(raw, client.settings)
+            return parsed, raw
+
+        (parsed, raw), attempts = self._guarded(_ask, req, wrapper_retries=True)
         return ShimResponse(
             parsed=parsed, raw=raw, model=req["model"], request=req,
             provenance=self._provenance(req, messages, raw,

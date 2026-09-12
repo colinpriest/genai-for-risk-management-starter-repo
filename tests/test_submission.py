@@ -687,11 +687,16 @@ def test_replay_artefact_matches_the_prompts_and_reviews_in_this_repository():
 def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposure():
     """
     THE GAP THIS CLOSES. The suite checked the Replay prompts and the claim reviews, but
-    nothing required the selection freeze or the exposure record to exist at all. A
-    private-copy probe deleted outputs/replay_selection.json, the embedded "selection"
-    block and both A/B prompt hashes, and the submission suite stayed exactly as green as
-    before - so the one safeguard standing between "chosen on development" and "chosen on
-    the held-out sample" was unverified at submission time.
+    nothing required the selection freeze or the exposure record to exist at all: a probe
+    deleted outputs/replay_selection.json, the embedded "selection" block and both A/B
+    prompt hashes, and the suite stayed exactly as green as before.
+
+    AND THE GAP THE FIRST ATTEMPT LEFT. It then read only the list embedded in
+    replay.json, so deleting the committed log changed nothing, and it demanded that
+    EVERY event in that list carry the current selection hash - which rejected the one
+    workflow the design exists to support: expose the holdout, declare a revalidation,
+    and expose it again under a changed configuration. Older events with older hashes are
+    the history. What must match the current freeze is the event THIS REPORT rests on.
     """
     import decision_replay as dr
     rep = _artefact("replay.json")
@@ -712,25 +717,96 @@ def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposur
         "count, draw indices, output ceiling, benchmark samples or panel - the reported "
         "holdout numbers were produced under a different selection")
 
-    # THE EXPOSURE THE HOLDOUT NUMBERS BELONG TO, bound to the freeze that governs it.
     exposure = rep.get("exposure") or {}
     assert exposure.get("events") is not None, (
         "replay.json carries no exposure record - regenerate the Replay stage")
-    opened = [e for e in exposure["events"] if e.get("type") == "open"]
+    embedded_events = list(exposure["events"])
+    declared_prior = bool(selection.get("prior_exposure_declared"))
+
+    # ---- the COMMITTED LOG is the authority, not the copy inside the artefact --------
+    log_path = ROOT / "outputs" / dr.EXPOSURE_LOG.name
+    committed = None
+    if log_path.exists():
+        events, damage = [], []
+        for n, line in enumerate(
+                log_path.read_text(encoding="utf-8").splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError as exc:
+                damage.append(f"line {n}: not JSON ({exc.msg})")
+                continue
+            if not isinstance(parsed, dict):
+                damage.append(f"line {n}: a {type(parsed).__name__}, not an event")
+                continue
+            if parsed.get("type") == "open":
+                missing = [f for f in dr._OPEN_EVENT_FIELDS if parsed.get(f) is None]
+                if missing:
+                    damage.append(f"line {n}: exposure event missing {missing}")
+            events.append(parsed)
+        assert not damage, (
+            f"outputs/{dr.EXPOSURE_LOG.name} is damaged, so the number of holdout "
+            f"exposures it records cannot be read:\n  " + "\n  ".join(damage)
+            + "\nRestore it from version control rather than editing it.")
+        committed = events
+
+    if any(e.get("type") == "open" for e in embedded_events):
+        assert committed is not None, (
+            f"replay.json reports recorded holdout exposures, but "
+            f"outputs/{dr.EXPOSURE_LOG.name} is missing. That file is the append-only "
+            f"authority the count rests on; the copy inside the artefact is not evidence "
+            f"of itself. Commit the log.")
+        assert committed == embedded_events, (
+            f"the exposure history embedded in replay.json is not the history in "
+            f"outputs/{dr.EXPOSURE_LOG.name}. One of them has been edited; regenerate "
+            f"the Replay stage from the committed log.")
+
+    opened = [e for e in embedded_events if e.get("type") == "open"]
     # EITHER the log records the exposure, OR the team declares that it happened before
     # the log existed. An empty log means one of two opposite things - untouched, or
     # exposed by a process that never recorded it - and the difference has to be stated
     # rather than inferred. What is NOT acceptable is holdout results with neither.
-    declared_prior = bool(selection.get("prior_exposure_declared"))
     assert opened or declared_prior, (
         "the holdout results are reported, but no holdout exposure was recorded and none "
         "was declared. Either regenerate the stage so the log records what was asked, or "
         "declare an exposure that predates the log:\n"
         '    python src/decision_replay.py --dev --prior-exposure --note="..."')
-    assert all(e.get("selection_config_hash") == selection.get("config_hash")
-               for e in opened), (
-        "a recorded holdout exposure belongs to a different selection than the frozen "
-        "one - the reported result and the exposure record disagree")
+
+    # ---- the REPORTED benchmark is bound to ONE event, and that event to this freeze --
+    if opened:
+        event_id = exposure.get("holdout_event_id")
+        assert event_id, (
+            "replay.json reports holdout numbers without naming the exposure they came "
+            "from. Regenerate the Replay stage so the benchmark carries its event id.")
+        named = [e for e in opened if e.get("event_id") == event_id]
+        assert len(named) == 1, (
+            f"holdout_event_id {event_id!r} names "
+            f"{'no' if not named else len(named)} event(s) in the exposure log")
+        event = named[0]
+        assert event.get("selection_config_hash") == selection.get("config_hash"), (
+            f"the reported holdout benchmark belongs to exposure {event_id} of selection "
+            f"{event.get('selection_config_hash')!r}, but the frozen selection is "
+            f"{selection.get('config_hash')!r}. Older exposures of older configurations "
+            f"are legitimate history; the one this report rests on must be the current "
+            f"freeze. Re-run the holdout under the frozen selection.")
+        assert event.get("freeze_id") == selection.get("freeze_id"), (
+            f"exposure {event_id} was recorded against freeze "
+            f"{event.get('freeze_id')!r}, not the current freeze "
+            f"{selection.get('freeze_id')!r}")
+        closed = {e.get("event_id") for e in embedded_events
+                  if e.get("type") == "close"}
+        assert event_id in closed, (
+            f"exposure {event_id} was never closed, so the benchmark it reports did not "
+            f"finish. Re-run the stage to completion before submitting.")
+        # Every exposure must have been authorised: the freeze says how many looks at the
+        # holdout the selection allows, and the log says how many were taken.
+        authorised = int(selection.get("authorised_exposures", 1))
+        assert len(opened) <= authorised, (
+            f"the log records {len(opened)} holdout exposure(s) but the freeze authorises "
+            f"{authorised}. A further look has to be declared with --revalidate.")
+
     status = exposure.get("evidence_status")
     assert status in ("prospective", "retrospective", "previously_exposed"), (
         "replay.json does not classify how its holdout evidence stands in relation to "
@@ -741,6 +817,12 @@ def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposur
             f"{status!r} - regenerate the Replay stage so the two agree")
         assert str(selection.get("note", "")).strip(), (
             "a declared prior exposure must say what happened, in words a marker reads")
+    if len(opened) > 1:
+        assert status == "retrospective", (
+            f"{len(opened)} holdout exposures are recorded, so the evidence is "
+            f"retrospective; the artefact says {status!r}")
+        assert str(selection.get("authorisation", "")).strip(), (
+            "a second exposure must carry the declared reason it was authorised for")
 
 
 def test_the_causal_ab_comparison_used_two_genuinely_different_prompts():

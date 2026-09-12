@@ -768,7 +768,17 @@ def llm_parsed(system: str, user: str, schema, seed_offset: int = 0) -> dict:
                         "prompt_sha": key}
             wrong = {k: (rec.get(k), v) for k, v in expected.items()
                      if rec.get(k) != v}
-            if wrong:
+            # THE SAME CONTRACT WORDS APPLIES. This loader compared the request-side
+            # fields and the payload schema, and nothing else - so a cache edited to name
+            # a different served model, with `provenance.response_status` set to
+            # `incomplete`, was reused: an answer from another deployment that the
+            # service had not finished, scored as a completed result.
+            contradictions = courseapi.envelope_contradictions(
+                rec, prompt_hash=key, prompt_field="prompt_sha")
+            if contradictions:
+                _quarantine(path, "envelope contradicts itself or this run: "
+                                  + "; ".join(contradictions))
+            elif wrong:
                 _quarantine(path, f"envelope metadata does not match this request "
                                   f"({list(wrong)})")
             elif not reusable_under_current_ceiling(rec):
@@ -806,7 +816,12 @@ def llm_parsed(system: str, user: str, schema, seed_offset: int = 0) -> dict:
                  "model_served": getattr(r, "model", None),
                  "prompt_sha": key,
                  "request_id": getattr(r, "id", None),
-                 "usage": getattr(r, "usage", None),
+                 "usage": getattr(r, "call_usage", None) or getattr(r, "usage", None),
+                 "usage_final_response": getattr(r, "usage", None),
+                 "transport_requests": (getattr(r, "provenance", None) or {}
+                                        ).get("transport_requests"),
+                 "config_hash": config_hash(),
+                 "envelope_version": courseapi.ENVELOPE_VERSION,
                  "timestamp": datetime.now(timezone.utc).isoformat()}, indent=1))
             config.ledger_add("shock", path)
             return payload

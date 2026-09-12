@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import sys
+import threading
 import types
 
 import pytest
@@ -48,12 +50,25 @@ def _response(parsed=None, text=None):
     # `.request` mirrors what courseapi records: the envelope writers copy it, and the
     # cache's output-ceiling rule reads it back, so a fake without it is not a fake of
     # this adapter.
+    # A REAL RESPONSE ALWAYS CARRIES THESE, so a fake that omits them is not a fake of
+    # this adapter - it is a fake of a defect. This one used to report `usage=None` and
+    # no transport count, which is exactly the shape the envelope contract exists to
+    # reject, so the fixture would have hidden a writer that stopped recording them.
+    usage = {"input_tokens": 10, "output_tokens": 10, "total_tokens": 20,
+             "prompt_tokens": 10, "completion_tokens": 10, "reasoning_tokens": 0,
+             "cached_input_tokens": 0}
     return types.SimpleNamespace(
         choices=[types.SimpleNamespace(message=msg)],
-        id="fake-request", usage=None,
+        id="fake-request",
+        usage=dict(usage),
+        call_usage=dict(usage, attempts_counted=1, attempts_unknown=0,
+                        tokens_known=True, is_complete=True),
         request={"model": config.MODEL, "temperature": config.SAMPLING_TEMPERATURE,
                  "max_output_tokens": config.MAX_OUTPUT_TOKENS},
-        provenance={"transmitted": {"max_output_tokens": config.MAX_OUTPUT_TOKENS}},
+        provenance={"transmitted": {"max_output_tokens": config.MAX_OUTPUT_TOKENS},
+                    "model_requested": config.MODEL, "model_served": config.MODEL,
+                    "response_status": "completed", "transport_requests": 1,
+                    "envelope_version": 2},
         model=config.MODEL)
 
 
@@ -1201,17 +1216,32 @@ def test_each_unfinished_response_is_classified_as_itself(monkeypatch, status, r
 # -------------------------------------------------------------------------------------------
 
 def _ok_draw(idx, **over):
+    """A CURRENT success envelope, complete to the contract.
+
+    This helper used to omit the response-side provenance a real writer always records -
+    exactly the shape the contract exists to reject - so it would have kept passing if
+    the writer stopped recording them.
+    """
+    import courseapi
     import text_features as tf
     rec = {"ok": True, "parsed": {"ok": True}, "call_index": idx,
            "config_hash": tf.call_config_hash(),
            "model": config.MODEL, "temperature": config.SAMPLING_TEMPERATURE,
+           "model_served": config.MODEL,
            "prompt_hash": tf._prompt_hash(),
            "request": {"model": config.MODEL,
                        "temperature": config.SAMPLING_TEMPERATURE,
                        "max_output_tokens": config.MAX_OUTPUT_TOKENS},
-           "usage": {"prompt_tokens": 10, "completion_tokens": 1},
+           "provenance": {"response_status": "completed",
+                          "model_requested": config.MODEL,
+                          "model_served": config.MODEL,
+                          "transport_requests": 1},
+           "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11,
+                     "attempts_counted": 1, "attempts_unknown": 0,
+                     "tokens_known": True, "is_complete": True},
+           "transport_requests": 1,
            "timestamp": "2026-09-12T00:00:00+00:00",
-           "envelope_version": 2}
+           "envelope_version": courseapi.ENVELOPE_VERSION}
     rec.update(over)
     return rec
 
@@ -1471,3 +1501,809 @@ def test_an_undeclared_empty_log_is_unexposed_and_a_declared_one_is_not(frozen):
     assert dr.evidence_status() == "unexposed"
     dr.freeze_selection(note="ran before the log existed", prior_exposure=True)
     assert dr.evidence_status() == "previously_exposed"
+
+
+# -------------------------------------------------------------------------------------------
+# EVERY FAILURE THE WRAPPER CAN RAISE IS CLASSIFIED  (recheck-3 N3)
+# -------------------------------------------------------------------------------------------
+
+def test_every_wrapper_error_has_an_explicit_category():
+    """
+    THE REGRESSION THIS PINS. The category map was written from the SDK's exception names,
+    but the wrapper translates those into its own before the adapter sees them - so
+    `APITimeoutError` became `ProxyTimeoutError` and `InternalServerError` became
+    `UpstreamServiceError`, neither was in the map, both were classified `unknown`, and
+    `unknown` is treated as a spent budget. Two transient failures that exist to be
+    retried stopped the run after one attempt.
+
+    A hand-written list will drift again unless something checks it, so this enumerates
+    the wrapper's actual exception classes instead of restating the list.
+    """
+    import courseapi
+    import unsw_ai
+
+    unclassified = []
+    for name in dir(unsw_ai):
+        klass = getattr(unsw_ai, name)
+        if not (isinstance(klass, type) and issubclass(klass, unsw_ai.UNSWAIError)):
+            continue
+        if klass is unsw_ai.UNSWAIError:
+            continue
+        try:
+            instance = klass("synthetic")
+        except Exception:                                # pragma: no cover
+            continue
+        if courseapi.failure_category(instance) == "unknown":
+            unclassified.append(name)
+    assert not unclassified, (
+        f"these wrapper errors have no category, so they would be treated as unknown and "
+        f"their retry budget as spent: {sorted(unclassified)}. Add each to "
+        f"courseapi._CATEGORY_BY_NAME.")
+
+
+def test_every_category_is_in_the_declared_vocabulary():
+    import courseapi
+    stray = sorted(set(courseapi._CATEGORY_BY_NAME.values())
+                   - set(courseapi.FAILURE_CATEGORIES))
+    assert not stray, f"categories not declared in FAILURE_CATEGORIES: {stray}"
+    for group in (courseapi.SETTLED_CATEGORIES, courseapi.RUN_LEVEL_CATEGORIES,
+                  courseapi.STAGE_RETRYABLE_CATEGORIES,
+                  courseapi.PRETRANSPORT_CATEGORIES):
+        stray = sorted(set(group) - set(courseapi.FAILURE_CATEGORIES))
+        assert not stray, f"undeclared categories in a policy group: {stray}"
+    overlap = sorted(set(courseapi.SETTLED_CATEGORIES)
+                     & set(courseapi.RUN_LEVEL_CATEGORIES))
+    assert not overlap, (
+        f"a category cannot be both a settled document outcome and a run-level abort: "
+        f"{overlap}")
+
+
+# -------------------------------------------------------------------------------------------
+# TRANSIENT FAILURES RECOVER; PERSISTENT ONES STOP  (recheck-3 N3, plan T4)
+# -------------------------------------------------------------------------------------------
+
+def _sequence_transport(monkeypatch, responses):
+    """Serve `responses` in order; each entry is a callable taking the httpx request."""
+    import httpx
+    import openai
+    import courseapi
+    import unsw_ai
+
+    sent = []
+
+    def transport(request):
+        sent.append(request)
+        make = responses[min(len(sent) - 1, len(responses) - 1)]
+        return make(request)
+
+    settings = unsw_ai.ProxySettings(proxy_url="https://mock.invalid",
+                                     access_code="synthetic", student_id="9999999",
+                                     fallback_models=())
+    sdk = openai.OpenAI(api_key="synthetic", base_url="https://mock.invalid",
+                        max_retries=0,
+                        http_client=httpx.Client(transport=httpx.MockTransport(transport)))
+    monkeypatch.setattr(unsw_ai, "build_openai_client", lambda *a, **k: sdk)
+    monkeypatch.setattr(unsw_ai.time, "sleep", lambda *a, **k: None)
+    client = unsw_ai.UNSWInstructor(settings=settings)
+    monkeypatch.setattr(unsw_ai, "get_client", lambda *a, **k: client)
+    monkeypatch.setattr(courseapi, "client_", lambda: courseapi.CourseClient())
+    return sent, sdk
+
+
+def _tool_body(arguments, tokens, status="completed"):
+    """One Responses-API tool call for `_Schema`, as instructor expects to parse it."""
+    import config as _c
+    return {
+        "id": "resp_ok", "object": "response", "created_at": 1, "status": status,
+        "incomplete_details": None, "model": _c.MODEL,
+        "output": [{"type": "function_call", "id": "fc", "call_id": "c",
+                    "name": _Schema.__name__, "arguments": arguments,
+                    "status": "completed"}],
+        "usage": {"input_tokens": 0, "output_tokens": tokens, "total_tokens": tokens}}
+
+
+def _tool_response(tokens=20):
+    import httpx
+    return lambda request: httpx.Response(
+        200, json=_tool_body(json.dumps({"ok": True}), tokens))
+
+
+def _http_error(code):
+    import httpx
+    return lambda request: httpx.Response(
+        code, json={"error": {"message": "synthetic", "type": "server_error"}})
+
+
+def _read_timeout():
+    import httpx
+    def raise_timeout(request):
+        raise httpx.ReadTimeout("synthetic timeout", request=request)
+    return raise_timeout
+
+
+@pytest.mark.parametrize("first,label", [
+    (_http_error(500), "HTTP 500"),
+    (_http_error(503), "HTTP 503"),
+    (_read_timeout(), "read timeout"),
+])
+def test_a_transient_failure_then_success_costs_exactly_two_requests(monkeypatch, first,
+                                                                     label):
+    """
+    Through the WHOLE stack - SDK, instructor, the wrapper's translation, this adapter and
+    the stage's own retry. Raising a hand-made SDK exception at the adapter would skip the
+    translation step that caused the defect, and would have passed while the real path
+    stopped after one attempt.
+    """
+    import text_features as tf
+
+    sent, sdk = _sequence_transport(monkeypatch, [first, _tool_response()])
+    monkeypatch.setattr(tf, "_schema_model", lambda: _Schema)
+    monkeypatch.setattr(tf.time, "sleep", lambda *a, **k: None)
+    try:
+        envelope = tf.score_once("synthetic", config.CALL_INDEX_BASE)
+    finally:
+        sdk.close()
+
+    assert envelope["ok"] is True, (
+        f"a {label} followed by a good response did not recover: {envelope.get('error')}")
+    assert len(sent) == 2, f"{label} then success cost {len(sent)} requests, not 2"
+
+
+@pytest.mark.parametrize("make,label", [
+    (_http_error(500), "HTTP 500"),
+    (_read_timeout(), "read timeout"),
+])
+def test_a_persistent_transient_failure_stops_at_the_declared_bound(monkeypatch, make,
+                                                                    label):
+    import text_features as tf
+
+    sent, sdk = _sequence_transport(monkeypatch, [make])
+    monkeypatch.setattr(tf, "_schema_model", lambda: _Schema)
+    monkeypatch.setattr(tf.time, "sleep", lambda *a, **k: None)
+    try:
+        envelope = tf.score_once("synthetic", config.CALL_INDEX_BASE)
+    finally:
+        sdk.close()
+
+    assert envelope["failure"]["category"] == "transport", (
+        f"{label} was classified {envelope['failure']['category']!r}")
+    assert len(sent) == config.MAX_RETRIES, (
+        f"a persistent {label} cost {len(sent)} requests; the stage bound is "
+        f"{config.MAX_RETRIES}")
+    assert envelope["transport_requests"] == len(sent)
+
+
+# -------------------------------------------------------------------------------------------
+# EVERY KNOWN ATTEMPT IS ON THE BILL  (recheck-3 N4, plan T5)
+# -------------------------------------------------------------------------------------------
+
+def _bad_then_good(bad_tokens=20, good_tokens=30):
+    """A completed-but-invalid object, then a valid one: instructor's repair case."""
+    import httpx
+    state = {"n": 0}
+
+    def respond(request):
+        state["n"] += 1
+        first = state["n"] == 1
+        arguments = ('{"ok":"not-a-boolean"}' if first else '{"ok":true}')
+        return httpx.Response(
+            200, json=_tool_body(arguments, bad_tokens if first else good_tokens))
+    return respond
+
+
+def test_a_repaired_success_bills_both_attempts(monkeypatch):
+    """
+    THE UNDERCOUNT THIS PINS. The envelope kept the LAST response's usage, so a draw that
+    cost a 20-token invalid attempt and a 30-token good one reported 30. Understating a
+    shared allowance is the wrong direction to be wrong in.
+    """
+    import text_features as tf
+
+    sent, sdk = _sequence_transport(monkeypatch, [_bad_then_good()])
+    monkeypatch.setattr(tf, "_schema_model", lambda: _Schema)
+    monkeypatch.setattr(tf.time, "sleep", lambda *a, **k: None)
+    try:
+        envelope = tf.score_once("synthetic", config.CALL_INDEX_BASE)
+    finally:
+        sdk.close()
+
+    assert envelope["ok"] is True, envelope.get("error")
+    assert len(sent) == 2
+    assert envelope["usage"]["total_tokens"] == 50, (
+        f"two billed attempts of 20 and 30 tokens were recorded as "
+        f"{envelope['usage']['total_tokens']}")
+    assert envelope["usage"]["attempts_counted"] == 2
+    assert envelope["usage_final_response"]["total_tokens"] == 30, (
+        "the final response's own figure must stay available and separate")
+    assert envelope["transport_requests"] == 2
+
+
+def test_a_failed_free_text_call_keeps_the_tokens_it_spent(monkeypatch):
+    """
+    Free-text validation used to run AFTER the guard returned, so the one failure that
+    knew exactly what it had cost threw the figure away: no transport count, no usage.
+    """
+    import courseapi
+    import httpx
+
+    def truncated(request):
+        return httpx.Response(200, json={
+            "id": "resp", "object": "response", "created_at": 1, "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"}, "model": config.MODEL,
+            "output": [{"type": "message", "id": "m", "role": "assistant",
+                        "status": "incomplete",
+                        "content": [{"type": "output_text", "text": "partial",
+                                     "annotations": []}]}],
+            "usage": {"input_tokens": 10, "output_tokens": 10, "total_tokens": 20}})
+
+    sent, sdk = _sequence_transport(monkeypatch, [truncated])
+    try:
+        with pytest.raises(courseapi.IncompleteResponseError) as caught:
+            courseapi.CourseClient().chat.completions.create(
+                messages=[{"role": "user", "content": "synthetic"}])
+    finally:
+        sdk.close()
+
+    assert courseapi.transport_attempts(caught.value) == 1
+    usage = courseapi.failed_attempt_usage(caught.value)
+    assert usage and usage["total_tokens"] == 20, (
+        f"a truncated free-text answer was billed 20 tokens and recorded {usage}")
+    assert usage["tokens_known"] is True
+
+
+def test_an_attempt_with_no_reported_usage_is_labelled_not_zeroed(monkeypatch):
+    """
+    A timeout costs an unknown amount, not nothing. Recording zero would let a run report
+    a total it cannot support; the count of unreported attempts is carried instead.
+    """
+    import text_features as tf
+
+    sent, sdk = _sequence_transport(
+        monkeypatch, [_read_timeout(), _tool_response(tokens=30)])
+    monkeypatch.setattr(tf, "_schema_model", lambda: _Schema)
+    monkeypatch.setattr(tf.time, "sleep", lambda *a, **k: None)
+    try:
+        envelope = tf.score_once("synthetic", config.CALL_INDEX_BASE)
+    finally:
+        sdk.close()
+
+    assert envelope["ok"] is True
+    assert envelope["transport_requests"] == 2
+    usage = envelope["usage"]
+    assert usage["total_tokens"] == 30, "the known part of the bill must be kept"
+    assert usage["attempts_unknown"] == 1, "the unreported attempt must be counted"
+    assert usage["is_complete"] is False, "and the total must not claim to be complete"
+
+
+def test_a_persistent_rate_limit_reports_unknown_cost_not_zero_tokens(monkeypatch):
+    import text_features as tf
+
+    sent, sdk = _sequence_transport(monkeypatch, [_http_error(429)])
+    monkeypatch.setattr(tf, "_schema_model", lambda: _Schema)
+    monkeypatch.setattr(tf.time, "sleep", lambda *a, **k: None)
+    try:
+        envelope = tf.score_once("synthetic", config.CALL_INDEX_BASE)
+    finally:
+        sdk.close()
+
+    usage = envelope["usage"]
+    assert usage is not None and usage["tokens_known"] is False, (
+        "five billed-but-unreported attempts must not read as a known total")
+    assert "total_tokens" not in usage, (
+        "an unknown cost must not be recorded as a number that can be summed")
+    assert usage["attempts_unknown"] == unsw_ai_budget()
+
+
+def unsw_ai_budget():
+    import unsw_ai
+    return unsw_ai.DEFAULT_RATE_LIMIT_RETRIES + 1
+
+
+# -------------------------------------------------------------------------------------------
+# A RUN-CONFIGURATION FAULT ABORTS AND RECOVERS  (recheck-3 N2, plan T3)
+# -------------------------------------------------------------------------------------------
+
+def test_a_forbidden_model_fallback_aborts_before_any_request_and_recovers(monkeypatch,
+                                                                          tmp_path):
+    """
+    THE CACHE POISONING THIS PINS. The adapter refuses a client with model fallback
+    enabled - correctly - but the refusal was raised as `ParameterNotSupportedError`,
+    which classifies as `request_rejected`: a SETTLED DOCUMENT OUTCOME. All five draws
+    were written as settled failures, and correcting the client configuration then made
+    zero fresh calls and kept zero valid draws, exactly as a mistyped access code once
+    did. How the run is configured is not what the request asked for.
+    """
+    import courseapi
+    import text_features as tf
+
+    requests = {"n": 0}
+
+    def never_called(**kwargs):
+        requests["n"] += 1
+        raise AssertionError("a forbidden fallback must be refused before any request")
+
+    misconfigured = types.SimpleNamespace(
+        settings=types.SimpleNamespace(fallback_models=("some-other-model",)),
+        beta=types.SimpleNamespace(chat=types.SimpleNamespace(
+            completions=types.SimpleNamespace(parse=never_called))),
+        chat=types.SimpleNamespace(completions=types.SimpleNamespace(
+            create_with_completion=never_called)),
+        client=types.SimpleNamespace(responses=types.SimpleNamespace(
+            create=never_called)))
+
+    monkeypatch.setattr(tf, "_schema_model", lambda: _Schema)
+    monkeypatch.setattr(tf, "run_dir", lambda: tmp_path)
+    monkeypatch.setattr(tf.time, "sleep", lambda *a, **k: None)
+
+    indices = [config.CALL_INDEX_BASE + i for i in range(config.N_PARALLEL_CALLS)]
+    survivor = _ok_draw(indices[0])
+    (tmp_path / "2020-05-01.json").write_text(json.dumps([survivor]))
+
+    tf._RUN_ABORTED.clear()
+    monkeypatch.setattr(courseapi.unsw_ai, "get_client", lambda *a, **k: misconfigured)
+    monkeypatch.setattr(tf, "client_", lambda: courseapi.CourseClient())
+    with pytest.raises(courseapi.RunConfigurationError):
+        tf.score_document("2020-05-01", "synthetic")
+
+    assert requests["n"] == 0, "the refusal must happen before any HTTP request"
+    cached = json.loads((tmp_path / "2020-05-01.json").read_text())
+    assert not [c for c in cached if tf._settled_failure(c)], (
+        "a run-configuration fault was written as a settled document outcome")
+    assert survivor in cached, "the draw that already succeeded must survive untouched"
+
+    # The configuration is repaired. No cache is deleted by hand.
+    tf._RUN_ABORTED.clear()
+    calls = {"n": 0}
+
+    def repaired(text, idx):
+        calls["n"] += 1
+        return _ok_draw(idx)
+
+    monkeypatch.setattr(tf, "score_once", repaired)
+    rec = tf.score_document("2020-05-01", "synthetic")
+    assert calls["n"] == config.N_PARALLEL_CALLS - 1, (
+        "exactly the missing draws must be requested - not the one that already worked")
+    assert sum(1 for c in rec["calls"] if c.get("ok")) == config.N_PARALLEL_CALLS
+
+
+# -------------------------------------------------------------------------------------------
+# THE ENVELOPE CONTRACT, WRITER TO LOADER, IN ALL THREE STAGES  (recheck-3 N5, plan T6/T9)
+# -------------------------------------------------------------------------------------------
+
+def _contract_response():
+    import courseapi
+    request = courseapi.effective_request(
+        model=config.MODEL, temperature=config.SAMPLING_TEMPERATURE,
+        max_tokens=config.MAX_OUTPUT_TOKENS)
+    usage = {"input_tokens": 10, "output_tokens": 10, "total_tokens": 20}
+    return types.SimpleNamespace(
+        choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(parsed=_Schema(), content="synthetic text"))],
+        request=request, model=config.MODEL, id="resp_synthetic",
+        usage=dict(usage),
+        call_usage=dict(usage, attempts_counted=1, attempts_unknown=0,
+                        tokens_known=True, is_complete=True),
+        provenance={"envelope_version": 2, "response_status": "completed",
+                    "model_requested": config.MODEL, "model_served": config.MODEL,
+                    "transport_requests": 1})
+
+
+@pytest.mark.parametrize("stage", ["replay", "shock"])
+def test_replay_and_shock_write_and_enforce_the_shared_envelope_contract(monkeypatch,
+                                                                        tmp_path, stage):
+    """
+    THE ASYMMETRY THIS PINS. Words carried a version marker and checked contradictions;
+    Replay and Shock wrote no version at all - so evidence written a minute ago
+    classified itself as "legacy" - and their loaders compared only the request-side
+    fields, so a cache edited to name a different served model with an `incomplete`
+    response status was reused by both.
+    """
+    import decision_replay as dr
+    import scenarios as sc
+
+    mod = dr if stage == "replay" else sc
+    response = _contract_response()
+    client = types.SimpleNamespace(beta=types.SimpleNamespace(chat=types.SimpleNamespace(
+        completions=types.SimpleNamespace(parse=lambda **kw: response))))
+    call = ((lambda: dr._cached_call("probe", "system", "user", schema=_Schema))
+            if stage == "replay" else
+            (lambda: sc.llm_parsed("system", "user", _Schema)))
+
+    monkeypatch.setattr(mod, "RAW_DIR", tmp_path)
+    monkeypatch.setattr(mod, "client_", lambda: client)
+    call()
+    paths = list(tmp_path.glob("*.json"))
+    assert len(paths) == 1, f"{stage} wrote {len(paths)} cache files"
+    path, saved = paths[0], json.loads(paths[0].read_text())
+    pristine = path.read_text()
+
+    import courseapi
+    assert saved.get("envelope_version") == courseapi.ENVELOPE_VERSION, (
+        f"{stage} writes no envelope version, so its own fresh evidence reads as legacy")
+    assert saved.get("usage") is not None and saved.get("transport_requests") is not None
+
+    def reuses_cache():
+        """True when the loader served the cache without calling."""
+        monkeypatch.setattr(mod, "client_", _explode)
+        try:
+            value = call()
+        except Exception:                                # noqa: BLE001
+            return False
+        # Replay returns a failed record rather than raising when it refuses a cache.
+        return not (isinstance(value, dict) and value.get("ok") is False)
+
+    assert reuses_cache(), "an unchanged valid record must replay without a request"
+
+    for field, value in (("model_served", "other-model"), ("model", "other-model"),
+                         ("temperature", 9), ("prompt_sha", "not-this-prompt"),
+                         ("envelope_version", 99), ("envelope_version", True)):
+        path.write_text(json.dumps(dict(saved, **{field: value})))
+        assert not reuses_cache(), (
+            f"{stage} reused a cached record whose {field} was changed to {value!r}")
+        path.write_text(pristine)
+
+    path.write_text(json.dumps(dict(
+        saved, provenance=dict(saved["provenance"], response_status="incomplete"))))
+    assert not reuses_cache(), (
+        f"{stage} reused a record marked ok with a non-terminal response status")
+    path.write_text(pristine)
+    assert reuses_cache(), "the restored control must replay again"
+
+
+def _explode(*a, **k):
+    raise RuntimeError("this call must be served from cache")
+
+
+@pytest.mark.parametrize("version,accepted", [
+    (None, True),        # genuine legacy: absence is classified, never back-filled
+    (2, True),           # the current contract
+    (99, False),         # a future contract this code cannot read
+    (True, False),       # a boolean is not a version
+    ("2", False),        # nor is a string
+])
+def test_words_version_boundaries(monkeypatch, tmp_path, version, accepted):
+    import text_features as tf
+
+    monkeypatch.setattr(tf, "_schema_model", lambda: _Schema)
+    monkeypatch.setattr(tf, "run_dir", lambda: tmp_path)
+    indices = [config.CALL_INDEX_BASE + i for i in range(config.N_PARALLEL_CALLS)]
+    draws = []
+    for i in indices:
+        rec = _ok_draw(i)
+        if version is None:
+            rec.pop("envelope_version")
+        else:
+            rec["envelope_version"] = version
+        draws.append(rec)
+    (tmp_path / "2020-08-01.json").write_text(json.dumps(draws))
+
+    if accepted:
+        out = tf.score_document("2020-08-01", "synthetic", offline=True)
+        assert out["cached"] and len(out["calls"]) == config.N_PARALLEL_CALLS
+    else:
+        with pytest.raises(RuntimeError, match="offline"):
+            tf.score_document("2020-08-01", "synthetic", offline=True)
+
+
+def test_a_current_success_without_response_provenance_is_refused(monkeypatch, tmp_path):
+    """A version-2 success with no provenance, served model, usage or transport count
+    claims a contract it does not keep. Absence is a defect in a CURRENT record."""
+    import text_features as tf
+
+    monkeypatch.setattr(tf, "_schema_model", lambda: _Schema)
+    monkeypatch.setattr(tf, "run_dir", lambda: tmp_path)
+    indices = [config.CALL_INDEX_BASE + i for i in range(config.N_PARALLEL_CALLS)]
+    for dropped in ("provenance", "model_served", "usage", "transport_requests"):
+        draws = []
+        for i in indices:
+            rec = _ok_draw(i)
+            rec.pop(dropped, None)
+            draws.append(rec)
+        (tmp_path / "2020-09-01.json").write_text(json.dumps(draws))
+        with pytest.raises(RuntimeError, match="offline"):
+            tf.score_document("2020-09-01", "synthetic", offline=True)
+
+
+# -------------------------------------------------------------------------------------------
+# THE EXPOSURE LOG IS THE AUTHORITY, AND THE VALIDATOR READS IT  (recheck-3 N1, plan T1/T2)
+# -------------------------------------------------------------------------------------------
+
+def _submission_module():
+    import importlib.util
+    here = pathlib.Path(__file__).resolve().parent
+    spec = importlib.util.spec_from_file_location(
+        "submission_under_test", here / "test_submission.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture()
+def two_exposures(monkeypatch, tmp_path):
+    """Exposure A, a DECLARED revalidation, then exposure B - the legitimate sequence.
+
+    This is the workflow the design exists to support, and the first version of the
+    submission check rejected it: it required every event in the history to carry the
+    CURRENT selection hash, which is false of A by construction.
+    """
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    monkeypatch.setattr(dr, "SELECTION_STAMP", outputs / "replay_selection.json")
+    monkeypatch.setattr(dr, "EXPOSURE_LOG", outputs / "replay_exposures.jsonl")
+    monkeypatch.setattr(dr, "dev_sample", lambda *a, **k: ["2020-01-01"])
+    monkeypatch.setattr(dr, "holdout_sample", lambda *a, **k: ["2020-02-01"])
+
+    dr.freeze_selection()
+    a = dr.record_holdout_exposure("first exposure")
+    dr.close_holdout_exposure(a["event_id"], "benchmark completed")
+
+    base = config.CALL_INDEX_BASE
+    monkeypatch.setattr(config, "CALL_INDEX_BASE", base + 100)
+    dr.freeze_selection(revalidate=True, note="declared second experiment")
+    b = dr.record_holdout_exposure("second exposure")
+    dr.close_holdout_exposure(b["event_id"], "benchmark completed")
+
+    sub = _submission_module()
+    monkeypatch.setattr(sub, "ROOT", tmp_path)
+
+    def artefact(event_id=None, events=None):
+        return {"selection": dr._read_selection(),
+                "exposure": {
+                    "events": dr.exposure_events() if events is None else events,
+                    "evidence_status": dr.evidence_status(),
+                    "holdout_event_id": event_id or b["event_id"]}}
+
+    def validate(**kw):
+        monkeypatch.setattr(sub, "_artefact", lambda name: artefact(**kw))
+        sub.test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposure()
+
+    return types.SimpleNamespace(a=a, b=b, log=dr.EXPOSURE_LOG, validate=validate,
+                                 artefact=artefact, sub=sub, tmp=tmp_path)
+
+
+def test_a_declared_revalidation_passes_the_submission_check(two_exposures):
+    """The control. Every rejection test below starts from this passing state."""
+    two_exposures.validate()
+    assert len(dr.exposures_recorded()) == 2, "both exposures must remain in the history"
+    assert dr.evidence_status() == "retrospective"
+
+
+def test_the_submission_check_reads_the_committed_log_not_the_embedded_copy(two_exposures):
+    """
+    Deleting the append-only log left the check green, because it only ever read the list
+    copied into replay.json - and a copy of a record is not evidence of the record.
+    """
+    # The artefact keeps the copy it was written with, as a real replay.json would;
+    # only the committed log goes missing.
+    embedded = dr.exposure_events()
+    two_exposures.log.unlink()
+    with pytest.raises(AssertionError, match="is missing"):
+        two_exposures.validate(events=embedded)
+
+
+@pytest.mark.parametrize("damage,label", [
+    ("not json at all", "a line that is not JSON"),
+    ("42", "a JSON scalar where an event belongs"),
+])
+def test_a_damaged_log_is_rejected_rather_than_read_as_a_shorter_history(two_exposures,
+                                                                        damage, label):
+    original = two_exposures.log.read_text(encoding="utf-8")
+    two_exposures.log.write_text(original + damage + "\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="damaged"):
+        two_exposures.validate()
+    two_exposures.log.write_text(original, encoding="utf-8")
+    two_exposures.validate()          # control restored
+
+
+def test_an_event_missing_a_required_field_is_damage(two_exposures):
+    lines = two_exposures.log.read_text(encoding="utf-8").splitlines()
+    stripped = json.loads(lines[0])
+    stripped.pop("freeze_id")
+    two_exposures.log.write_text(
+        "\n".join([json.dumps(stripped)] + lines[1:]) + "\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="damaged"):
+        two_exposures.validate()
+
+
+def test_the_reported_benchmark_must_name_an_event_of_the_current_freeze(two_exposures):
+    with pytest.raises(AssertionError, match="names"):
+        two_exposures.validate(event_id="deadbeef1234")
+    # A's event is real and legitimate HISTORY, but it is not what this report rests on.
+    with pytest.raises(AssertionError, match="belongs to exposure"):
+        two_exposures.validate(event_id=two_exposures.a["event_id"])
+    two_exposures.validate()          # control restored
+
+
+def test_a_substituted_history_is_rejected(two_exposures):
+    only_b = [e for e in dr.exposure_events()
+              if e.get("event_id") == two_exposures.b["event_id"]]
+    with pytest.raises(AssertionError, match="not the history"):
+        two_exposures.validate(events=only_b)
+
+
+def test_the_runtime_refuses_to_count_a_damaged_history(two_exposures):
+    """
+    A count derived from a damaged log is not a count. Reading the damage as "zero
+    exposures so far" would have bought another look at the held-out sample.
+    """
+    original = two_exposures.log.read_text(encoding="utf-8")
+    two_exposures.log.write_text(original + "malformed event\n", encoding="utf-8")
+    for call in (dr._require_frozen_selection, dr.record_holdout_exposure,
+                 dr.freeze_selection):
+        with pytest.raises(RuntimeError, match="damaged"):
+            call()
+    two_exposures.log.write_text(original, encoding="utf-8")
+    dr._require_frozen_selection()    # control restored
+
+
+def test_a_cache_only_replay_keeps_the_exposure_its_evidence_came_from(two_exposures):
+    """
+    Re-running the stage from committed caches asks the holdout nothing, so it records no
+    new event - but the numbers it reports still belong to the exposure that produced
+    them. Writing `null` there severed the report from its own evidence.
+    """
+    assert dr.originating_exposure_id() == two_exposures.b["event_id"]
+    assert dr.originating_exposure_id() is not None
+
+
+def test_an_unclosed_exposure_is_not_a_finished_benchmark(two_exposures, monkeypatch):
+    lines = [json.loads(x) for x in
+             two_exposures.log.read_text(encoding="utf-8").splitlines()]
+    kept = [x for x in lines
+            if not (x.get("type") == "close"
+                    and x.get("event_id") == two_exposures.b["event_id"])]
+    two_exposures.log.write_text(
+        "\n".join(json.dumps(x) for x in kept) + "\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="never closed"):
+        two_exposures.validate()
+
+
+# -------------------------------------------------------------------------------------------
+# THE EXPOSURE IS DURABLE BEFORE ANY WORKER REQUESTS HOLDOUT DATA  (recheck-3, plan T7)
+# -------------------------------------------------------------------------------------------
+
+def _holdout_workers(monkeypatch, tmp_path, append=None, workers=8):
+    """Start `workers` threads at a barrier, all entering the holdout path together.
+
+    A BARRIER, NOT A SLEEP. Timing-dependent tests pass on a fast machine for the wrong
+    reason; the barrier makes every worker arrive at the same instant on every machine.
+    """
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    monkeypatch.setattr(dr, "SELECTION_STAMP", outputs / "replay_selection.json")
+    monkeypatch.setattr(dr, "EXPOSURE_LOG", outputs / "replay_exposures.jsonl")
+    monkeypatch.setattr(dr, "dev_sample", lambda *a, **k: ["2020-01-01"])
+    monkeypatch.setattr(dr, "holdout_sample", lambda *a, **k: ["2020-02-01"])
+    dr.freeze_selection()
+    if append is not None:
+        monkeypatch.setattr(dr, "_append_event", append)
+
+    monkeypatch.setattr(dr, "_CURRENT_SAMPLE", "holdout")
+    monkeypatch.setattr(dr, "_EXPOSURE_RECORDED", False)
+    monkeypatch.setattr(dr, "_EXPOSURE_EVENT", None)
+
+    barrier = threading.Barrier(workers)
+    observed, errors = [], []
+
+    def worker():
+        barrier.wait()
+        try:
+            with dr._EXPOSURE_LOCK:
+                if not dr._EXPOSURE_RECORDED:
+                    dr._EXPOSURE_EVENT = dr.record_holdout_exposure("concurrent")
+                    dr._EXPOSURE_RECORDED = True
+            # Standing in for "this worker now makes its first request": what the log
+            # holds at this instant is what the request would be covered by.
+            observed.append(len(dr.exposures_recorded()))
+        except Exception as exc:                         # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return observed, errors
+
+
+def test_exactly_one_exposure_is_durable_before_any_worker_proceeds(monkeypatch,
+                                                                    tmp_path):
+    observed, errors = _holdout_workers(monkeypatch, tmp_path)
+    assert not errors, errors
+    assert observed and set(observed) == {1}, (
+        f"workers saw {sorted(set(observed))} recorded exposures; every one of them must "
+        f"see exactly the single durable event before it would make a request")
+    assert len(dr.exposures_recorded()) == 1
+
+
+def test_a_failed_append_lets_no_worker_reach_transport(monkeypatch, tmp_path):
+    """
+    If the event cannot be made durable, nothing may proceed as though it had been. The
+    flag must not be set, and the failure must surface rather than being swallowed.
+    """
+    def broken_append(event):
+        raise OSError("synthetic: the exposure log could not be written")
+
+    observed, errors = _holdout_workers(monkeypatch, tmp_path, append=broken_append)
+    assert not observed, (
+        "a worker carried on to make a request after the exposure record failed to write")
+    assert errors and all(isinstance(e, OSError) for e in errors), errors
+    assert dr._EXPOSURE_RECORDED is False, (
+        "a failed append must not leave the run believing the exposure was recorded")
+    assert not dr.exposures_recorded()
+
+
+# -------------------------------------------------------------------------------------------
+# FILTERED DRAWS: TOLERATED VS BLOCKING  (recheck-3 N6, plan T10)
+# -------------------------------------------------------------------------------------------
+
+def _parsed_payload():
+    import text_features as tf
+    payload = {}
+    for field in tf.FIELDS:
+        payload[field] = 5.0
+        if tf.REQUIRE_EVIDENCE:
+            payload[f"{field}_evidence"] = "the Board judged"
+    return payload
+
+
+def _filtered_draw(idx):
+    return {"ok": False, "call_index": config.CALL_INDEX_BASE + idx,
+            "error": "ContentFilteredError: synthetic",
+            "failure": {"category": "content_filter", "settled": True,
+                        "run_level": False, "error_type": "ContentFilteredError"}}
+
+
+@pytest.mark.parametrize("n_valid", [config.MIN_VALID_CALLS,
+                                     config.N_PARALLEL_CALLS - 1])
+def test_filtered_draws_are_tolerated_while_enough_valid_ones_remain(n_valid):
+    """
+    The rubric's first filter row promises the document still scores. It only does while
+    `MIN_VALID_CALLS` draws came back, which is exactly the distinction the rubric used
+    to leave out.
+    """
+    import pandas as pd
+    import text_features as tf
+
+    calls = [{"ok": True, "call_index": config.CALL_INDEX_BASE + i,
+              "parsed": _parsed_payload()} for i in range(n_valid)]
+    calls += [_filtered_draw(i) for i in range(n_valid, config.N_PARALLEL_CALLS)]
+    docs = pd.DataFrame([{"meeting_date": "2020-01-01",
+                          "text_scored": "the Board judged that conditions warranted"}])
+    df, _ev = tf.aggregate([{"meeting_date": "2020-01-01", "calls": calls}], docs)
+    assert len(df) == 1
+    assert int(df.iloc[0]["n_calls_valid"]) == n_valid
+
+
+def test_a_document_filtered_below_the_minimum_stops_the_stage_with_usable_advice():
+    """
+    Below the minimum the stage must stop rather than average what is left - and say
+    something a team can act on. "Re-run" is the wrong advice: a filtered draw is settled,
+    so an unchanged re-run makes no calls at all and the loop cannot terminate.
+    """
+    import pandas as pd
+    import text_features as tf
+
+    calls = [_filtered_draw(i) for i in range(config.N_PARALLEL_CALLS)]
+    docs = pd.DataFrame([{"meeting_date": "2020-01-01", "text_scored": "synthetic"}])
+    with pytest.raises(RuntimeError) as caught:
+        tf.aggregate([{"meeting_date": "2020-01-01", "calls": calls}], docs)
+    message = str(caught.value)
+    assert "content_filter" in message, "the message must say WHY the draws failed"
+    assert "will not clear it" in message
+    assert "DO NOT edit the corpus" in message
+    assert "email the lecturer" in message
+
+
+def test_a_truncated_document_below_the_minimum_is_told_to_raise_the_ceiling():
+    """A different cause needs different advice; one generic message served neither."""
+    import pandas as pd
+    import text_features as tf
+
+    calls = [dict(_filtered_draw(i),
+                  failure={"category": "truncated", "settled": True, "run_level": False,
+                           "error_type": "IncompleteResponseError"})
+             for i in range(config.N_PARALLEL_CALLS)]
+    docs = pd.DataFrame([{"meeting_date": "2020-01-01", "text_scored": "synthetic"}])
+    with pytest.raises(RuntimeError, match="MAX_OUTPUT_TOKENS"):
+        tf.aggregate([{"meeting_date": "2020-01-01", "calls": calls}], docs)

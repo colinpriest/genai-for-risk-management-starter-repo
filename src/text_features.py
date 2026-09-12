@@ -439,17 +439,26 @@ def score_once(text: str, call_index: int) -> dict:
                 "config_hash": call_config_hash(),
                 "prompt_hash": _prompt_hash(),
                 "request_id": getattr(r, "id", None),
-                "usage": getattr(r, "usage", None),
+                # THE BILL for this draw, across every attempt it took - including the
+                # ones instructor repaired away. `usage_final_response` is the last
+                # response's own figure, kept separately so the two are never confused.
+                "usage": courseapi.merge_usage(spent_usage,
+                                               getattr(r, "call_usage", None)),
+                "usage_final_response": getattr(r, "usage", None),
                 "attempt": attempt + 1,
-                "transport_requests": (getattr(r, "provenance", None) or {}
-                                       ).get("transport_requests"),
+                "transport_requests": transport + ((getattr(r, "provenance", None) or {}
+                                                   ).get("transport_requests") or 0),
                 "envelope_version": courseapi.ENVELOPE_VERSION,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         except Exception as e:  # noqa: BLE001
             failure = courseapi.describe_failure(e, request=request)
-            transport += courseapi.transport_attempts(e) or 1
-            spent_usage = courseapi.failed_attempt_usage(e) or spent_usage
+            # ACCUMULATED ACROSS OUTER ATTEMPTS, and `0` is a real answer: a failure
+            # raised before any request left cost no requests, and `or 1` said it cost one.
+            attempted = courseapi.transport_attempts(e)
+            transport += attempted if isinstance(attempted, int) else 1
+            spent_usage = courseapi.merge_usage(
+                spent_usage, courseapi.failed_attempt_usage(e))
             # A RUN-LEVEL failure is not this call's failure, it is the end of the run:
             # every remaining call will fail the same way, and the fix is outside the
             # repository. Recording it as a failed call instead let one run mark 66 calls
@@ -536,17 +545,11 @@ _RUN_LEVEL_ERRORS = (
 )
 
 
-def envelope_generation(call: dict) -> str:
-    """"current" if this record was written under the versioned contract, else "legacy".
-
-    Evidence committed before the move to the course proxy genuinely lacks fields that
-    did not exist when it was written. That is a different thing from a current record
-    with a field missing, and the difference decides what may be concluded: a legacy
-    envelope is classified as "fields unavailable", never back-filled with a value
-    invented now. See courseapi.ENVELOPE_VERSION.
-    """
-    v = call.get("envelope_version")
-    return "current" if isinstance(v, int) and v >= courseapi.ENVELOPE_VERSION else "legacy"
+#: THE SHARED CONTRACT, not a Words-local copy. Replay and Shock validate against the
+#: same definition, because three stages with three private ideas of what an envelope
+#: guarantees is how two of them ended up writing no version at all and reusing a cache
+#: that named a different deployment.
+envelope_generation = courseapi.envelope_generation
 
 
 def failure_category(call: dict) -> str | None:
@@ -655,64 +658,10 @@ def _prompt_hash() -> str:
     return _sha(SYSTEM_PROMPT + json.dumps(CONSTRUCTS, sort_keys=True))
 
 
-#: What a record written under courseapi.ENVELOPE_VERSION always carries. Checked on
-#: load, so "field missing from a current record" is a defect rather than something to
-#: shrug at, and legacy evidence is classified rather than back-filled.
-_REQUIRED_FIELDS = {
-    True:  ("call_index", "config_hash", "request", "model", "temperature",
-            "prompt_hash", "parsed", "timestamp"),
-    False: ("call_index", "config_hash", "request", "model", "temperature",
-            "failure", "timestamp"),
-}
-
-
 def _envelope_contradictions(call: dict) -> list[str]:
-    """Fields inside one envelope that disagree with each other or with this run.
-
-    A MATCHING `config_hash` IS NOT PROVENANCE. It says the run was configured the same
-    way; it says nothing about what the envelope itself claims. A hand-written cache
-    naming a different model, a temperature of 9, an unrelated prompt and a response
-    status of `incomplete` used to load and score, because nothing ever compared the
-    envelope's own fields against the configuration whose hash it carried.
-
-    ONLY FIELDS THAT ARE PRESENT ARE CHECKED. Absence in a legacy record means the field
-    did not exist when it was written, and inventing a value for it now would be exactly
-    the false provenance this validation exists to prevent.
-    """
-    bad: list[str] = []
-    current = envelope_generation(call) == "current"
-
-    def check(field, actual, expected):
-        if actual is not None and actual != expected:
-            bad.append(f"{field}={actual!r}, but this run is {expected!r}")
-
-    check("model", call.get("model"), config.MODEL)
-    check("temperature", call.get("temperature"), config.SAMPLING_TEMPERATURE)
-    check("prompt_hash", call.get("prompt_hash"), _prompt_hash())
-    req = call.get("request") or {}
-    check("request.model", req.get("model"), config.MODEL)
-    check("request.temperature", req.get("temperature"), config.SAMPLING_TEMPERATURE)
-
-    prov = call.get("provenance") or {}
-    # NO SILENT MODEL SUBSTITUTION, on the way back in as well as on the way out. An
-    # envelope whose served model differs from the one it requested is a record of an
-    # answer some other deployment produced.
-    served = call.get("model_served") or prov.get("model_served")
-    requested = prov.get("model_requested") or call.get("model") or config.MODEL
-    if served is not None and served != requested:
-        bad.append(f"model_served={served!r} but model_requested={requested!r}: "
-                   f"this answer came from a different deployment")
-    status = prov.get("response_status")
-    if call.get("ok") and status is not None and status != "completed":
-        bad.append(f"marked ok with response_status={status!r}: an unfinished response "
-                   f"is a fragment, not a result")
-    if current:
-        missing = [f for f in _REQUIRED_FIELDS[bool(call.get("ok"))]
-                   if call.get(f) is None]
-        if missing:
-            bad.append(f"declares envelope_version {call.get('envelope_version')} but "
-                       f"is missing {missing}")
-    return bad
+    """Words' view of the shared contract: adds the rubric identity to the common checks."""
+    return courseapi.envelope_contradictions(
+        call, config_hash=call_config_hash(), prompt_hash=_prompt_hash())
 
 
 def _archive_superseded(out, dropped: list[tuple[dict, str]]) -> None:
@@ -926,10 +875,39 @@ def aggregate(records: list[dict], docs: pd.DataFrame) -> tuple[pd.DataFrame, di
     for rec in records:
         ok = [c["parsed"] for c in rec["calls"] if c.get("ok")]
         if len(ok) < config.MIN_VALID_CALLS:
+            # WHY it is short decides what to do about it, and "re-run" is the wrong
+            # advice for most of the reasons. A filtered document is settled: an
+            # unchanged re-run makes no calls at all by design, so telling a team to
+            # re-run sends them round a loop that cannot terminate.
+            reasons = {}
+            for call in rec["calls"]:
+                if call.get("ok"):
+                    continue
+                cat = (failure_category(call)
+                       or _error_name(call) or "unrecorded")
+                reasons[cat] = reasons.get(cat, 0) + 1
+            blocked = reasons.get("content_filter", 0)
+            if blocked and blocked + len(ok) >= config.N_PARALLEL_CALLS - len(ok):
+                advice = (
+                    f"{blocked} draw(s) were stopped by the content filter, which is "
+                    f"deterministic: re-running the same document at the same settings "
+                    f"makes no new calls and will not clear it. DO NOT edit the corpus - "
+                    f"it is hash-checked and editing it invalidates the run. This is an "
+                    f"approved-service failure: report the blocked document and the "
+                    f"filter's reason in your Words write-up, email the lecturer before "
+                    f"the deadline (brief S6 step 3), and see the rubric's "
+                    f"approved-service table for what is waived.")
+            elif reasons.get("truncated"):
+                advice = (f"{reasons['truncated']} draw(s) hit the output ceiling. Raise "
+                          f"config.MAX_OUTPUT_TOKENS and re-run - only the truncated "
+                          f"draws are re-asked.")
+            else:
+                advice = ("Re-run to fill the missing draws; do not proceed on partial "
+                          "data.")
             raise RuntimeError(
-                f"{rec['meeting_date']}: only {len(ok)} valid calls, "
-                f"minimum is {config.MIN_VALID_CALLS}. Re-run; do not proceed on partial "
-                f"data.")
+                f"{rec['meeting_date']}: only {len(ok)} valid calls, minimum is "
+                f"{config.MIN_VALID_CALLS}. Failed draws: "
+                f"{ {k: v for k, v in sorted(reasons.items())} }.\n{advice}")
         row = {"meeting_date": rec["meeting_date"], "n_calls_valid": len(ok)}
         for f in FIELDS:
             v = np.array([c[f] for c in ok if f in c], dtype=float) / span
@@ -1366,8 +1344,10 @@ def run_pilot(dry_run: bool = False, offline: bool = False) -> pd.DataFrame | No
     the full pass reports - spread, concentration, effective bins, separation and
     orientation - for about a seventh of the tokens.
 
-    IT WRITES AN AUDIT FILE, one per scoring configuration, under
-    `outputs/words_pilot/<call-hash>.json`. That is deliberate: the rubric awards the
+    IT WRITES AN AUDIT FILE, one per AUDIT, under
+    `outputs/words_pilot/<call-hash>-<audit-id>.json`. The call hash identifies the
+    scoring configuration; the audit id additionally covers the gates, the output ceiling
+    and the sample, so two audits of the same calls under different gates are two files. That is deliberate: the rubric awards the
     iteration marks for a before-and-after audit pair, and an earlier version printed
     those tables to the terminal and threw them away - so following the supplied command
     produced none of the evidence the marks are for. Each file records the documents
