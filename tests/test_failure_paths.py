@@ -2378,6 +2378,7 @@ def _relabelled(two_exposures, **changes):
     ("log_loss_declared", True),
     ("exposures_still_missing", 1),
     ("log_loss_in_effect", True),
+    ("origin_declared", True),
 ])
 def test_a_report_cannot_misstate_one_fact_about_its_own_evidence(two_exposures,
                                                                   field, value):
@@ -2410,7 +2411,7 @@ def test_a_status_the_files_do_not_support_is_rejected_even_with_true_flags(two_
 
 
 _LATER_FLAGS = ("exposures_declared_lost", "log_loss_declared",
-                "exposures_still_missing", "log_loss_in_effect")
+                "exposures_still_missing", "log_loss_in_effect", "origin_declared")
 
 
 def test_a_report_written_before_the_lost_log_flags_existed_still_passes(two_exposures):
@@ -2696,7 +2697,27 @@ def test_a_cache_only_replay_keeps_the_exposure_its_evidence_came_from(two_expos
     assert dr.originating_exposure_id() is not None
 
 
-def test_an_unclosed_exposure_is_not_a_finished_benchmark(two_exposures, monkeypatch):
+def test_an_unclosed_exposure_is_not_a_finished_benchmark(cached_holdout):
+    """A benchmark that never finished - its exposure opened and never closed - is no result."""
+    dr.freeze_selection()
+    event = dr.record_holdout_exposure("a look that never finished")
+    report = {"selection": dr._read_selection(),
+              "exposure": {"events": dr.exposure_events(),
+                           "evidence_status": dr.evidence_status(),
+                           "evidence_flags": dr.evidence_flags(),
+                           "holdout_event_id": event["event_id"]}}
+    with pytest.raises(AssertionError, match="never closed"):
+        cached_holdout.submit(report)
+
+
+def test_a_finished_benchmark_whose_close_was_deleted_is_a_missing_record(two_exposures):
+    """
+    (recheck-7 U1) Deleting a finished benchmark's close line used to leave an exposure every
+    check read as merely unclosed - and an unclosed exposure of the current freeze is one a
+    run resumes, with new requests. The freeze now records the completion, so the deletion is
+    a MISSING RECORD: refused by the runtime and at submission until it is restored or
+    declared, and the benchmark stays finished either way.
+    """
     lines = [json.loads(x) for x in
              two_exposures.log.read_text(encoding="utf-8").splitlines()]
     kept = [x for x in lines
@@ -2704,8 +2725,21 @@ def test_an_unclosed_exposure_is_not_a_finished_benchmark(two_exposures, monkeyp
                     and x.get("event_id") == two_exposures.b["event_id"])]
     two_exposures.log.write_text(
         "\n".join(json.dumps(x) for x in kept) + "\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="record of it finishing"):
+        two_exposures.validate()
+    with pytest.raises(RuntimeError, match="record of it finishing"):
+        dr.require_readable_log()
+    assert dr.open_exposure(two_exposures.b["freeze_id"]) is None, (
+        "a benchmark the freeze recorded as finished must not be resumable")
+
+    dr.freeze_selection(lost_log=True, note="synthetic: the log could not be restored")
+    dr.require_readable_log()
+    assert dr.open_exposure(two_exposures.b["freeze_id"]) is None
     with pytest.raises(AssertionError, match="never closed"):
         two_exposures.validate()
+    dr.close_holdout_exposure(two_exposures.b["event_id"],
+                              "benchmark completed (replayed from committed cache)")
+    two_exposures.validate()
 
 
 # -------------------------------------------------------------------------------------------
@@ -3554,3 +3588,609 @@ def test_every_request_count_equals_what_reached_the_network(route, outcome, tmp
         f"request(s); {len(sent)} were sent")
     if outcome in _T4_REFUSED_BEFORE_SENDING:
         assert client.usage.report() == "No requests recorded."
+
+
+# -------------------------------------------------------------------------------------------
+# A FINISHED BENCHMARK STAYS FINISHED  (recheck-7 U1)
+# -------------------------------------------------------------------------------------------
+# Completion was reconstructed from readable close lines alone. Every fresh request below is a
+# REAL cache miss through `_cached_call`, the course adapter and the wrapper's real
+# ProxyTransport; only the network behind them is scripted, and every request it receives is
+# counted. The earlier damage tests exercised cached replay, which never reaches the decision
+# to send one.
+
+def _holdout_request(monkeypatch, tmp_path, label):
+    """One real cache miss on the holdout. Returns (the exposure event or the refusal, requests)."""
+    import warnings
+    import httpx
+    import openai
+    from pydantic import BaseModel
+    import courseapi
+    import unsw_ai
+
+    class HoldoutProbe(BaseModel):
+        value: int
+
+    sent = []
+
+    def network(request):
+        sent.append(request)
+        return httpx.Response(200, json={
+            "id": "resp_synthetic", "object": "response", "created_at": 1,
+            "model": config.MODEL, "status": "completed", "incomplete_details": None,
+            "output": [{"type": "function_call", "id": "f", "call_id": "c",
+                        "name": "HoldoutProbe", "arguments": '{"value":1}',
+                        "status": "completed"}],
+            "usage": {"input_tokens": 10, "output_tokens": 10, "total_tokens": 20}})
+
+    built = []
+
+    def build(settings, **kwargs):
+        proxy = unsw_ai.ProxyTransport(settings, inner=httpx.MockTransport(network),
+                                       token_limiter=kwargs.get("token_limiter"))
+        built.append(openai.OpenAI(api_key="synthetic", base_url="https://synthetic.invalid",
+                                   max_retries=0, http_client=httpx.Client(transport=proxy)))
+        return built[-1]
+
+    settings = unsw_ai.ProxySettings(proxy_url="https://synthetic.invalid",
+                                     access_code="synthetic", student_id="9999999",
+                                     fallback_models=())
+    raw = tmp_path / f"raw-{len(list(tmp_path.glob('raw-*')))}"
+    raw.mkdir()
+    with monkeypatch.context() as m:
+        m.setattr(unsw_ai, "build_openai_client", build)
+        m.setattr(unsw_ai.time, "sleep", lambda *a, **k: None)
+        m.setattr(config, "ledger_add", lambda *a, **k: None)
+        m.setattr(dr, "RAW_DIR", raw)
+        m.setattr(dr, "_CURRENT_SAMPLE", "holdout")
+        m.setattr(dr, "_EXPOSURE_RECORDED", False)
+        m.setattr(dr, "_EXPOSURE_EVENT", None)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            client = unsw_ai.UNSWInstructor(settings=settings)
+            m.setattr(unsw_ai, "get_client", lambda *a, **k: client)
+            m.setattr(dr, "client_", lambda *a, **k: courseapi.CourseClient())
+            try:
+                dr._cached_call("probe", "system", f"synthetic holdout question: {label}",
+                                schema=HoldoutProbe)
+                outcome = dr._EXPOSURE_EVENT
+            except RuntimeError as exc:
+                outcome = exc
+    for sdk in built:
+        sdk.close()
+    return outcome, len(sent)
+
+
+_COMPLETION_LOSS = ("malformed close line", "incomplete close object",
+                    "truncated close line", "missing close line")
+
+
+@pytest.mark.parametrize("loss", _COMPLETION_LOSS)
+def test_a_finished_benchmark_is_not_resumed_when_its_close_record_is_lost(
+        cached_holdout, monkeypatch, tmp_path, loss):
+    """
+    THE DEFECT THIS PINS (U1). With a finished benchmark's close line corrupted and the damage
+    declared, a genuine cache miss reopened the exposure: one new request went to the held-out
+    meetings as a "resumed" run, the count and the allowance stayed at one, and submission
+    accepted the result. A resume now needs the freeze's own record that the benchmark did
+    not finish; a further look is a separate, authorised exposure.
+    """
+    w = cached_holdout
+    dr.freeze_selection()
+    first, sent = _holdout_request(monkeypatch, tmp_path, "the one look")
+    assert sent == 1 and not first["resumed"]
+    origin = first["event_id"]
+    dr.close_holdout_exposure(origin, "benchmark completed")
+    assert dr._read_selection()["exposure_stamps"][0]["closed_at"], (
+        "the freeze must record that the benchmark finished")
+
+    lines = w.lines()
+    close_at = next(i for i, line in enumerate(lines)
+                    if json.loads(line).get("type") == "close")
+    newline_at_end = True
+    if loss == "malformed close line":
+        lines[close_at] = "{synthetic damaged close"
+    elif loss == "incomplete close object":
+        event = json.loads(lines[close_at])
+        event.pop("at")
+        lines[close_at] = json.dumps(event, sort_keys=True)
+    elif loss == "truncated close line":
+        lines[close_at] = lines[close_at][: len(lines[close_at]) // 2]
+        newline_at_end = close_at != len(lines) - 1
+    else:
+        del lines[close_at]
+    w.write(lines, newline_at_end=newline_at_end)
+
+    with pytest.raises(RuntimeError, match="damaged|record of it finishing"):
+        dr.require_readable_log()
+    _declare()
+    dr.require_readable_log()
+
+    refused, sent = _holdout_request(monkeypatch, tmp_path, "a look after the loss")
+    assert isinstance(refused, RuntimeError) and "authorises" in str(refused), refused
+    assert sent == 0, f"{loss}: {sent} request(s) reached the held-out meetings"
+    assert dr.known_exposure_count() == 1
+    assert dr._read_selection()["authorised_exposures"] == 1
+
+    # CACHED RECOVERY IS UNAFFECTED, and asks nothing.
+    recovered = w.benchmark()
+    assert recovered.attrs["exposure_event_id"] == origin
+    assert w.requests["n"] == 0
+    w.submit(w.report(recovered))
+
+    # ANOTHER LOOK IS A SEPARATE, AUTHORISED EXPOSURE - with its own id, count and history.
+    dr.freeze_selection(revalidate=True, note="synthetic: a declared second look")
+    second, sent = _holdout_request(monkeypatch, tmp_path, "the declared second look")
+    assert sent == 1 and not second["resumed"]
+    assert second["event_id"] != origin and second["sequence"] == 2
+    assert dr.known_exposure_count() == 2
+    dr.close_holdout_exposure(second["event_id"], "benchmark completed")
+    latest = w.benchmark()
+    assert latest.attrs["exposure_event_id"] == second["event_id"]
+    w.submit(w.report(latest))
+
+
+def test_an_interrupted_benchmark_is_resumed_as_the_same_exposure(cached_holdout, monkeypatch,
+                                                                 tmp_path):
+    """The control for U1: a benchmark that genuinely never finished resumes, uncounted."""
+    w = cached_holdout
+    dr.freeze_selection()
+    first, sent = _holdout_request(monkeypatch, tmp_path, "the look, interrupted")
+    assert sent == 1 and not first["resumed"]
+    assert dr._read_selection()["exposure_stamps"][0]["closed_at"] is None, (
+        "the freeze must record, when the exposure opens, that its benchmark has not finished")
+
+    again, sent = _holdout_request(monkeypatch, tmp_path, "the same look, resumed")
+    assert sent == 1 and again["resumed"] and again["event_id"] == first["event_id"]
+    assert dr.known_exposure_count() == 1
+    dr.close_holdout_exposure(first["event_id"], "benchmark completed")
+    done = w.benchmark()
+    assert done.attrs["exposure_event_id"] == first["event_id"]
+    w.submit(w.report(done))
+    assert dr.evidence_status() == "prospective"
+
+
+def test_an_open_benchmark_is_not_resumed_past_damage_that_may_be_its_close(
+        cached_holdout, monkeypatch, tmp_path):
+    dr.freeze_selection()
+    _, sent = _holdout_request(monkeypatch, tmp_path, "the look, interrupted")
+    assert sent == 1
+    with dr.EXPOSURE_LOG.open("ab") as fh:
+        fh.write(b"{synthetic damage after the open record\n")
+    _declare()
+    refused, sent = _holdout_request(monkeypatch, tmp_path, "an attempted resume")
+    assert isinstance(refused, RuntimeError), refused
+    assert "damaged line after its open record" in str(refused)
+    assert sent == 0 and dr.known_exposure_count() == 1
+
+
+# -------------------------------------------------------------------------------------------
+# A PREVIOUS RELEASE'S WORKSPACE KEEPS ITS BENCHMARK ORIGIN  (recheck-7 U2)
+# -------------------------------------------------------------------------------------------
+# NOT AN INVENTED LEGACY SCHEMA. Each workspace below is the selection and the log that the
+# PREVIOUS RELEASE's own functions wrote (starter commit a89afa3, `src/decision_replay.py`:
+# freeze_selection, record_holdout_exposure, close_holdout_exposure and run_dev(lost_log=True),
+# run on synthetic samples), captured byte for byte. The selection is written back with
+# `json.dumps(selection, indent=1)` and each log line as stored - exactly what that release
+# wrote. Its selections carry each exposure's full open event in `exposures` and no stamps.
+
+_PREVIOUS_RELEASE_WORKSPACES = {
+    'two exposures, one freeze': {
+        'ids': {'first': '2c52d4966381', 'second': '93db603dc29b'},
+        'selection': ('{"freeze_id": "f06434206160", "config_hash": "67e653ace5b9", "strategy": "strati'
+                      'fied", "k": 9, "n_seeds": 3, "call_index_base": 20260818, "max_output_tokens": 8'
+                      '000, "frozen_at": "2026-09-13T03:31:09.468256+00:00", "authorised_exposures": 2,'
+                      ' "authorisation": "synthetic: a declared second look", "note": "synthetic: a dec'
+                      'lared second look", "history": [], "revalidated": true, "prior_exposure_declared'
+                      '": false, "exposure_number": 2, "exposure_log": "replay_exposures.jsonl", "expos'
+                      'ures": [{"at": "2026-09-13T03:31:09.480255+00:00", "authorisation": "prospective'
+                      ' selection freeze", "call_index_base": 20260818, "event_id": "2c52d4966381", "fr'
+                      'eeze_id": "f06434206160", "k": 9, "n_seeds": 3, "reason": "synthetic first look"'
+                      ', "selection_config_hash": "67e653ace5b9", "sequence": 1, "strategy": "stratifie'
+                      'd", "type": "open"}, {"at": "2026-09-13T03:31:09.520865+00:00", "authorisation":'
+                      ' "synthetic: a declared second look", "call_index_base": 20260818, "event_id": "'
+                      '93db603dc29b", "freeze_id": "f06434206160", "k": 9, "n_seeds": 3, "reason": "syn'
+                      'thetic second look", "selection_config_hash": "67e653ace5b9", "sequence": 2, "st'
+                      'rategy": "stratified", "type": "open"}], "exposure_event_ids": ["2c52d4966381", '
+                      '"93db603dc29b"], "refrozen_at": "2026-09-13T03:31:09.509798+00:00"}'),
+        'log': [
+            ('{"at": "2026-09-13T03:31:09.480255+00:00", "authorisation": "prospective selecti'
+             'on freeze", "call_index_base": 20260818, "event_id": "2c52d4966381", "freeze_id"'
+             ': "f06434206160", "k": 9, "n_seeds": 3, "reason": "synthetic first look", "selec'
+             'tion_config_hash": "67e653ace5b9", "sequence": 1, "strategy": "stratified", "typ'
+             'e": "open"}'),
+            ('{"at": "2026-09-13T03:31:09.493294+00:00", "event_id": "2c52d4966381", "outcome"'
+             ': "benchmark completed", "type": "close"}'),
+            ('{"at": "2026-09-13T03:31:09.520865+00:00", "authorisation": "synthetic: a declar'
+             'ed second look", "call_index_base": 20260818, "event_id": "93db603dc29b", "freez'
+             'e_id": "f06434206160", "k": 9, "n_seeds": 3, "reason": "synthetic second look", '
+             '"selection_config_hash": "67e653ace5b9", "sequence": 2, "strategy": "stratified"'
+             ', "type": "open"}'),
+            ('{"at": "2026-09-13T03:31:09.532873+00:00", "event_id": "93db603dc29b", "outcome"'
+             ': "benchmark completed", "type": "close"}'),
+        ],
+    },
+    'two exposures, changed freeze': {
+        'ids': {'first': '4e2d75f61cb8', 'second': '442f98a89e2c'},
+        'selection': ('{"freeze_id": "c285377e7e39", "config_hash": "8e55564ed1c6", "strategy": "strati'
+                      'fied", "k": 9, "n_seeds": 3, "call_index_base": 20260918, "max_output_tokens": 8'
+                      '000, "frozen_at": "2026-09-13T03:31:09.594108+00:00", "authorised_exposures": 2,'
+                      ' "authorisation": "synthetic: a declared second look", "note": "synthetic: a dec'
+                      'lared second look", "history": [{"freeze_id": "da51a5df934a", "config_hash": "67'
+                      'e653ace5b9", "strategy": "stratified", "k": 9, "frozen_at": "2026-09-13T03:31:09'
+                      '.549076+00:00", "authorised_exposures": 1, "exposures_at_supersession": 1}], "re'
+                      'validated": true, "prior_exposure_declared": false, "exposure_number": 2, "expos'
+                      'ure_log": "replay_exposures.jsonl", "exposures": [{"at": "2026-09-13T03:31:09.56'
+                      '5076+00:00", "authorisation": "prospective selection freeze", "call_index_base":'
+                      ' 20260818, "event_id": "4e2d75f61cb8", "freeze_id": "da51a5df934a", "k": 9, "n_s'
+                      'eeds": 3, "reason": "synthetic first look", "selection_config_hash": "67e653ace5'
+                      'b9", "sequence": 1, "strategy": "stratified", "type": "open"}, {"at": "2026-09-1'
+                      '3T03:31:09.607624+00:00", "authorisation": "synthetic: a declared second look", '
+                      '"call_index_base": 20260918, "event_id": "442f98a89e2c", "freeze_id": "c285377e7'
+                      'e39", "k": 9, "n_seeds": 3, "reason": "synthetic look under a new selection", "s'
+                      'election_config_hash": "8e55564ed1c6", "sequence": 2, "strategy": "stratified", '
+                      '"type": "open"}], "exposure_event_ids": ["4e2d75f61cb8", "442f98a89e2c"]}'),
+        'log': [
+            ('{"at": "2026-09-13T03:31:09.565076+00:00", "authorisation": "prospective selecti'
+             'on freeze", "call_index_base": 20260818, "event_id": "4e2d75f61cb8", "freeze_id"'
+             ': "da51a5df934a", "k": 9, "n_seeds": 3, "reason": "synthetic first look", "selec'
+             'tion_config_hash": "67e653ace5b9", "sequence": 1, "strategy": "stratified", "typ'
+             'e": "open"}'),
+            ('{"at": "2026-09-13T03:31:09.577082+00:00", "event_id": "4e2d75f61cb8", "outcome"'
+             ': "benchmark completed", "type": "close"}'),
+            ('{"at": "2026-09-13T03:31:09.607624+00:00", "authorisation": "synthetic: a declar'
+             'ed second look", "call_index_base": 20260918, "event_id": "442f98a89e2c", "freez'
+             'e_id": "c285377e7e39", "k": 9, "n_seeds": 3, "reason": "synthetic look under a n'
+             'ew selection", "selection_config_hash": "8e55564ed1c6", "sequence": 2, "strategy'
+             '": "stratified", "type": "open"}'),
+            ('{"at": "2026-09-13T03:31:09.623207+00:00", "event_id": "442f98a89e2c", "outcome"'
+             ': "benchmark completed", "type": "close"}'),
+        ],
+    },
+    'latest exposure declared lost by that release': {
+        'ids': {'first': 'a84c6b975b47', 'second': '9d52b478dfd8'},
+        'selection': ('{"freeze_id": "ca192df948fe", "config_hash": "67e653ace5b9", "strategy": "strati'
+                      'fied", "k": 9, "n_seeds": 3, "call_index_base": 20260818, "max_output_tokens": 8'
+                      '000, "frozen_at": "2026-09-13T03:31:09.640735+00:00", "authorised_exposures": 2,'
+                      ' "authorisation": "synthetic: a declared second look", "note": "synthetic: the l'
+                      'og could not be restored from version control", "history": [], "revalidated": tr'
+                      'ue, "prior_exposure_declared": false, "exposure_number": 2, "exposure_log": "rep'
+                      'lay_exposures.jsonl", "exposures": [{"at": "2026-09-13T03:31:09.654733+00:00", "'
+                      'authorisation": "prospective selection freeze", "call_index_base": 20260818, "ev'
+                      'ent_id": "a84c6b975b47", "freeze_id": "ca192df948fe", "k": 9, "n_seeds": 3, "rea'
+                      'son": "synthetic first look", "selection_config_hash": "67e653ace5b9", "sequence'
+                      '": 1, "strategy": "stratified", "type": "open"}], "exposure_event_ids": ["a84c6b'
+                      '975b47", "9d52b478dfd8"], "refrozen_at": "2026-09-13T03:31:09.720116+00:00", "lo'
+                      'g_loss": {"declared_at": "2026-09-13T03:31:09.716611+00:00", "note": "synthetic:'
+                      ' the log could not be restored from version control", "lost_event_ids": ["9d52b4'
+                      '78dfd8"], "damaged_lines_at_declaration": []}}'),
+        'log': [
+            ('{"at": "2026-09-13T03:31:09.654733+00:00", "authorisation": "prospective selecti'
+             'on freeze", "call_index_base": 20260818, "event_id": "a84c6b975b47", "freeze_id"'
+             ': "ca192df948fe", "k": 9, "n_seeds": 3, "reason": "synthetic first look", "selec'
+             'tion_config_hash": "67e653ace5b9", "sequence": 1, "strategy": "stratified", "typ'
+             'e": "open"}'),
+            ('{"at": "2026-09-13T03:31:09.667424+00:00", "event_id": "a84c6b975b47", "outcome"'
+             ': "benchmark completed", "type": "close"}'),
+            ('{"at": "2026-09-13T03:31:09.716611+00:00", "damaged_lines_at_declaration": [], "'
+             'event_id": "7a8da7cf7a2c", "freeze_id": "ca192df948fe", "lost_event_ids": ["9d52'
+             'b478dfd8"], "note": "synthetic: the log could not be restored from version contr'
+             'ol", "selection_config_hash": "67e653ace5b9", "type": "log_loss_declared"}'),
+        ],
+    },
+    'interrupted exposure': {
+        'ids': {'first': 'cbb783523e64'},
+        'selection': ('{"freeze_id": "0b007db4ad21", "config_hash": "67e653ace5b9", "strategy": "strati'
+                      'fied", "k": 9, "n_seeds": 3, "call_index_base": 20260818, "max_output_tokens": 8'
+                      '000, "frozen_at": "2026-09-13T03:31:09.739136+00:00", "authorised_exposures": 1,'
+                      ' "authorisation": "prospective selection freeze", "note": "", "history": [], "re'
+                      'validated": false, "prior_exposure_declared": false, "exposure_number": 1, "expo'
+                      'sure_log": "replay_exposures.jsonl", "exposures": [{"at": "2026-09-13T03:31:09.7'
+                      '51331+00:00", "authorisation": "prospective selection freeze", "call_index_base"'
+                      ': 20260818, "event_id": "cbb783523e64", "freeze_id": "0b007db4ad21", "k": 9, "n_'
+                      'seeds": 3, "reason": "synthetic look, interrupted", "selection_config_hash": "67'
+                      'e653ace5b9", "sequence": 1, "strategy": "stratified", "type": "open"}], "exposur'
+                      'e_event_ids": ["cbb783523e64"]}'),
+        'log': [
+            ('{"at": "2026-09-13T03:31:09.751331+00:00", "authorisation": "prospective selecti'
+             'on freeze", "call_index_base": 20260818, "event_id": "cbb783523e64", "freeze_id"'
+             ': "0b007db4ad21", "k": 9, "n_seeds": 3, "reason": "synthetic look, interrupted",'
+             ' "selection_config_hash": "67e653ace5b9", "sequence": 1, "strategy": "stratified'
+             '", "type": "open"}'),
+        ],
+    },
+}
+
+
+def _previous_release(name, monkeypatch):
+    """Write a Replay workspace exactly as the previous release wrote it; return its ids."""
+    fixture = _PREVIOUS_RELEASE_WORKSPACES[name]
+    selection = json.loads(fixture["selection"])
+    dr.SELECTION_STAMP.write_bytes(json.dumps(selection, indent=1).encode("utf-8"))
+    dr.EXPOSURE_LOG.write_bytes("".join(line + "\n" for line in fixture["log"]).encode("utf-8"))
+    monkeypatch.setattr(dr, "selection_config_hash", lambda: selection["config_hash"])
+    return dict(fixture["ids"])
+
+
+def _report_naming(event_id):
+    return {"selection": dr._read_selection(),
+            "exposure": {"events": dr.exposure_events(),
+                         "evidence_status": dr.evidence_status(),
+                         "evidence_flags": dr.evidence_flags(),
+                         "holdout_event_id": event_id}}
+
+
+_PREVIOUS_RELEASE_LOSSES = [
+    ("two exposures, one freeze", "the later exposure"),
+    ("two exposures, one freeze", "the earlier exposure"),
+    ("two exposures, one freeze", "the whole log"),
+    ("two exposures, changed freeze", "the later exposure"),
+    ("two exposures, changed freeze", "the whole log"),
+]
+
+
+@pytest.mark.parametrize("saved_first", [False, True],
+                         ids=["read as saved", "after this release saves it"])
+@pytest.mark.parametrize("workspace,lost", _PREVIOUS_RELEASE_LOSSES)
+def test_a_previous_release_workspace_keeps_its_benchmark_origin_through_a_loss(
+        cached_holdout, monkeypatch, workspace, lost, saved_first):
+    """
+    THE DEFECT THIS PINS (U2). The origin was rebuilt from this release's stamps and the
+    readable log, and the previous release wrote no stamps: its `exposures` list, which holds
+    each exposure's freeze and sequence, was ignored - and then overwritten by the
+    declaration. After a complete loss the cached benchmark named no exposure; after losing
+    the later one it named the earlier, and submission accepted that.
+    """
+    w = cached_holdout
+    ids = _previous_release(workspace, monkeypatch)
+    reference = w.benchmark().to_dict("records")
+    ids = _previous_release(workspace, monkeypatch)      # back to the bytes that release wrote
+    if saved_first:
+        dr.freeze_selection()                            # an ordinary --dev, nothing lost yet
+
+    if lost == "the whole log":
+        dr.EXPOSURE_LOG.unlink()
+    else:
+        gone = ids["second"] if lost == "the later exposure" else ids["first"]
+        w.write(_without_event(w.lines(), gone))
+    with pytest.raises(RuntimeError, match="no longer contains"):
+        dr.require_readable_log()
+    _declare()
+
+    after = w.benchmark()
+    assert after.attrs["exposure_event_id"] == ids["second"], (
+        f"{workspace}, {lost}: the benchmark was bound to "
+        f"{after.attrs['exposure_event_id']!r}, not the latest exposure {ids['second']!r}")
+    assert after.to_dict("records") == reference, "recovery changed the benchmark's numbers"
+    assert dr.known_exposure_count() == 2
+    assert dr._read_selection()["authorised_exposures"] == 2
+    assert w.requests["n"] == 0
+    report = w.report(after)
+    w.submit(report)
+    older = json.loads(json.dumps(report))
+    older["exposure"]["holdout_event_id"] = ids["first"]
+    with pytest.raises(AssertionError):
+        w.submit(older)
+
+
+def test_an_origin_the_previous_release_left_undescribed_is_withheld_not_guessed(
+        cached_holdout, monkeypatch):
+    """
+    GENUINELY ABSENT METADATA. The previous release declared the later exposure lost and
+    rewrote its selection without that exposure's open event, so nothing records its freeze
+    or order. The origin is withheld rather than settled on the older exposure that survives,
+    and the supported way forward is a declared origin the flags report.
+    """
+    w = cached_holdout
+    ids = _previous_release("latest exposure declared lost by that release", monkeypatch)
+    dr.require_readable_log()
+    origin, doubtful = dr.originating_exposure()
+    assert origin is None and doubtful == [ids["second"]], (origin, doubtful)
+    with pytest.raises(RuntimeError, match="cannot be bound"):
+        w.benchmark()
+    assert w.requests["n"] == 0
+    for claimed in (ids["first"], ids["second"]):
+        with pytest.raises(AssertionError, match="cannot be bound"):
+            w.submit(_report_naming(claimed))
+
+    with pytest.raises(RuntimeError, match="not an exposure that could"):
+        dr.declare_origin("000000000000", "synthetic")
+    with pytest.raises(RuntimeError, match="how you know"):
+        dr.declare_origin(ids["second"], " ")
+    dr.run_dev(origin=ids["second"],
+               note="synthetic: the team's own record of that run names this exposure")
+    after = w.benchmark()
+    assert after.attrs["exposure_event_id"] == ids["second"]
+    flags = dr.evidence_flags()
+    assert flags["origin_declared"] is True and flags["status"] == "previously_exposed"
+    assert dr.known_exposure_count() == 2
+    assert dr._read_selection()["authorised_exposures"] == 2
+    assert w.requests["n"] == 0
+    report = w.report(after)
+    w.submit(report)
+    hidden = json.loads(json.dumps(report))
+    hidden["exposure"]["evidence_flags"]["origin_declared"] = False
+    with pytest.raises(AssertionError, match="contradicts the evidence"):
+        w.submit(hidden)
+
+
+def test_an_origin_the_records_establish_cannot_be_declared_over(cached_holdout):
+    dr.freeze_selection()
+    origin = cached_holdout.expose("the one look")
+    with pytest.raises(RuntimeError, match="no origin to declare"):
+        dr.declare_origin(origin, "synthetic: an attempt to restate a known origin")
+
+
+@pytest.mark.parametrize("field,value", [("sequence", 5), ("freeze_id", "000000000000"),
+                                         ("at", "2026-01-01T00:00:00+00:00"),
+                                         ("selection_config_hash", "000000000000")])
+def test_contradictory_saved_metadata_is_refused_not_resolved(cached_holdout, monkeypatch,
+                                                              field, value):
+    """A saved exposure record that disagrees with the log, with its own id or with its
+    freeze's configuration is a contradiction - refused by every consumer, never settled."""
+    w = cached_holdout
+    ids = _previous_release("two exposures, one freeze", monkeypatch)
+    selection = json.loads(dr.SELECTION_STAMP.read_text(encoding="utf-8"))
+    selection["exposures"][-1][field] = value
+    dr.SELECTION_STAMP.write_text(json.dumps(selection, indent=1), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="contradict"):
+        dr.require_readable_log()
+
+    w.write(_without_event(w.lines(), ids["second"]))
+    with pytest.raises(RuntimeError, match="contradict"):
+        dr.require_readable_log()
+    with pytest.raises(RuntimeError, match="contradict"):
+        _declare()
+    with pytest.raises(AssertionError, match="contradict"):
+        w.submit(_report_naming(ids["second"]))
+
+
+def test_a_previous_release_exposure_left_open_is_not_resumed_on_a_missing_close(
+        cached_holdout, monkeypatch, tmp_path):
+    """
+    That release kept no completion state, so a close line that is absent is all that says
+    its benchmark did not finish - and absence is not evidence. Cached replay still finishes
+    it without asking anything; a further request is a new, declared exposure.
+    """
+    w = cached_holdout
+    ids = _previous_release("interrupted exposure", monkeypatch)
+    refused, sent = _holdout_request(monkeypatch, tmp_path, "an attempted resume")
+    assert isinstance(refused, RuntimeError), refused
+    assert "kept no completion state" in str(refused)
+    assert sent == 0 and dr.known_exposure_count() == 1
+
+    done = w.benchmark()
+    assert done.attrs["exposure_event_id"] == ids["first"] and w.requests["n"] == 0
+    w.submit(w.report(done))
+    dr.freeze_selection(revalidate=True, note="synthetic: a declared second look")
+    second, sent = _holdout_request(monkeypatch, tmp_path, "the declared second look")
+    assert sent == 1 and not second["resumed"] and second["sequence"] == 2
+
+
+# -------------------------------------------------------------------------------------------
+# ONE VALIDITY RULE FOR THE RUNTIME AND FOR SUBMISSION  (recheck-7 U3)
+# -------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("deleted", ["an earlier exposure of this freeze",
+                                     "an exposure of an earlier freeze",
+                                     "the reported exposure"])
+def test_submission_refuses_a_shortened_history_the_runtime_refuses(cached_holdout,
+                                                                    monkeypatch, deleted):
+    """
+    THE DEFECT THIS PINS (U3). The submission check tested contradictions and undeclared
+    damage, never undeclared MISSING exposures: with an earlier exposure's records deleted
+    and the report regenerated from the shortened files, submission passed a history the
+    Replay stage refused. Declaring exactly what was lost passes both, qualified.
+    """
+    w = cached_holdout
+    dr.freeze_selection()
+    first = w.expose("the first look")
+    if deleted == "an exposure of an earlier freeze":
+        monkeypatch.setattr(config, "CALL_INDEX_BASE", config.CALL_INDEX_BASE + 100)
+    dr.freeze_selection(revalidate=True, note="synthetic: a declared second look")
+    second = w.expose("the second look")
+    w.write(_without_event(w.lines(), second if deleted == "the reported exposure" else first))
+
+    with pytest.raises(RuntimeError, match="no longer contains"):
+        dr.require_readable_log()
+    with pytest.raises(AssertionError, match="no longer contains"):
+        w.submit(_report_naming(second))
+
+    _declare()
+    dr.require_readable_log()
+    after = w.benchmark()
+    assert after.attrs["exposure_event_id"] == second
+    w.submit(w.report(after))
+    assert dr.evidence_status() == "previously_exposed"
+
+
+def _history_step(w, step, saved):
+    if step == "drop the earlier exposure":
+        w.write(_without_event(w.lines(), saved["first"]))
+    elif step == "drop the earlier close":
+        w.write([line for line in w.lines()
+                 if not (json.loads(line).get("type") == "close"
+                         and json.loads(line).get("event_id") == saved["first"])])
+    elif step == "delete the log":
+        dr.EXPOSURE_LOG.unlink()
+    elif step == "declare":
+        _declare()
+    elif step == "restore":
+        w.write(saved["original"] + w.lines()[len(saved["kept"]):])
+    elif step == "damage":
+        with dr.EXPOSURE_LOG.open("ab") as fh:
+            fh.write(b"{synthetic damage\n")
+    elif step == "damage again":
+        with dr.EXPOSURE_LOG.open("ab") as fh:
+            fh.write(b"{synthetic damage added after the declaration\n")
+    elif step == "contradict the earlier open":
+        event = json.loads(saved["original"][0])
+        event["reason"] = "a different account of the same exposure"
+        w.write(w.lines() + [json.dumps(event, sort_keys=True)])
+    elif step == "contradict the earlier stamp":
+        selection = dr._read_selection()
+        selection["exposure_stamps"][0]["sequence"] = 7
+        dr.SELECTION_STAMP.write_text(json.dumps(selection, indent=1), encoding="utf-8")
+    else:
+        raise AssertionError(step)
+    if step.startswith("drop"):
+        saved["kept"] = w.lines()
+
+
+_HISTORY_MATRIX = [
+    ("intact", (), "accepted"),
+    ("missing earlier exposure", ("drop the earlier exposure",), "refused"),
+    ("missing earlier exposure, declared", ("drop the earlier exposure", "declare"),
+     "accepted"),
+    ("missing earlier exposure, declared, restored",
+     ("drop the earlier exposure", "declare", "restore"), "accepted"),
+    ("whole log deleted", ("delete the log",), "refused"),
+    ("whole log deleted, declared", ("delete the log", "declare"), "accepted"),
+    ("malformed line", ("damage",), "refused"),
+    ("malformed line, declared", ("damage", "declare"), "accepted"),
+    ("malformed line, declared, then more damage", ("damage", "declare", "damage again"),
+     "refused"),
+    ("missing earlier completion record", ("drop the earlier close",), "refused"),
+    ("missing earlier completion record, declared", ("drop the earlier close", "declare"),
+     "accepted"),
+    ("two accounts of one exposure", ("contradict the earlier open",), "refused"),
+    ("stamp contradicts the log", ("contradict the earlier stamp",), "refused"),
+]
+
+
+@pytest.mark.parametrize("case,steps,expected", _HISTORY_MATRIX,
+                         ids=[case for case, _, _ in _HISTORY_MATRIX])
+def test_the_runtime_and_submission_agree_on_every_history(cached_holdout, case, steps,
+                                                           expected):
+    """Every history is judged by one rule: the runtime refuses it exactly when submission
+    does. Each report is regenerated from the altered files and names the latest exposure."""
+    w = cached_holdout
+    dr.freeze_selection()
+    first = w.expose("the first look")
+    dr.freeze_selection(revalidate=True, note="synthetic: a declared second look")
+    second = w.expose("the second look")
+    saved = {"first": first, "original": w.lines(), "kept": w.lines()}
+    for step in steps:
+        _history_step(w, step, saved)
+
+    try:
+        dr.require_readable_log()
+        runtime = "accepted"
+    except RuntimeError:
+        runtime = "refused"
+    try:
+        w.submit(_report_naming(second))
+        submission = "accepted"
+    except AssertionError:
+        submission = "refused"
+    assert (runtime, submission) == (expected, expected), (
+        f"{case}: the runtime {runtime} it and submission {submission} it; both should "
+        f"have {expected} it")
+
+
+def test_a_recorded_time_without_an_offset_is_compared_rather_than_crashing():
+    """Every writer records UTC with an offset; a hand-edited time without one reads as UTC."""
+    earlier = dr._when("2026-09-13T03:00:00")
+    later = dr._when("2026-09-13T04:00:00+00:00")
+    assert earlier is not None and earlier < later
+    assert dr._when("not a time") is None and dr._when(None) is None

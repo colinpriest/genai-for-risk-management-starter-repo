@@ -994,7 +994,11 @@ def evaluate_all(k: int | None = None, strategies: list[str] | None = None,
         # A CACHE-ONLY REPLAY ASKS THE HOLDOUT NOTHING, and therefore records no new
         # event - but the result it reports still BELONGS to the exposure that produced
         # the envelopes, and writing `null` there severed the report from its evidence.
-        event_id = originating_exposure_id()
+        event_id, doubtful = originating_exposure()
+        if doubtful:
+            # AN ORIGIN THE RECORDS CANNOT ESTABLISH IS NOT GUESSED, and a benchmark that
+            # names none is not written as if it had one.
+            raise RuntimeError(origin_uncertainty_message(doubtful))
     if sample == "holdout" and event_id:
         close_holdout_exposure(
             event_id, f"{sample} benchmark completed on {n_meetings} meetings"
@@ -1360,6 +1364,14 @@ _CLOSE_EVENT_FIELDS = ("type", "event_id", "at")
 #: that described it is gone.
 _STAMP_FIELDS = ("event_id", "freeze_id", "sequence", "at", "selection_config_hash")
 
+#: WHETHER THE BENCHMARK AN EXPOSURE STARTED HAS FINISHED, as the freeze recorded it: a time
+#: once it completed; `None` - written the moment the exposure is recorded - while the freeze
+#: knows it has not; ABSENT when the freeze never knew, as in a selection saved by a release
+#: that kept no completion state. Absent never reads as "not finished". A close record that
+#: cannot be read is not evidence that the benchmark did not complete, and reading it that
+#: way let a finished benchmark resume and draw new answers from the held-out meetings.
+_COMPLETION_FIELD = "closed_at"
+
 
 def parse_exposure_log(path=None) -> list[dict]:
     """Every line of an exposure log as an event, with damaged lines kept AS damage.
@@ -1423,70 +1435,161 @@ def log_damage(events: list[dict] | None = None) -> list[str]:
             for e in events if e.get("type") == "damaged"]
 
 
+def _when(recorded: object) -> datetime | None:
+    """A recorded ISO time as a datetime, or None when there is nothing to compare.
+
+    A time without an offset is read as UTC - every writer here records UTC - so a record
+    edited by hand is compared rather than crashing the comparison.
+    """
+    try:
+        moment = datetime.fromisoformat(str(recorded)) if recorded else None
+    except ValueError:
+        return None
+    if moment is not None and moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment
+
+
 def exposure_accounting(selection: dict | None, events: list[dict]) -> dict:
-    """THE identity and count rule for holdout exposures, from a selection and a log.
+    """THE identity, order, completion and count rule for holdout exposures.
 
     The runtime guard, the evidence flags and the submission check all call this, so the
     three cannot count differently. From files alone it answers:
 
     * which exposures are KNOWN - the distinct union of what the log shows, what the freeze
-      stamped as each exposure was recorded, and what a declaration says was lost. A UNION,
-      not a sum: restoring a declared-lost event used to count it twice, and the restored
-      evidence was refused against an allowance it had not exceeded;
+      stamped as each exposure was recorded, what an earlier release saved in the selection,
+      and what a declaration says was lost. A UNION, not a sum: restoring a declared-lost
+      event used to count it twice;
+    * which freeze each exposure belongs to, and in what order - from EVERY record that
+      holds it. The previous release saved each exposure's full open event in the
+      selection's `exposures` list; reading only the newer stamps dropped it, so after a
+      loss a benchmark lost its origin or moved to an older exposure. The records must agree
+      with each other, reproduce the exposure's id and name the configuration of the freeze
+      they cite. A contradiction is reported, never settled by preferring one record;
+    * whether each exposure's benchmark FINISHED - a readable close, or the completion the
+      freeze recorded - and which completion records the log has lost;
     * which known exposures are STILL MISSING from the readable log, and whether a
-      declaration covers each - so a historical declaration and an event that is still
-      gone are told apart;
+      declaration covers each;
     * which damaged lines a declaration covers, by line number and exact bytes, and which
-      are new;
-    * which freeze each exposure belongs to, and in what order - so a benchmark's
-      originating exposure is the latest one its freeze made, not whichever happens to
-      survive in a shortened log.
+      are new.
     """
     selection = selection or {}
     loss = selection.get("log_loss") if isinstance(selection.get("log_loss"), dict) else {}
+    conflicts: set[str] = set()
+    details: list[str] = []
 
-    readable, conflicts, first = [], set(), {}
-    for event in events:
-        if event.get("type") != "open":
-            continue
-        eid = event.get("event_id")
-        if eid in first:
-            # THE SAME EVENT RESTORED TWICE is still one exposure. The same id carrying
-            # different content is not a restoration but a contradiction.
-            if first[eid] != event:
-                conflicts.add(eid)
-            continue
-        first[eid] = event
-        readable.append(event)
+    readable, first, open_position = [], {}, {}
+    closes: dict[str, list] = {}
+    damaged_positions = []
+    for position, event in enumerate(events):
+        kind = event.get("type")
+        if kind == "damaged":
+            damaged_positions.append(position)
+        elif kind == "close" and event.get("event_id"):
+            closes.setdefault(event["event_id"], []).append(event.get("at"))
+        elif kind == "open":
+            eid = event.get("event_id")
+            if eid in first:
+                # THE SAME EVENT RESTORED TWICE is still one exposure. The same id carrying
+                # different content is not a restoration but a contradiction.
+                if first[eid] != event:
+                    conflicts.add(eid)
+                    details.append(f"exposure {eid}: the log holds two different open "
+                                   f"events under this id")
+                continue
+            first[eid] = event
+            open_position[eid] = position
+            readable.append(event)
     readable_ids = [e.get("event_id") for e in readable]
 
-    stamps, stamped = [], set()
-    for stamp in selection.get("exposure_stamps") or []:
-        if isinstance(stamp, dict) and stamp.get("event_id") \
-                and stamp["event_id"] not in stamped:
-            stamps.append({k: stamp.get(k) for k in _STAMP_FIELDS})
-            stamped.add(stamp["event_id"])
-    # Ids remembered before stamps carried a freeze and a sequence take those from the
-    # readable log where it still has them, and stay unknown where it does not - a freeze
-    # is never invented for an exposure nobody can read.
-    for eid in list(selection.get("exposure_event_ids") or []) + readable_ids:
-        if eid and eid not in stamped:
-            event = first.get(eid, {})
-            stamps.append({"event_id": eid,
-                           **{k: event.get(k) for k in _STAMP_FIELDS if k != "event_id"}})
-            stamped.add(eid)
-    for stamp in stamps:
-        event = first.get(stamp["event_id"])
-        if event is not None:
-            for k in _STAMP_FIELDS:
-                if stamp.get(k) is None:
-                    stamp[k] = event.get(k)
-
+    # EVERY RECORD OF EACH EXPOSURE'S IDENTITY. A later source fills what an earlier one
+    # lacks; two sources that disagree are a contradiction, whichever is right.
+    sources = (("the freeze's exposure stamps", selection.get("exposure_stamps")),
+               ("the exposure list saved in the selection", selection.get("exposures")),
+               ("the log", readable))
+    merged: dict[str, dict] = {}
+    held_by: dict[str, dict] = {}
+    recorded_completion: dict[str, object] = {}
+    for label, entries in sources:
+        for entry in entries or []:
+            if not isinstance(entry, dict) or not entry.get("event_id"):
+                continue
+            eid = entry["event_id"]
+            stamp = merged.setdefault(eid, {"event_id": eid})
+            for field in _STAMP_FIELDS[1:]:
+                value = entry.get(field)
+                if value is None:
+                    continue
+                if field not in held_by.setdefault(eid, {}):
+                    held_by[eid][field] = label
+                    stamp[field] = value
+                elif stamp[field] != value:
+                    conflicts.add(eid)
+                    details.append(f"exposure {eid}: {held_by[eid][field]} records {field} "
+                                   f"{stamp[field]!r}, {label} records {value!r}")
+            if label == "the freeze's exposure stamps" and _COMPLETION_FIELD in entry:
+                recorded_completion[eid] = entry[_COMPLETION_FIELD]
+    # Ids remembered before any of those records existed stay undescribed where nothing
+    # still describes them - a freeze or an order is never invented for an exposure nobody
+    # can read.
     lost_declared = [e for e in (loss.get("lost_event_ids") or []) if e]
-    known = [s["event_id"] for s in stamps] + [e for e in lost_declared if e not in stamped]
+    for eid in list(selection.get("exposure_event_ids") or []) + lost_declared:
+        if eid:
+            merged.setdefault(eid, {"event_id": eid})
+
+    freeze_configs, freeze_started = {}, {}
+    for record in [selection] + [h for h in (selection.get("history") or [])
+                                 if isinstance(h, dict)]:
+        if record.get("freeze_id"):
+            if record.get("config_hash"):
+                freeze_configs.setdefault(record["freeze_id"], record["config_hash"])
+            if record.get("frozen_at"):
+                freeze_started.setdefault(record["freeze_id"], record["frozen_at"])
+    for eid, stamp in merged.items():
+        freeze, sequence, at = stamp.get("freeze_id"), stamp.get("sequence"), stamp.get("at")
+        # AN ID IS A HASH OF ITS FREEZE, SEQUENCE AND TIME, so a record whose metadata was
+        # altered cannot pass for the exposure it names.
+        if None not in (freeze, sequence, at) and _event_id(freeze, sequence, at) != eid:
+            conflicts.add(eid)
+            details.append(f"exposure {eid}: its recorded freeze {freeze!r}, sequence "
+                           f"{sequence!r} and time {at!r} do not reproduce its id")
+        expected, recorded = freeze_configs.get(freeze), stamp.get("selection_config_hash")
+        if expected and recorded and recorded != expected:
+            conflicts.add(eid)
+            details.append(f"exposure {eid}: recorded against freeze {freeze}, whose "
+                           f"configuration is {expected}, but records configuration "
+                           f"{recorded}")
+
+    known = list(merged)
     present = set(readable_ids)
     still_missing = [e for e in known if e not in present]
     still_missing_declared = [e for e in still_missing if e in lost_declared]
+
+    stamps, completion = [], {}
+    for eid in known:
+        stamp = {k: merged[eid].get(k) for k in _STAMP_FIELDS}
+        if closes.get(eid):
+            stamp[_COMPLETION_FIELD] = recorded_completion.get(eid) or closes[eid][0]
+            completion[eid] = "closed"
+        elif recorded_completion.get(eid):
+            stamp[_COMPLETION_FIELD] = recorded_completion[eid]
+            completion[eid] = "closed"
+        elif eid in recorded_completion:
+            stamp[_COMPLETION_FIELD] = None
+            completion[eid] = "open"
+        else:
+            completion[eid] = "unknown"
+        stamps.append(stamp)
+
+    # A COMPLETION THE FREEZE RECORDED AND THE LOG NO LONGER HOLDS. A damaged line after the
+    # exposure's open record may be that very record, and is accounted for as damage.
+    missing_closes = [e for e in known
+                      if e in open_position and recorded_completion.get(e)
+                      and not closes.get(e)
+                      and not any(p > open_position[e] for p in damaged_positions)]
+    # Declaring an exposure lost declares all of its records, its completion included.
+    close_declared = set(lost_declared) | {e for e in (loss.get("lost_close_ids") or []) if e}
+    missing_closes_declared = [e for e in missing_closes if e in close_declared]
 
     declared_lines = {(d.get("line_number"), d.get("sha256"))
                       for d in (loss.get("damaged_lines") or []) if isinstance(d, dict)}
@@ -1496,41 +1599,137 @@ def exposure_accounting(selection: dict | None, events: list[dict]) -> dict:
     uncovered = [d for d in damaged
                  if (d.get("line_number"), d.get("sha256")) not in declared_lines]
 
-    freeze_of, order_of = {}, {}
+    freeze_of, order_of, undescribed = {}, {}, []
     for position, stamp in enumerate(stamps):
-        freeze_of[stamp["event_id"]] = stamp.get("freeze_id")
-        sequence = stamp.get("sequence")
-        order_of[stamp["event_id"]] = (sequence if isinstance(sequence, int)
-                                       and not isinstance(sequence, bool) else -1, position)
+        eid, sequence = stamp["event_id"], stamp.get("sequence")
+        freeze_of[eid] = stamp.get("freeze_id")
+        ordered = isinstance(sequence, int) and not isinstance(sequence, bool)
+        order_of[eid] = (sequence if ordered else -1, position)
+        if not ordered or not stamp.get("freeze_id"):
+            undescribed.append(eid)
+
+    # WHEN EACH LOST EXPOSURE WAS FIRST DECLARED LOST. An exposure declared lost before
+    # another was recorded, or before a freeze began, happened before it - whatever else
+    # about it is unknown.
+    declared_by: dict[str, str] = {}
+
+    def note_declared(ids, at):
+        for eid in ids or []:
+            if eid and _when(at) and (eid not in declared_by
+                                      or _when(at) < _when(declared_by[eid])):
+                declared_by[eid] = at
+
+    for entry in loss.get("declarations") or []:
+        if isinstance(entry, dict):
+            note_declared(entry.get("lost_event_ids"), entry.get("declared_at"))
+    if not loss.get("declarations"):
+        # A declaration made by the release before declarations were kept as a list.
+        note_declared(loss.get("lost_event_ids"), loss.get("declared_at"))
+    for event in events:
+        if event.get("type") == "log_loss_declared":
+            note_declared(event.get("lost_event_ids"), event.get("at"))
+
+    origin = selection.get("origin_declaration")
     return {
         "readable": readable,
         "conflicts": sorted(c for c in conflicts if c),
+        "conflict_details": details,
         "stamps": stamps,
         "known_ids": known,
         "lost_declared": lost_declared,
         "still_missing": still_missing,
         "still_missing_declared": still_missing_declared,
         "undeclared_missing": [e for e in still_missing if e not in lost_declared],
+        "completion": completion,
+        "missing_closes": missing_closes,
+        "missing_closes_declared": missing_closes_declared,
+        "undeclared_missing_closes": [e for e in missing_closes if e not in close_declared],
         "damaged": damaged,
+        "damaged_positions": damaged_positions,
+        "open_position": open_position,
         "declared_damage_present": covered,
         "undeclared_damage": uncovered,
         # THE LOSS IS IN EFFECT while anything it declared is still unreadable. Restoring
         # the evidence ends it; the declaration itself stays on record as history.
-        "loss_in_effect": bool(still_missing_declared or covered),
+        "loss_in_effect": bool(still_missing_declared or covered or missing_closes_declared),
         "freeze_of": freeze_of,
         "order_of": order_of,
+        "freeze_started": freeze_started,
+        "undescribed": undescribed,
+        "declared_by": declared_by,
+        "origin_declaration": origin if isinstance(origin, dict) else None,
     }
 
 
-def latest_exposure_for(accounting: dict, freeze_id: str | None) -> str | None:
-    """The most recent exposure a freeze made, from its stamps - readable or lost."""
+def _origin_evidence(accounting: dict, freeze_id: str | None) -> tuple[str | None, list[str]]:
+    """(the latest DESCRIBED exposure of a freeze, the undescribed ones that could be later)."""
     if not freeze_id:
-        return None
+        return None, []
+    order_of = accounting["order_of"]
     mine = [eid for eid in accounting["known_ids"]
-            if accounting["freeze_of"].get(eid) == freeze_id]
-    if not mine:
-        return None
-    return max(mine, key=lambda eid: accounting["order_of"].get(eid, (-1, -1)))
+            if accounting["freeze_of"].get(eid) == freeze_id and order_of[eid][0] >= 0]
+    best = max(mine, key=lambda eid: order_of[eid]) if mine else None
+    best_at = _when(next((s.get("at") for s in accounting["stamps"]
+                          if s["event_id"] == best), None))
+    began = _when(accounting["freeze_started"].get(freeze_id))
+    doubtful = []
+    for eid in accounting["undescribed"]:
+        declared = _when(accounting["declared_by"].get(eid))
+        # PROVEN EARLIER: declared lost before this freeze began, or before the latest
+        # described exposure was recorded.
+        if declared and ((began and declared < began) or (best_at and declared < best_at)):
+            continue
+        doubtful.append(eid)
+    return best, doubtful
+
+
+def exposure_origin(accounting: dict, freeze_id: str | None) -> tuple[str | None, list[str]]:
+    """The latest exposure a freeze made - and the exposures, if any, that leave it unknown.
+
+    Read from the records of every exposure, readable or lost. An exposure whose freeze or
+    order no surviving record describes could be later than every exposure that is
+    described, so the answer is WITHHELD rather than guessed: settling on the latest exposure
+    still described is exactly how a benchmark came to be attached to an older look. Such an
+    exposure stops mattering once it is proven earlier, or once the team declares the origin
+    (`--declare-origin`) - a statement the evidence flags then report as `origin_declared`.
+    """
+    best, doubtful = _origin_evidence(accounting, freeze_id)
+    if not doubtful:
+        return best, []
+    declaration = accounting.get("origin_declaration") or {}
+    candidates = ([best] if best else []) + doubtful
+    if declaration.get("freeze_id") == freeze_id and declaration.get("event_id") in candidates:
+        return declaration["event_id"], []
+    return None, doubtful
+
+
+def origin_was_declared(accounting: dict, freeze_id: str | None) -> bool:
+    """True when this freeze's benchmark origin rests on a declaration, not on the records."""
+    best, doubtful = _origin_evidence(accounting, freeze_id)
+    return bool(doubtful) and exposure_origin(accounting, freeze_id)[0] is not None
+
+
+def origin_uncertainty_message(doubtful: list[str]) -> str:
+    """Why a benchmark cannot be bound to its exposure, and what a team can do about it."""
+    return (
+        f"the holdout benchmark cannot be bound to the exposure that produced it. "
+        f"Exposure(s) {doubtful} are known to have happened, but no record that survives says "
+        f"which freeze they belong to or when they were recorded: their records were lost, "
+        f"and declared lost, before the selection kept that metadata. So the latest exposure "
+        f"is unknown, and binding the benchmark to the latest one still described could bind "
+        f"it to an older look.\n"
+        f"  1. Restore outputs/{EXPOSURE_LOG.name} from version control, which settles it.\n"
+        f"  2. If it cannot be restored, tell the course staff and declare which exposure the "
+        f"benchmark came from, and how you know:\n"
+        f'       python src/decision_replay.py --dev --declare-origin=EVENT_ID '
+        f'--note="how you know"\n'
+        f"     The declaration adds no exposure and is reported as origin_declared: it is a "
+        f"statement, not a record.")
+
+
+def latest_exposure_for(accounting: dict, freeze_id: str | None) -> str | None:
+    """The most recent exposure a freeze made, or None when there is none or it is unknown."""
+    return exposure_origin(accounting, freeze_id)[0]
 
 
 def _declare_lost_log(old: dict, note: str) -> dict:
@@ -1541,10 +1740,10 @@ def _declare_lost_log(old: dict, note: str) -> dict:
     in effect, and no further look is authorised. What it buys is a way forward that is not
     deleting the evidence.
 
-    EXACTLY WHAT WAS LOST, NOTHING MORE. A declaration names the missing exposure ids, and
-    each damaged line by its number and the SHA-256 of its bytes. It used to waive every
-    damaged line from then on, so corruption introduced AFTER a declaration was accepted
-    too. A later loss now needs a later declaration; the earlier ones stay as history.
+    EXACTLY WHAT WAS LOST, NOTHING MORE. A declaration names the missing exposure ids, the
+    exposures whose completion record is missing, and each damaged line by its number and
+    the SHA-256 of its bytes. A later loss needs a later declaration; the earlier ones stay
+    as history.
     """
     if not str(note).strip():
         raise RuntimeError(
@@ -1555,21 +1754,24 @@ def _declare_lost_log(old: dict, note: str) -> dict:
     accounting = exposure_accounting(old, exposure_events())
     if accounting["conflicts"]:
         raise RuntimeError(
-            f"{EXPOSURE_LOG.name} records different events under the same id "
-            f"({accounting['conflicts']}). That is not a lost history but a contradictory "
-            f"one, and declaring it lost would hide which account is true. Restore the "
-            f"log from version control and tell the course staff.")
+            f"{EXPOSURE_LOG.name} and the frozen selection contradict each other:\n  "
+            + "\n  ".join(accounting["conflict_details"])
+            + "\nThat is not a lost history but a contradictory one, and declaring it lost "
+              "would hide which account is true. Restore both files from version control "
+              "and tell the course staff.")
     missing = accounting["undeclared_missing"]
+    unfinished = accounting["undeclared_missing_closes"]
     damage = accounting["undeclared_damage"]
     previous = declared_log_loss(old)
-    if not missing and not damage:
+    if not missing and not unfinished and not damage:
         already = (f" This freeze already declares "
                    f"{len(previous.get('lost_event_ids') or [])} lost exposure(s) and "
                    f"{len(previous.get('damaged_lines') or [])} damaged line(s); nothing "
                    f"has been lost since." if previous else "")
         raise RuntimeError(
             f"there is nothing to declare: {EXPOSURE_LOG.name} still contains every "
-            f"exposure this freeze knows about ({len(accounting['known_ids'])}) and has no "
+            f"exposure this freeze knows about ({len(accounting['known_ids'])}) and the "
+            f"completion record of every benchmark it knows finished, and has no "
             f"undeclared damaged lines.{already}\n"
             f"If you meant to authorise ANOTHER look at the holdout, that is "
             f'--revalidate --note="why". If you meant to declare that the holdout was '
@@ -1577,16 +1779,28 @@ def _declare_lost_log(old: dict, note: str) -> dict:
     at = datetime.now(timezone.utc).isoformat()
     lines = [{k: d.get(k) for k in ("line_number", "sha256", "problem")} for d in damage]
     entry = {"declared_at": at, "note": str(note), "lost_event_ids": list(missing),
-             "damaged_lines": lines}
+             "lost_close_ids": list(unfinished), "damaged_lines": lines}
+    earlier = list(previous.get("declarations") or [])
+    if previous and not earlier:
+        # A DECLARATION MADE BY THE PREVIOUS RELEASE, which kept one rather than a list. It
+        # becomes the first entry, dated as it was made, so nothing it declared - nor when -
+        # is lost by declaring more.
+        earlier = [{"declared_at": previous.get("declared_at"), "note": previous.get("note"),
+                    "lost_event_ids": list(previous.get("lost_event_ids") or []),
+                    "lost_close_ids": [], "damaged_lines": [],
+                    "damaged_lines_at_declaration":
+                        list(previous.get("damaged_lines_at_declaration") or [])}]
     lost = list(previous.get("lost_event_ids") or [])
+    closes_lost = list(previous.get("lost_close_ids") or [])
     all_lines = list(previous.get("damaged_lines") or []) + lines
     return {
         "declared_at": at,
         "note": str(note),
-        "declarations": list(previous.get("declarations") or []) + [entry],
+        "declarations": earlier + [entry],
         # THE COUNT OF RECORD, carried forward: ids the freeze stamped when the exposures
         # happened. Nothing here is reconstructed from a damaged file.
         "lost_event_ids": lost + [e for e in missing if e not in lost],
+        "lost_close_ids": closes_lost + [e for e in unfinished if e not in closes_lost],
         "damaged_lines": all_lines,
         "damaged_lines_at_declaration": [f"line {d.get('line_number')}: {d.get('problem')}"
                                          for d in all_lines],
@@ -1622,71 +1836,98 @@ def known_exposure_count(rec: dict | None = None) -> int:
     return len(exposure_accounting(rec, exposure_events())["known_ids"])
 
 
-def require_readable_log() -> None:
-    """Refuse to derive an exposure COUNT from a history that cannot be trusted.
+def exposure_history_problems(selection: dict | None, events: list[dict],
+                              accounting: dict | None = None) -> list[str]:
+    """Everything that stops an exposure history counting as evidence, in words to act on.
 
-    The count is what authorises another look at the holdout. A damaged log whose damage
-    is ignored answers "zero exposures so far" to a question it cannot answer - and so
-    does a log that has been DELETED.
+    THE ONE VALIDITY RULE. `require_readable_log()` raises the first of these and the
+    submission check refuses a history with any, so the two cannot accept different
+    histories. They did: the submission check tested contradictions and undeclared damage
+    but never undeclared MISSING exposures, so a report regenerated from a log with an
+    earlier exposure deleted passed a check the Replay stage itself refused to run on.
 
-    THE FREEZE REMEMBERS WHAT THE LOG SHOULD CONTAIN. Each exposure is stamped into the
-    freeze when it is recorded, so a missing or shortened log is detectable rather than
-    simply believed.
-
-    A DECLARED LOSS IS ACCOUNTED FOR, NOT FORGIVEN - AND ONLY FOR WHAT IT DECLARED. The
-    missing ids and the exact damaged lines a declaration names stop raising here; any
-    other missing exposure, and any line damaged since, still does.
+    THE FREEZE REMEMBERS WHAT THE LOG SHOULD CONTAIN - each exposure, and each completion,
+    recorded as it happened - so a missing or shortened log is detectable rather than
+    believed. A DECLARED LOSS IS ACCOUNTED FOR, NOT FORGIVEN, and only for what it declared.
     """
-    rec = _read_selection()
-    accounting = exposure_accounting(rec, exposure_events())
-    if accounting["conflicts"]:
-        raise RuntimeError(
-            f"{EXPOSURE_LOG.name} records different events under the same id "
-            f"({accounting['conflicts']}), so the exposures it describes cannot be "
-            f"counted. Restore it from version control rather than editing it.")
-    lost = accounting["undeclared_missing"]
+    a = exposure_accounting(selection, events) if accounting is None else accounting
+    name = EXPOSURE_LOG.name
+    declare = ('       python src/decision_replay.py --dev --declare-lost-log '
+               '--note="what happened to the log"')
+    problems = []
+    if a["conflicts"]:
+        problems.append(
+            f"{name} and the frozen selection record different events under the same id, "
+            f"or contradict each other about one, so the exposures they describe cannot be "
+            f"counted:\n  " + "\n  ".join(a["conflict_details"])
+            + "\nRestore both files from version control rather than editing either. If "
+              "they cannot be restored, tell the course staff: a contradiction cannot be "
+              "declared lost.")
+    known, lost = a["known_ids"], a["undeclared_missing"]
     if lost:
-        known = accounting["known_ids"]
         # A DAMAGED LINE IS OFTEN WHERE THE MISSING EXPOSURE WAS. Reporting only the missing
         # id hid the damage that caused it, and the team was told nothing about the line.
-        unread = accounting["undeclared_damage"]
+        unread = a["undeclared_damage"]
         where = ("" if not unread else
                  f"\nIt also has {len(unread)} damaged line(s) - "
                  + "; ".join(f"line {d.get('line_number')}: {d.get('problem')}"
                              for d in unread)
                  + " - which may be where those exposures were recorded.")
-        raise RuntimeError(
+        problems.append(
             f"the frozen selection records {len(known)} holdout exposure(s) but "
-            f"{EXPOSURE_LOG.name} no longer contains {lost}.{where}\n"
+            f"{name} no longer contains {lost}.{where}\n"
             f"That file is append-only evidence and the count in it decides whether "
             f"the held-out sample may be asked anything more, so a shorter log is "
             f"not a clean slate.\n"
             f"  1. Restore it from version control - `git checkout -- "
-            f"outputs/{EXPOSURE_LOG.name}` - which is the outcome to want.\n"
+            f"outputs/{name}` - which is the outcome to want.\n"
             f"  2. If it is genuinely unrecoverable, tell the course staff and "
-            f"declare it:\n"
-            f'       python src/decision_replay.py --dev --declare-lost-log '
-            f'--note="what happened to the log"\n'
+            f"declare it:\n{declare}\n"
             f"     That keeps the {len(known)} exposure(s) counted against you and "
             f"reports the evidence as previously_exposed. It does not restore the "
             f"history and does not authorise another look.")
-    damage = accounting["undeclared_damage"]
+    unfinished = a["undeclared_missing_closes"]
+    if unfinished:
+        problems.append(
+            f"the frozen selection records that the benchmark of exposure(s) {unfinished} "
+            f"finished, but {name} no longer contains the record of it finishing. A "
+            f"benchmark whose completion record is missing could be taken for an unfinished "
+            f"one and resumed with new requests to the held-out meetings.\n"
+            f"  1. Restore it from version control - `git checkout -- "
+            f"outputs/{name}` - which is the outcome to want.\n"
+            f"  2. If it is genuinely unrecoverable, tell the course staff and "
+            f"declare it:\n{declare}\n"
+            f"     That keeps the benchmark counted as finished: it can be replayed from "
+            f"cache, and any new request to the held-out meetings is a new exposure.")
+    damage = a["undeclared_damage"]
     if damage:
         described = [f"line {d.get('line_number')}: {d.get('problem')}" for d in damage]
         since = (" A declaration on this freeze covers other lines; these are new."
-                 if declared_log_loss(rec) else "")
-        raise RuntimeError(
-            f"{EXPOSURE_LOG.name} has {len(damage)} damaged line(s), so the number of "
+                 if declared_log_loss(selection or {}) else "")
+        problems.append(
+            f"{name} has {len(damage)} damaged line(s), so the number of "
             f"holdout exposures it records cannot be read:\n  "
             + "\n  ".join(described) + since
             + f"\nThis file is append-only evidence and the count in it decides whether "
               f"the held-out sample may be asked anything more.\n"
               f"  1. Restore it from version control - `git checkout -- "
-              f"outputs/{EXPOSURE_LOG.name}` - rather than editing or deleting it.\n"
+              f"outputs/{name}` - rather than editing or deleting it.\n"
               f"  2. If it is genuinely unrecoverable, tell the course staff and "
-              f"declare it:\n"
-              f'       python src/decision_replay.py --dev --declare-lost-log '
-              f'--note="what happened to the log"')
+              f"declare it:\n{declare}")
+    return problems
+
+
+def require_readable_log() -> None:
+    """Refuse to derive an exposure COUNT from a history that cannot be trusted.
+
+    The count is what authorises another look at the holdout. A damaged log whose damage
+    is ignored answers "zero exposures so far" to a question it cannot answer - and so
+    does a log that has been DELETED. What counts as untrustworthy is decided once, in
+    `exposure_history_problems()`, which the submission check applies too.
+    """
+    problems = exposure_history_problems(_read_selection(), exposure_events())
+    if problems:
+        raise RuntimeError(problems[0])
 
 
 def _append_event(event: dict) -> dict:
@@ -1716,41 +1957,115 @@ def exposures_recorded() -> list[dict]:
     return exposure_accounting({}, exposure_events())["readable"]
 
 
-def open_exposure(freeze_id: str) -> dict | None:
-    """An exposure of this freeze that was started and never closed.
+def unfinished_exposure(freeze_id: str,
+                        rec: dict | None = None) -> tuple[dict | None, str | None]:
+    """An exposure of this freeze that a run may RESUME - or why the one left open may not be.
 
-    RESUMING ONE IS NOT A NEW EXPOSURE. A run that crashes, or that is stopped and
-    restarted to fill cache misses, is still the same question asked once; charging it a
-    second exposure would either block a legitimate resume or make the count meaningless.
-    A new exposure begins only after the previous one is closed by a completed benchmark.
+    RESUMING ONE IS NOT A NEW EXPOSURE. A run that crashes, or that is stopped and restarted
+    to fill cache misses, is still the same question asked once; charging it a second
+    exposure would either block a legitimate resume or make the count meaningless.
+
+    BUT A RESUME SENDS NEW REQUESTS, SO IT NEEDS EVIDENCE THE BENCHMARK DID NOT FINISH - not
+    merely the absence of a readable close record. Damaging a completed benchmark's close
+    line, declaring the damage and hitting a cache miss used to reopen it: fresh answers
+    were drawn from the held-out meetings under a look already spent, and counted as
+    nothing. An exposure is resumable only when the freeze recorded it as unfinished, and
+    nothing that could be its completion record stands in the way - no damaged line after
+    its open record, and no record the log has lost since it began.
     """
-    state: dict[str, dict] = {}
-    for e in exposure_events():
-        if e.get("type") == "open":
-            state[e.get("event_id")] = e
-        elif e.get("type") == "close":
-            state.pop(e.get("event_id"), None)
-    for event in reversed(list(state.values())):
-        if event.get("freeze_id") == freeze_id:
-            return event
-    return None
+    rec = _read_selection() if rec is None else rec
+    a = exposure_accounting(rec, exposure_events())
+    left_open = [e for e in a["readable"] if e.get("freeze_id") == freeze_id
+                 and a["completion"].get(e.get("event_id")) != "closed"]
+    if not left_open:
+        return None, None
+    event = max(left_open, key=lambda e: a["order_of"].get(e.get("event_id"), (-1, -1)))
+    eid = event["event_id"]
+    if a["completion"].get(eid) == "unknown":
+        return None, (f"exposure {eid} was recorded by a release that kept no completion "
+                      f"state, so nothing establishes that its benchmark did not finish")
+    if any(p > a["open_position"][eid] for p in a["damaged_positions"]):
+        return None, (f"exposure {eid} has a damaged line after its open record, and that "
+                      f"line may be the record of its benchmark finishing")
+    began = _when(event.get("at"))
+    recorded_at = {s["event_id"]: s.get("at") for s in a["stamps"]}
+    finished_at = {s["event_id"]: s.get(_COMPLETION_FIELD) for s in a["stamps"]}
+
+    def before_it(when):
+        return bool(began and _when(when) and _when(when) < began)
+
+    gaps = ([m for m in a["still_missing"] if not before_it(recorded_at.get(m))]
+            + [m for m in a["missing_closes"] if not before_it(finished_at.get(m))])
+    if gaps:
+        return None, (f"records the log has lost that may postdate exposure {eid} ({gaps}) "
+                      f"could include the record of its benchmark finishing")
+    return event, None
+
+
+def open_exposure(freeze_id: str) -> dict | None:
+    """An exposure of this freeze that a run may resume, or None. See `unfinished_exposure`."""
+    return unfinished_exposure(freeze_id)[0]
+
+
+def originating_exposure(freeze_id: str | None = None) -> tuple[str | None, list[str]]:
+    """The exposure a freeze's evidence came from, and the exposures that leave it unknown."""
+    rec = _read_selection() or {}
+    if freeze_id is None:
+        freeze_id = rec.get("freeze_id")
+    return exposure_origin(exposure_accounting(rec, exposure_events()), freeze_id)
 
 
 def originating_exposure_id(freeze_id: str | None = None) -> str | None:
     """The exposure whose requests produced the evidence this freeze reports on.
 
-    THE LATEST EXPOSURE THIS FREEZE MADE, read from the freeze's own stamps - not the last
-    one that happens to survive in the log. Reading only the readable log returned `None`
-    once the log was lost, which severed a cached benchmark from its evidence; after a
-    PARTIAL loss it silently attached the benchmark to an OLDER exposure, and the
-    submission check accepted that. A run served entirely from cache creates no event and
-    must still say which exposure its numbers came from; `None` still means this freeze
-    has never asked the holdout anything.
+    THE LATEST EXPOSURE THIS FREEZE MADE, read from every record of it - not the last one
+    that happens to survive in the log. Reading only the readable log returned `None` once
+    the log was lost, which severed a cached benchmark from its evidence; after a PARTIAL
+    loss it silently attached the benchmark to an OLDER exposure, and the submission check
+    accepted that. A run served entirely from cache creates no event and must still say
+    which exposure its numbers came from. `None` means this freeze has never asked the
+    holdout anything - or that the records cannot say which exposure was the latest, which
+    `originating_exposure()` reports.
     """
-    rec = _read_selection() or {}
-    if freeze_id is None:
-        freeze_id = rec.get("freeze_id")
-    return latest_exposure_for(exposure_accounting(rec, exposure_events()), freeze_id)
+    return originating_exposure(freeze_id)[0]
+
+
+def declare_origin(event_id: str, note: str) -> dict:
+    """Record which exposure this freeze's benchmark came from, when the records cannot.
+
+    THE SUPPORTED WAY OUT OF A GENUINELY UNKNOWN ORIGIN, and only that. It is accepted only
+    while `exposure_origin()` withholds the answer, only for an exposure that could be the
+    latest, and only with a note. It adds no exposure, authorises nothing, and is reported
+    as `origin_declared`; the loss that made it necessary keeps the evidence
+    `previously_exposed`.
+    """
+    if not str(note).strip():
+        raise RuntimeError(
+            "declaring where a benchmark came from is a statement about your own evidence, "
+            "so it has to say how you know:\n"
+            '    python src/decision_replay.py --dev --declare-origin=EVENT_ID '
+            '--note="how you know"')
+    rec = _read_selection()
+    if not rec:
+        raise RuntimeError("no frozen selection to declare a benchmark origin for")
+    require_readable_log()
+    freeze_id = rec.get("freeze_id")
+    best, doubtful = _origin_evidence(exposure_accounting(rec, exposure_events()), freeze_id)
+    if not doubtful:
+        raise RuntimeError(
+            f"there is no origin to declare: the records establish the latest exposure of "
+            f"this freeze ({best!r}). A declaration can only settle what the records cannot.")
+    candidates = ([best] if best else []) + doubtful
+    if event_id not in candidates:
+        raise RuntimeError(
+            f"{event_id!r} is not an exposure that could have produced this freeze's "
+            f"benchmark; the candidates are {candidates}.")
+    rec = dict(rec)
+    rec["origin_declaration"] = {"event_id": event_id, "freeze_id": freeze_id,
+                                 "candidates": candidates, "note": str(note),
+                                 "declared_at": datetime.now(timezone.utc).isoformat()}
+    config.atomic_write_text(SELECTION_STAMP, json.dumps(rec, indent=1))
+    return rec
 
 
 def freeze_selection(note: str = "", revalidate: bool = False,
@@ -1880,9 +2195,14 @@ def freeze_selection(note: str = "", revalidate: bool = False,
     # log alone would make a declaration self-erasing: the ids it exists to preserve are
     # exactly the ones the log no longer has, so the next freeze would stamp a shorter
     # list and the exposures would be gone for good.
+    # MIGRATED BEFORE ANYTHING IS REWRITTEN. Everything the previous record knew - its
+    # stamps, and the exposure list an earlier release saved in it - describes exposures
+    # the log may have lost, and `exposures` has just been overwritten with what the log
+    # still reads. Carrying only the stamps is how a previous release's workspace lost its
+    # benchmark origin the moment its loss was declared.
+    carried = exposure_accounting(old, exposure_events())
     accounting = exposure_accounting(
-        dict(rec, exposure_stamps=(old or {}).get("exposure_stamps"),
-             exposure_event_ids=(old or {}).get("exposure_event_ids")),
+        dict(rec, exposure_stamps=carried["stamps"], exposure_event_ids=carried["known_ids"]),
         exposure_events())
     rec["exposure_stamps"] = accounting["stamps"]
     rec["exposure_event_ids"] = accounting["known_ids"]
@@ -1900,6 +2220,7 @@ def freeze_selection(note: str = "", revalidate: bool = False,
                        "at": loss["declared_at"],
                        # THIS declaration's loss - earlier ones have their own events.
                        "lost_event_ids": loss["declarations"][-1]["lost_event_ids"],
+                       "lost_close_ids": loss["declarations"][-1]["lost_close_ids"],
                        "damaged_lines": loss["declarations"][-1]["damaged_lines"],
                        "note": loss["note"]})
     return rec
@@ -1928,6 +2249,7 @@ def evidence_flags() -> dict:
     declared_prior = bool(rec.get("prior_exposure_declared")) if rec else False
     revalidated = bool(rec.get("revalidated")) if rec else False
     in_effect = accounting["loss_in_effect"]
+    origin_declared = bool(rec) and origin_was_declared(accounting, freeze_id)
     return {
         "logged_exposures": len(events),
         "exposures_under_this_freeze": len(mine),
@@ -1940,6 +2262,9 @@ def evidence_flags() -> dict:
         # THE PRESENT: what a declaration covers that is still unreadable now.
         "exposures_still_missing": len(accounting["still_missing_declared"]),
         "log_loss_in_effect": in_effect,
+        # A STATEMENT, NOT A RECORD: the benchmark's exposure could not be established from
+        # the files, and the team declared it.
+        "origin_declared": origin_declared,
         "status": _classify_evidence(len(events), len(mine), declared_prior, revalidated,
                                      bool(rec), in_effect),
     }
@@ -1999,7 +2324,7 @@ def record_holdout_exposure(reason: str = "fresh holdout draw") -> dict:
             "the configuration has moved since the selection was frozen; freeze again "
             "before asking the holdout anything.")
 
-    resumed = open_exposure(freeze_id)
+    resumed, not_resumable = unfinished_exposure(freeze_id, rec)
     if resumed is not None:
         print(f"    continuing holdout exposure {resumed['sequence']} "
               f"({resumed['event_id']}) - a resumed run is not a new exposure")
@@ -2015,10 +2340,14 @@ def record_holdout_exposure(reason: str = "fresh holdout draw") -> dict:
     recorded = known_exposure_count(rec)
     authorised = int(rec.get("authorised_exposures", 1))
     if recorded >= authorised:
+        why = (f"\nThe exposure left open cannot be resumed: {not_resumable}. Resuming it "
+               f"would draw new answers from the held-out meetings under a look that may "
+               f"already be spent, so a further request is a new exposure."
+               if not_resumable else "")
         raise RuntimeError(
             f"the held-out sample has already been exposed {recorded} time(s) and this "
-            f"freeze authorises {authorised}. Asking it again is a second experiment on "
-            f"the same data, and it has to be declared rather than taken:\n"
+            f"freeze authorises {authorised}.{why}\nAsking it again is a second experiment "
+            f"on the same data, and it has to be declared rather than taken:\n"
             f'    python src/decision_replay.py --dev --revalidate --note="why a second '
             f'exposure is justified"\n'
             f"The report must then say so; the rubric credits the declaration, not the "
@@ -2040,30 +2369,49 @@ def record_holdout_exposure(reason: str = "fresh holdout draw") -> dict:
     # exposure and the next freeze, deleting the log therefore erased the exposure with
     # nothing to notice: the window covered the whole holdout run. Written AFTER the log
     # append is fsynced, so a crash in between leaves the exposure recorded rather than
-    # only remembered.
-    stamped = list(rec.get("exposure_event_ids") or [])
-    stamps = [s for s in (rec.get("exposure_stamps") or []) if isinstance(s, dict)]
-    if event["event_id"] not in stamped:
-        stamped.append(event["event_id"])
-        # WITH ITS FREEZE AND ITS ORDER, so the benchmark this exposure produces can still
-        # be bound to it after the log line describing it is lost.
-        stamps.append({k: event.get(k) for k in _STAMP_FIELDS})
-        rec["exposure_event_ids"] = stamped
-        rec["exposure_stamps"] = stamps
-        rec["exposures"] = exposures_recorded()
-        rec["exposure_number"] = len(stamped)
-        config.atomic_write_text(SELECTION_STAMP, json.dumps(rec, indent=1))
+    # only remembered. Every earlier exposure's record is carried with it, migrated from
+    # whatever the selection held.
+    accounting = exposure_accounting(rec, exposure_events())
+    stamps = accounting["stamps"]
+    for stamp in stamps:
+        if stamp["event_id"] == event["event_id"]:
+            # THE FREEZE KNOWS THIS BENCHMARK HAS NOT FINISHED - the positive evidence a
+            # later resume needs, and the only kind a resume accepts.
+            stamp[_COMPLETION_FIELD] = None
+    rec["exposure_event_ids"] = accounting["known_ids"]
+    rec["exposure_stamps"] = stamps
+    rec["exposures"] = exposures_recorded()
+    rec["exposure_number"] = len(accounting["known_ids"])
+    config.atomic_write_text(SELECTION_STAMP, json.dumps(rec, indent=1))
     print(f"    HOLDOUT EXPOSURE {sequence} recorded as {event['event_id']} ({reason})")
     return dict(event, resumed=False, exposure_number=sequence,
                 exposures=exposures_recorded())
 
 
 def close_holdout_exposure(event_id: str, outcome: str = "benchmark completed") -> None:
-    """Append the fact that an exposure finished. Never edits the `open` line."""
+    """Append the fact that an exposure finished, then record it in the freeze.
+
+    Never edits the `open` line. THE FREEZE RECORDS THE COMPLETION TOO, so a benchmark stays
+    finished when its close line is later damaged or lost: a finished benchmark whose close
+    could not be read used to be resumed, and sampled the held-out meetings again. Written
+    after the log line is durable, so a crash in between leaves a readable close rather
+    than a completion the log never saw.
+    """
     if not event_id:
         return
     _append_event({"type": "close", "event_id": event_id, "outcome": outcome,
                    "at": datetime.now(timezone.utc).isoformat()})
+    rec = _read_selection()
+    if not rec:
+        return
+    accounting = exposure_accounting(rec, exposure_events())
+    # A CONTRADICTORY HISTORY IS LEFT EXACTLY AS IT IS: rewriting the stamps would settle the
+    # contradiction in favour of whichever record happened to be read first.
+    if accounting["conflicts"] or accounting["stamps"] == rec.get("exposure_stamps"):
+        return
+    rec["exposure_stamps"] = accounting["stamps"]
+    rec["exposure_event_ids"] = accounting["known_ids"]
+    config.atomic_write_text(SELECTION_STAMP, json.dumps(rec, indent=1))
 
 
 #: Which sample the benchmark is currently running, so `_cached_call` can record an
@@ -2112,7 +2460,8 @@ def _require_frozen_selection() -> None:
 
 
 def run_dev(revalidate: bool = False, note: str = "",
-            prior_exposure: bool = False, lost_log: bool = False) -> pd.DataFrame:
+            prior_exposure: bool = False, lost_log: bool = False,
+            origin: str = "") -> pd.DataFrame:
     """Development sample only, then freeze the selection. Costs no holdout exposure.
 
     `note` is recorded verbatim in the freeze. Use it when the record needs a caveat a
@@ -2122,6 +2471,13 @@ def run_dev(revalidate: bool = False, note: str = "",
     if not _prompts_written():
         raise NotImplementedError(
             "Set MEETING and write RECOMMENDATION_PROMPT and STATEMENT_PROMPT first.")
+    if origin:
+        # A STATEMENT ABOUT EVIDENCE THAT EXISTS - it spends nothing and asks nothing.
+        declare_origin(origin, note)
+        print(f"\n  DECLARED: this freeze's holdout benchmark came from exposure {origin}.")
+        print(f"  The evidence flags report origin_declared; say so, and how you know, in "
+              f"the report. Written to {SELECTION_STAMP.name}.")
+        return pd.DataFrame()
     if lost_log:
         # A RECOVERY ROUTE MUST NOT SPEND ANYTHING. Declaring a lost log is a statement
         # about evidence that already exists; re-running the development sample first
@@ -2318,12 +2674,14 @@ if __name__ == "__main__":
     if "--dev" in sys.argv:
         # Development sample only, then freeze the selection. The holdout is untouched,
         # so iterate here as often as the budget allows.
-        _note = ""
+        _note, _origin = "", ""
         for _a in sys.argv:
             if _a.startswith("--note="):
                 _note = _a.split("=", 1)[1]
+            if _a.startswith("--declare-origin="):
+                _origin = _a.split("=", 1)[1]
         run_dev(revalidate="--revalidate" in sys.argv, note=_note,
                 prior_exposure="--prior-exposure" in sys.argv,
-                lost_log="--declare-lost-log" in sys.argv)
+                lost_log="--declare-lost-log" in sys.argv, origin=_origin)
     else:
         run()

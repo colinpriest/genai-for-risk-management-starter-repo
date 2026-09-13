@@ -742,20 +742,6 @@ def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposur
     log_path = ROOT / "outputs" / dr.EXPOSURE_LOG.name
     committed = dr.parse_exposure_log(log_path) if log_path.exists() else None
     accounting = dr.exposure_accounting(selection, committed or [])
-    assert not accounting["conflicts"], (
-        f"outputs/{dr.EXPOSURE_LOG.name} records different events under the same id "
-        f"{accounting['conflicts']}. Restore it from version control rather than editing "
-        f"it.")
-    undeclared = accounting["undeclared_damage"]
-    assert not undeclared, (
-        f"outputs/{dr.EXPOSURE_LOG.name} is damaged, so the number of holdout "
-        f"exposures it records cannot be read:\n  "
-        + "\n  ".join(f"line {d.get('line_number')}: {d.get('problem')}"
-                      for d in undeclared)
-        + ("\nA lost-log declaration covers other lines of this file; these are not "
-           "among them." if selection.get("log_loss") else "")
-        + "\nRestore it from version control rather than editing it. If it is genuinely "
-          "unrecoverable, tell the course staff and declare it with --declare-lost-log.")
 
     if any(e.get("type") == "open" for e in embedded_events):
         assert committed is not None, (
@@ -763,6 +749,15 @@ def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposur
             f"outputs/{dr.EXPOSURE_LOG.name} is missing. That file is the append-only "
             f"authority the count rests on; the copy inside the artefact is not evidence "
             f"of itself. Commit the log.")
+    # AND JUDGED BY THE RUNTIME'S OWN RULE. This check tested contradictions and undeclared
+    # damage but never undeclared MISSING exposures: with an earlier exposure's records
+    # deleted and the report regenerated to agree with the shortened log, a history the
+    # Replay stage refused to run on passed here. Both now apply exposure_history_problems().
+    problems = dr.exposure_history_problems(selection, committed or [], accounting)
+    assert not problems, (
+        f"the exposure history in outputs/{dr.SELECTION_STAMP.name} and "
+        f"outputs/{dr.EXPOSURE_LOG.name} cannot be accepted as evidence - the Replay stage "
+        f"refuses to run on it for the same reason:\n\n" + "\n\n".join(problems))
     # WHENEVER THE LOG EXISTS, IT IS THE HISTORY - not only when the report admits to
     # having one. Guarding this comparison on the EMBEDDED list having an open event let
     # a report replace its history with [] and, under a prior-exposure declaration, pass
@@ -799,12 +794,16 @@ def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposur
     # ---- the REPORTED benchmark is bound to ONE exposure: the latest this freeze made --
     known = accounting["known_ids"]
     if known:
+        current_freeze = selection.get("freeze_id")
+        # AN ORIGIN THE RECORDS CANNOT ESTABLISH IS REFUSED, not settled on the latest
+        # exposure still described - which is how a benchmark came to be bound to an older
+        # look. A declared origin is accepted, and reported in the flags below.
+        latest, doubtful = dr.exposure_origin(accounting, current_freeze)
+        assert not doubtful, dr.origin_uncertainty_message(doubtful)
         event_id = exposure.get("holdout_event_id")
         assert event_id, (
             "replay.json reports holdout numbers without naming the exposure they came "
             "from. Regenerate the Replay stage so the benchmark carries its event id.")
-        current_freeze = selection.get("freeze_id")
-        latest = dr.latest_exposure_for(accounting, current_freeze)
         readable = {e.get("event_id"): e for e in opened}
         if event_id in readable:
             event = readable[event_id]
@@ -890,6 +889,7 @@ def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposur
         "log_loss_declared": bool(selection.get("log_loss")),
         "exposures_still_missing": len(accounting["still_missing_declared"]),
         "log_loss_in_effect": accounting["loss_in_effect"],
+        "origin_declared": dr.origin_was_declared(accounting, freeze_id),
     }
     # ONE CLASSIFIER STILL - fed verified facts rather than reported ones.
     derived["status"] = dr._classify_evidence(
@@ -907,7 +907,8 @@ def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposur
     for field, not_declared in (("exposures_declared_lost", 0),
                                 ("log_loss_declared", False),
                                 ("exposures_still_missing", 0),
-                                ("log_loss_in_effect", False)):
+                                ("log_loss_in_effect", False),
+                                ("origin_declared", False)):
         if field not in reported and derived[field] == not_declared:
             reported[field] = not_declared
     disagreements = [
@@ -934,6 +935,9 @@ def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposur
     if derived["log_loss_declared"]:
         assert str((selection.get("log_loss") or {}).get("note", "")).strip(), (
             "a declared loss of the exposure log must say what happened to it")
+    if derived["origin_declared"]:
+        assert str((selection.get("origin_declaration") or {}).get("note", "")).strip(), (
+            "a declared benchmark origin must say how the team knows it")
     if len(accounting["known_ids"]) > 1 or derived["revalidated"]:
         assert str(selection.get("authorisation", "")).strip(), (
             "a second exposure must carry the declared reason it was authorised for")
