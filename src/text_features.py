@@ -458,7 +458,11 @@ def score_once(text: str, call_index: int) -> dict:
             # ACCUMULATED ACROSS OUTER ATTEMPTS, and `0` is a real answer: a failure
             # raised before any request left cost no requests, and `or 1` said it cost one.
             attempted = courseapi.transport_attempts(e)
-            transport += attempted if isinstance(attempted, int) else 1
+            # AN UNSTAMPED FAILURE IS NOT EVIDENCE OF A REQUEST. The adapter stamps every
+            # failure that passed through its transport path with the real count; one with
+            # no stamp was not counted there, and treating it as one request wrote a
+            # request into the record of a draw that never contacted the service.
+            transport += attempted if isinstance(attempted, int) else 0
             spent_usage = courseapi.merge_usage(
                 spent_usage, courseapi.failed_attempt_usage(e))
             # A RUN-LEVEL failure is not this call's failure, it is the end of the run:

@@ -768,17 +768,34 @@ def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposur
             f"outputs/{dr.EXPOSURE_LOG.name} is missing. That file is the append-only "
             f"authority the count rests on; the copy inside the artefact is not evidence "
             f"of itself. Commit the log.")
+    # WHENEVER THE LOG EXISTS, IT IS THE HISTORY - not only when the report admits to
+    # having one. Guarding this comparison on the EMBEDDED list having an open event let
+    # a report replace its history with [] and, under a prior-exposure declaration, pass
+    # while the committed log held two real exposures. The report has to agree with the
+    # file whether it claims exposures or claims none.
+    if committed is not None:
         assert committed == embedded_events, (
             f"the exposure history embedded in replay.json is not the history in "
-            f"outputs/{dr.EXPOSURE_LOG.name}. One of them has been edited; regenerate "
-            f"the Replay stage from the committed log.")
+            f"outputs/{dr.EXPOSURE_LOG.name}: the artefact reports "
+            f"{len([e for e in embedded_events if e.get('type') == 'open'])} exposure(s) "
+            f"and the log records "
+            f"{len([e for e in committed if e.get('type') == 'open'])}. One of them has "
+            f"been edited; regenerate the Replay stage from the committed log.")
 
-    opened = [e for e in embedded_events if e.get("type") == "open"]
+    # THE AUTHORITATIVE HISTORY, from here on. `committed` is the file; the embedded copy
+    # has just been required to equal it, so anything derived below rests on the file.
+    authoritative = committed if committed is not None else []
+    opened = [e for e in authoritative if e.get("type") == "open"]
+    # A DECLARED LOSS OF THE LOG is the third way a holdout result can stand: the exposures
+    # happened - the freeze stamped their ids when they did - and their record cannot be
+    # produced. It is read from the SELECTION, where it is declared, never from the report.
+    log_loss = selection.get("log_loss") or {}
+    lost_ids = [e for e in (log_loss.get("lost_event_ids") or []) if e]
     # EITHER the log records the exposure, OR the team declares that it happened before
     # the log existed. An empty log means one of two opposite things - untouched, or
     # exposed by a process that never recorded it - and the difference has to be stated
     # rather than inferred. What is NOT acceptable is holdout results with neither.
-    assert opened or declared_prior, (
+    assert opened or declared_prior or log_loss, (
         "the holdout results are reported, but no holdout exposure was recorded and none "
         "was declared. Either regenerate the stage so the log records what was asked, or "
         "declare an exposure that predates the log:\n"
@@ -805,7 +822,7 @@ def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposur
             f"exposure {event_id} was recorded against freeze "
             f"{event.get('freeze_id')!r}, not the current freeze "
             f"{selection.get('freeze_id')!r}")
-        closed = {e.get("event_id") for e in embedded_events
+        closed = {e.get("event_id") for e in authoritative
                   if e.get("type") == "close"}
         assert event_id in closed, (
             f"exposure {event_id} was never closed, so the benchmark it reports did not "
@@ -813,9 +830,18 @@ def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposur
         # Every exposure must have been authorised: the freeze says how many looks at the
         # holdout the selection allows, and the log says how many were taken.
         authorised = int(selection.get("authorised_exposures", 1))
-        assert len(opened) <= authorised, (
+        assert len(opened) + len(lost_ids) <= authorised, (
             f"the log records {len(opened)} holdout exposure(s) but the freeze authorises "
             f"{authorised}. A further look has to be declared with --revalidate.")
+    elif log_loss:
+        # THE REPORT RESTS ON AN EXPOSURE WHOSE RECORD WAS DECLARED LOST. Its open and close
+        # events cannot be produced, so they cannot be checked. What can be checked is that
+        # the event it names is one the freeze stamped and the declaration covers - so a
+        # declaration cannot be used to attach a benchmark to an exposure nobody recorded.
+        event_id = exposure.get("holdout_event_id")
+        assert event_id in lost_ids, (
+            f"holdout_event_id {event_id!r} is not one of the exposures the lost-log "
+            f"declaration covers ({lost_ids})")
 
     # ---- the status comes from ONE classifier, and this check reads it -------------
     # It used to re-derive the rule here, and the two derivations disagreed: a team that
@@ -835,17 +861,72 @@ def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposur
     assert flags["status"] == status, (
         f"replay.json's evidence_status ({status!r}) disagrees with its own flags "
         f"({flags['status']!r})")
-    assert dr._classify_evidence(
-        flags["logged_exposures"], flags["exposures_under_this_freeze"],
-        flags["prior_exposure_declared"], flags["revalidated"], True) == status, (
-        f"the recorded facts {flags} do not classify as {status!r} under this "
-        f"repository's rule - regenerate the Replay stage")
+
+    # ---- THE FLAGS ARE CHECKED AGAINST THE FILES, NOT AGAINST THEMSELVES ------------
+    # This used to run the shared classifier on the numbers the REPORT supplied, so it
+    # only ever asked "is this report internally consistent?". It was: a report whose
+    # flags claimed one exposure, no prior declaration and no revalidation classified
+    # as `prospective`, agreed with itself, and passed - while the frozen selection
+    # carried a prior-exposure declaration and the committed log held two exposures it
+    # had said nothing about. A summary that contradicts its own evidence is the one
+    # thing this check exists to catch, so the facts are now DERIVED from the frozen
+    # selection and the committed log and the report is compared against them.
+    lost = [e for e in ((selection.get("log_loss") or {}).get("lost_event_ids") or [])
+            if e]
+    freeze_id = selection.get("freeze_id")
+    mine = [e for e in opened if e.get("freeze_id") == freeze_id] if freeze_id else []
+    derived = {
+        "logged_exposures": len(opened),
+        "exposures_under_this_freeze": len(mine),
+        "exposures_under_earlier_freezes": len(opened) - len(mine),
+        "prior_exposure_declared": bool(selection.get("prior_exposure_declared")),
+        "revalidated": bool(selection.get("revalidated")),
+        "exposures_declared_lost": len(lost),
+        "log_loss_declared": bool(selection.get("log_loss")),
+    }
+    # ONE CLASSIFIER STILL - fed verified facts rather than reported ones.
+    derived["status"] = dr._classify_evidence(
+        derived["logged_exposures"], derived["exposures_under_this_freeze"],
+        derived["prior_exposure_declared"], derived["revalidated"], True,
+        derived["log_loss_declared"])
+    # FLAGS ADDED AFTER A REPORT COULD ALREADY EXIST. A replay.json written before a
+    # lost-log declaration was possible cannot have recorded one, so for these two fields -
+    # and only these - absence reads as "not declared", and is accepted only when the frozen
+    # selection agrees that nothing was declared. A report that omits them while the
+    # selection carries a declaration still disagrees, and is rejected. Every other flag
+    # existed when replay.json gained evidence_flags: its absence is a disagreement like any
+    # other, and the fix is to regenerate the report, never to assume a value for it.
+    reported = dict(flags)
+    for field, not_declared in (("exposures_declared_lost", 0),
+                                ("log_loss_declared", False)):
+        if field not in reported and derived[field] == not_declared:
+            reported[field] = not_declared
+    disagreements = [
+        f"{field}: replay.json says {reported.get(field)!r}, the evidence says {value!r}"
+        for field, value in derived.items()
+        if reported.get(field) != value
+    ]
+    assert not disagreements, (
+        "replay.json's exposure summary contradicts the evidence it summarises "
+        f"(outputs/{dr.SELECTION_STAMP.name} and outputs/{dr.EXPOSURE_LOG.name}):\n  "
+        + "\n  ".join(disagreements)
+        + "\nThe files are the record; the summary is a copy of it. Regenerate the "
+          "Replay stage rather than editing the report.")
+    assert status == derived["status"], (
+        f"replay.json calls its holdout evidence {status!r}, but the frozen selection "
+        f"and the committed log make it {derived['status']!r}")
 
     # ---- and the DECLARATIONS each qualification requires must be present -----------
-    if flags["prior_exposure_declared"]:
+    # Read from the SELECTION, which is where a declaration is made, rather than from
+    # the report's copy of it.
+    if derived["prior_exposure_declared"]:
         assert str(selection.get("note", "")).strip(), (
             "a declared prior exposure must say what happened, in words a marker reads")
-    if flags["logged_exposures"] > 1 or flags["revalidated"]:
+    if derived["log_loss_declared"]:
+        assert str((selection.get("log_loss") or {}).get("note", "")).strip(), (
+            "a declared loss of the exposure log must say what happened to it")
+    if derived["logged_exposures"] + derived["exposures_declared_lost"] > 1 \
+            or derived["revalidated"]:
         assert str(selection.get("authorisation", "")).strip(), (
             "a second exposure must carry the declared reason it was authorised for")
 

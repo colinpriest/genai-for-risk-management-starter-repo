@@ -268,6 +268,23 @@ def transport_attempts(exc: BaseException) -> int | None:
     return None if stamp is None else stamp.get("attempts")
 
 
+def stamp_unsent(exc: BaseException) -> BaseException:
+    """Stamp a failure raised BEFORE any request left: zero requests, no usage.
+
+    An unstamped exception used to reach the stages, which counted a failure with no
+    stamp as ONE request - so a missing access code or a forbidden model fallback was
+    recorded as `transport_requests: 1` for a draw that never contacted the service.
+    Zero is a real answer here, not an unknown one: nothing was sent. An existing stamp
+    is left alone, because a stamp is only ever written by code that counted.
+    """
+    if getattr(exc, _TRANSPORT_STAMP, None) is None:
+        stamp_transport(
+            exc, attempts=0,
+            budget_spent=failure_category(exc) not in STAGE_RETRYABLE_CATEGORIES,
+            usage=None)
+    return exc
+
+
 def failed_attempt_usage(exc: BaseException) -> dict | None:
     """Tokens a FAILED attempt still spent, when the service reported them.
 
@@ -344,10 +361,17 @@ SUPPORTED_ENVELOPE_VERSIONS = (2,)
 #   success           a completed, parsed answer: full response-side provenance
 #   response_failure  a response arrived and was rejected (truncated, filtered,
 #                     refused, nonterminal, schema): status is known, no payload
-#   pretransport      the request never left, or never got an answer (bad
-#                     credentials, forbidden fallback, timeout, 429): there is no
-#                     response id and no served model, and inventing one would be
-#                     a fabricated audit trail
+#   pretransport      NO USABLE RESPONSE. The name is historical, and it covers two
+#                     different situations that the request count tells apart:
+#                       - NOTHING WAS SENT (bad credentials, a forbidden fallback):
+#                         `failure.transport_attempts` is 0, `transport_requests`
+#                         is null and `usage` is null;
+#                       - REQUESTS WERE SENT and none was answered usably (a
+#                         timeout, a 429, a 5xx): `transport_requests` is the real
+#                         count, and `usage` says `tokens_known: false` with every
+#                         attempt in `attempts_unknown`.
+#                     Either way there is no response id and no served model, and
+#                     inventing one would be a fabricated audit trail
 #
 # Free-text calls cut across all three: they have no response schema, so
 # `response_schema_sha256_16` is absent from their provenance and is not required
@@ -538,7 +562,14 @@ def envelope_contradictions(call: dict, *, config_hash: str | None = None,
         # `is None` test and so satisfied the contract while carrying nothing, which is
         # how a version-2 success with no response-side provenance at all was accepted by
         # all three loaders.
-        missing = [f for f in spec["required"]
+        # TEMPERATURE IS REQUIRED ONLY WHILE THE RUN SAMPLES. A run that sets no sampling
+        # temperature sends none and records `temperature: null`, and every such record was
+        # refused as "missing" on its first reload - so that configuration could never
+        # replay its own cache. Under a sampling run it stays required, and a record that
+        # carries a temperature while the run sets none is refused by the checks below.
+        required = [f for f in spec["required"]
+                    if not (f == "temperature" and config.SAMPLING_TEMPERATURE is None)]
+        missing = [f for f in required
                    if call.get(f) is None
                    or (isinstance(call.get(f), (dict, list, str))
                        and len(call.get(f)) == 0)]
@@ -578,12 +609,124 @@ def envelope_contradictions(call: dict, *, config_hash: str | None = None,
             if value is not None and value != config.MODEL:
                 bad.append(f"{field}={value!r}, but this run is configured for "
                            f"{config.MODEL!r}")
-        for field, value in (("temperature", call.get("temperature")),
-                             ("request.temperature",
-                              (call.get("request") or {}).get("temperature"))):
-            if value is not None and value != config.SAMPLING_TEMPERATURE:
-                bad.append(f"{field}={value!r}, but this run is configured for "
-                           f"{config.SAMPLING_TEMPERATURE!r}")
+        top_temperature = call.get("temperature")
+        if (top_temperature is not None
+                and top_temperature != config.SAMPLING_TEMPERATURE):
+            bad.append(f"temperature={top_temperature!r}, but this run is configured for "
+                       f"{config.SAMPLING_TEMPERATURE!r}")
+
+        # EVERY RECORDED COPY OF THE REQUEST, not only the top-level one. The complete
+        # request is also written to `provenance.transmitted` on a success and to
+        # `failure.request` on a failure. A temperature of 99 in `transmitted` sat beside
+        # two correct copies and was never read, so a cache whose own record of what was
+        # sent contradicted this run was reused as though it agreed.
+        failure_block = call.get("failure") or {}
+        request_copies = [("request", call.get("request"))]
+        if "transmitted" in prov_block:
+            request_copies.append(("provenance.transmitted", prov_block.get("transmitted")))
+        if failure_block.get("request") is not None:
+            request_copies.append(("failure.request", failure_block.get("request")))
+        ceilings = {}
+        for label, copy in request_copies:
+            if copy is None:
+                continue          # a missing top-level request is the contract check's job
+            if not isinstance(copy, dict):
+                bad.append(f"{label} is a {type(copy).__name__}, not a request record")
+                continue
+            if label != "request":            # request.model is checked above
+                sent_model = copy.get("model")
+                if sent_model is not None and sent_model != config.MODEL:
+                    bad.append(f"{label}.model={sent_model!r}, but this run is "
+                               f"configured for {config.MODEL!r}")
+            # TEMPERATURE IS REQUIRED WHEN THE RUN SAMPLES. Every stage passes
+            # `config.SAMPLING_TEMPERATURE` explicitly, so a current request that omits it
+            # cannot say what produced the answer - and absence used to satisfy a check
+            # that only compared values that were present.
+            sent_temperature = copy.get("temperature")
+            if config.SAMPLING_TEMPERATURE is not None:
+                if sent_temperature is None:
+                    bad.append(f"{label} records no temperature, but this run samples at "
+                               f"{config.SAMPLING_TEMPERATURE!r}: a request without its "
+                               f"temperature cannot say what produced the answer")
+                elif sent_temperature != config.SAMPLING_TEMPERATURE:
+                    bad.append(f"{label}.temperature={sent_temperature!r}, but this run "
+                               f"is configured for {config.SAMPLING_TEMPERATURE!r}")
+            elif sent_temperature is not None:
+                bad.append(f"{label}.temperature={sent_temperature!r}, but this run sets "
+                           f"no sampling temperature, so none was sent")
+            # The CEILING is not compared with the one now in force - a different ceiling
+            # is a re-ask decided by `reusable_under_current_ceiling`, not a contradiction.
+            # It must be a real ceiling, and every copy must agree on which one it was.
+            ceiling = copy.get("max_output_tokens")
+            if ceiling is not None:
+                if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling <= 0:
+                    bad.append(f"{label}.max_output_tokens={ceiling!r} is not a positive "
+                               f"integer")
+                else:
+                    ceilings[label] = ceiling
+        if len(set(ceilings.values())) > 1:
+            bad.append(f"the recorded output ceilings disagree with each other: {ceilings}")
+
+        # COUNTS ARE COUNTS. A negative number of requests, attempts or tokens is not a
+        # record of anything that happened, and a bool is not a count. Consistency is
+        # checked only WITHIN one kind of figure: whole-call totals and the final adapter
+        # attempt's own metadata legitimately differ after a stage retry.
+        def _count(label, value, *, minimum=0):
+            if value is None:
+                return
+            if isinstance(value, bool) or not isinstance(value, int):
+                bad.append(f"{label}={value!r} is not an integer count")
+            elif value < minimum:
+                bad.append(f"{label}={value} is below {minimum}: "
+                           + ("a completed answer took at least one request"
+                              if minimum else "a count cannot be negative"))
+
+        succeeded = bool(call.get("ok"))
+        _count("transport_requests", call.get("transport_requests"),
+               minimum=1 if succeeded else 0)
+        _count("provenance.transport_requests", prov_block.get("transport_requests"),
+               minimum=1 if succeeded else 0)
+        _count("provenance.adapter_attempts", prov_block.get("adapter_attempts"),
+               minimum=1 if succeeded else 0)
+        _count("failure.transport_attempts", failure_block.get("transport_attempts"))
+        for usage_label in ("usage", "usage_final_response"):
+            usage = call.get(usage_label)
+            if usage is None:
+                continue
+            if not isinstance(usage, dict):
+                bad.append(f"{usage_label} is a {type(usage).__name__}, not a usage record")
+                continue
+            for key in _ADDITIVE_USAGE:
+                _count(f"{usage_label}.{key}", usage.get(key))
+            _count(f"{usage_label}.attempts_counted", usage.get("attempts_counted"))
+            _count(f"{usage_label}.attempts_unknown", usage.get("attempts_unknown"))
+            for flag in ("tokens_known", "is_complete"):
+                if flag in usage and not isinstance(usage[flag], bool):
+                    bad.append(f"{usage_label}.{flag}={usage[flag]!r} is not true or false")
+            unknown = usage.get("attempts_unknown")
+            if (usage.get("is_complete") is True and isinstance(unknown, int)
+                    and not isinstance(unknown, bool) and unknown > 0):
+                bad.append(f"{usage_label} is marked complete while {unknown} attempt(s) "
+                           f"have an unknown cost")
+            # The writers leave token keys OUT when nothing was reported. A record that
+            # says the cost is unknown and then states one is a zero bill in disguise.
+            if usage.get("tokens_known") is False:
+                stated = [k for k in _ADDITIVE_USAGE if k in usage]
+                if stated:
+                    bad.append(f"{usage_label} says no token usage was reported but "
+                               f"records {stated}: an unreported cost is absent, not a "
+                               f"number")
+
+    # AN EXPLICIT `null` IS NOT AN ABSENT MARKER. A record written before the contract
+    # existed has no `envelope_version` key at all; one that carries the key with no value
+    # is not legacy evidence, it is an invalid marker - and reading it as legacy silently
+    # switched off every current-contract check above, which is how a record with its
+    # version nulled and its provenance, served model, transport count and usage removed
+    # was accepted as a clean cache hit.
+    if "envelope_version" in call and call.get("envelope_version") is None:
+        bad.append("envelope_version is present but null: a record from before the "
+                   "contract has no marker at all, so this is an invalid marker rather "
+                   "than a legacy one, and the weaker legacy checks do not apply")
     return bad
 
 
@@ -619,12 +762,14 @@ def validate_call_kwargs(kwargs: dict) -> None:
         if name in _ACCEPTED_KWARGS:
             continue
         why = _REJECTED_KWARGS.get(name)
-        raise unsw_ai.ParameterNotSupportedError(
+        # Refused before anything is sent, so stamped as zero requests: a rejected
+        # parameter must not be recorded as a call that reached the service.
+        raise stamp_unsent(unsw_ai.ParameterNotSupportedError(
             f"courseapi does not accept {name!r}: "
             + (why or "it is not transmitted by this adapter, and an adapter "
                       "that accepted it would put a parameter in the "
                       "reproducibility record that never reached the service")
-            + ". Remove it from the call.")
+            + ". Remove it from the call."))
 
 
 def normalise_usage(raw: Any) -> dict | None:
@@ -1099,9 +1244,15 @@ class _Completions:
         retried them and each stage attempt is one more request rather than five.
         """
         _account_reset()
-        client = unsw_ai.get_client(req["model"])
-        self._no_substitution(client, req["model"])
-        settings = client.settings
+        try:
+            client = unsw_ai.get_client(req["model"])
+            self._no_substitution(client, req["model"])
+            settings = client.settings
+        except Exception as exc:  # noqa: BLE001 - stamped, then re-raised unchanged
+            # A forbidden fallback is refused HERE, before any request - and it used to
+            # leave this method unstamped, so the stages recorded it as one request.
+            stamp_unsent(exc)
+            raise
         retries = 0 if wrapper_retries else unsw_ai.DEFAULT_RATE_LIMIT_RETRIES
         for attempt in range(retries + 1):
             # The wrapper stashes each raw response on a THREAD-LOCAL. Clear it
@@ -1159,8 +1310,13 @@ class _Completions:
                               response_format=response_format,
                               temperature=temperature, call_index=call_index,
                               max_tokens=max_tokens)
-        req = self._transmitted(model, temperature, max_tokens)
-        client = unsw_ai.get_client(req["model"])
+        try:
+            req = self._transmitted(model, temperature, max_tokens)
+            client = unsw_ai.get_client(req["model"])
+        except Exception as exc:  # noqa: BLE001 - stamped, then re-raised unchanged
+            # Nothing has been sent yet: a missing access code fails right here.
+            stamp_unsent(exc)
+            raise
 
         # VALIDATION HAPPENS INSIDE THE GUARD, so a truncated free-text answer is
         # accounted for like any other failure. Validating after `_guarded` returned
@@ -1185,8 +1341,13 @@ class _Completions:
     def parse(self, *, model=None, messages, response_format, temperature=None,
               call_index=None, max_tokens=None, **rejected):
         validate_call_kwargs(rejected)
-        req = self._transmitted(model, temperature, max_tokens)
-        client = unsw_ai.get_client(req["model"])
+        try:
+            req = self._transmitted(model, temperature, max_tokens)
+            client = unsw_ai.get_client(req["model"])
+        except Exception as exc:  # noqa: BLE001 - stamped, then re-raised unchanged
+            # Nothing has been sent yet: a missing access code fails right here.
+            stamp_unsent(exc)
+            raise
         # `_repair_policy()` lets INSTRUCTOR re-ask once for a completed-but-
         # invalid object, and not at all for a truncated or filtered one. Its
         # repair loop used to re-ask three times for a body the service had cut

@@ -65,7 +65,13 @@ def _response(parsed=None, text=None):
                         tokens_known=True, is_complete=True),
         request={"model": config.MODEL, "temperature": config.SAMPLING_TEMPERATURE,
                  "max_output_tokens": config.MAX_OUTPUT_TOKENS},
-        provenance={"transmitted": {"max_output_tokens": config.MAX_OUTPUT_TOKENS},
+        # `transmitted` is the COMPLETE request, exactly as `_provenance` copies it. A fake
+        # that recorded only the ceiling there was a fake of a writer that dropped the
+        # model and temperature from its own record of what it sent - and it passed only
+        # because nothing read that copy.
+        provenance={"transmitted": {"model": config.MODEL,
+                                    "temperature": config.SAMPLING_TEMPERATURE,
+                                    "max_output_tokens": config.MAX_OUTPUT_TOKENS},
                     "model_requested": config.MODEL, "model_served": config.MODEL,
                     "response_status": "completed", "transport_requests": 1,
                     "input_sha256_16": "0123456789abcdef",
@@ -1885,7 +1891,10 @@ def _contract_response():
         usage=dict(usage),
         call_usage=dict(usage, attempts_counted=1, attempts_unknown=0,
                         tokens_known=True, is_complete=True),
+        # `transmitted` is the complete request, exactly as `_provenance` writes it. Without
+        # it, the loader's comparison of that copy could never be exercised through here.
         provenance={"envelope_version": 2, "response_status": "completed",
+                    "transmitted": dict(request),
                     "model_requested": config.MODEL, "model_served": config.MODEL,
                     "input_sha256_16": "0123456789abcdef",
                     "transport_requests": 1})
@@ -1955,6 +1964,235 @@ def test_replay_and_shock_write_and_enforce_the_shared_envelope_contract(monkeyp
 
 def _explode(*a, **k):
     raise RuntimeError("this call must be served from cache")
+
+
+# -------------------------------------------------------------------------------------------
+# EVERY RECORDED COPY OF THE REQUEST, AND COUNTS AS COUNTS  (recheck-5 S2)
+# -------------------------------------------------------------------------------------------
+# Each case writes a VALID record through the real stage writer, over the real adapter and a
+# scripted transport; proves the loader serves it from cache; changes ONE thing; and proves
+# the loader then refuses it. Refusing means a fresh request was attempted AND no cached
+# payload came back - for Replay a returned failed record is a refusal, not an acceptance,
+# so the absence of an exception is never taken as a pass.
+
+def _real_writer_cache(stage, tmp_path, monkeypatch):
+    import warnings
+    import httpx
+    import openai
+    from pydantic import BaseModel
+    import courseapi
+    import unsw_ai
+    import decision_replay as dr
+    import scenarios as sc
+
+    class CacheProbe(BaseModel):
+        value: int
+
+    def respond(request):
+        return httpx.Response(200, json={
+            "id": "resp_synthetic", "object": "response", "created_at": 1,
+            "model": config.MODEL, "status": "completed", "incomplete_details": None,
+            "output": [{"type": "function_call", "id": "f", "call_id": "c",
+                        "name": "CacheProbe", "arguments": '{"value":1}',
+                        "status": "completed"}],
+            "usage": {"input_tokens": 10, "output_tokens": 10, "total_tokens": 20}})
+
+    mod = dr if stage == "replay" else sc
+    sdk = openai.OpenAI(api_key="synthetic", base_url="https://synthetic.invalid",
+                        max_retries=0,
+                        http_client=httpx.Client(transport=httpx.MockTransport(respond)))
+    settings = unsw_ai.ProxySettings(proxy_url="https://synthetic.invalid",
+                                     access_code="synthetic", student_id="9999999",
+                                     fallback_models=())
+    monkeypatch.setattr(unsw_ai, "build_openai_client", lambda *a, **k: sdk)
+    monkeypatch.setattr(unsw_ai.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(config, "ledger_add", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "RAW_DIR", tmp_path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        client = unsw_ai.UNSWInstructor(settings=settings)
+    monkeypatch.setattr(unsw_ai, "get_client", lambda *a, **k: client)
+    monkeypatch.setattr(mod, "client_", lambda *a, **k: courseapi.CourseClient())
+    if stage == "replay":
+        def call():
+            return dr._cached_call("probe", "system", "user", schema=CacheProbe)
+    else:
+        def call():
+            return sc.llm_parsed("system", "user", CacheProbe)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        call()
+    paths = sorted(tmp_path.glob("*.json"))
+    assert len(paths) == 1, f"{stage} wrote {len(paths)} cache files"
+    return paths[0], json.loads(paths[0].read_text(encoding="utf-8")), call, mod
+
+
+def _served_from_cache(monkeypatch, mod, call):
+    """True only when NOTHING was requested AND a successful payload came back."""
+    attempts = {"n": 0}
+
+    def refuse(*a, **k):
+        attempts["n"] += 1
+        raise RuntimeError("the cache was refused, so a fresh request was attempted")
+
+    monkeypatch.setattr(mod, "client_", refuse)
+    try:
+        value = call()
+    except Exception:                                    # noqa: BLE001
+        value = None
+    succeeded = value is not None and not (isinstance(value, dict)
+                                           and value.get("ok") is False)
+    return attempts["n"] == 0 and succeeded
+
+
+def _without(block, key):
+    block.pop(key, None)
+
+
+_S2_MUTATIONS = {
+    "request omits the temperature":
+        lambda r: _without(r["request"], "temperature"),
+    "transmitted omits the temperature":
+        lambda r: _without(r["provenance"]["transmitted"], "temperature"),
+    "transmitted temperature contradicts the run":
+        lambda r: r["provenance"]["transmitted"].update(temperature=99),
+    "transmitted model contradicts the run":
+        lambda r: r["provenance"]["transmitted"].update(model="another-deployment"),
+    "transmitted ceiling disagrees with the request":
+        lambda r: r["provenance"]["transmitted"].update(
+            max_output_tokens=r["request"]["max_output_tokens"] + 1),
+    "negative transport count":
+        lambda r: r.update(transport_requests=-1),
+    "boolean transport count":
+        lambda r: r.update(transport_requests=True),
+    "a success that took no request":
+        lambda r: r.update(transport_requests=0),
+    "negative adapter attempts":
+        lambda r: r["provenance"].update(adapter_attempts=-1),
+    "negative token count":
+        lambda r: r["usage"].update(total_tokens=-40),
+    "token count that is not a number":
+        lambda r: r["usage"].update(input_tokens="10"),
+    "complete bill with attempts of unknown cost":
+        lambda r: r["usage"].update(attempts_unknown=1),
+    "unknown cost that still states tokens":
+        lambda r: r["usage"].update(tokens_known=False),
+    "explicit null version":
+        lambda r: r.update(envelope_version=None),
+    "null version with the current fields stripped":
+        lambda r: r.update(envelope_version=None, provenance=None, model_served=None,
+                           transport_requests=None, usage=None),
+}
+
+
+@pytest.mark.parametrize("stage", ["replay", "shock"])
+@pytest.mark.parametrize("mutation", list(_S2_MUTATIONS))
+def test_a_cached_record_with_one_invalid_field_is_not_served(stage, mutation, tmp_path,
+                                                             monkeypatch):
+    path, saved, call, mod = _real_writer_cache(stage, tmp_path, monkeypatch)
+    assert _served_from_cache(monkeypatch, mod, call), (
+        f"{stage}: the unmodified record the real writer produced must be served from "
+        f"cache - without that control, a refusal below proves nothing")
+    changed = json.loads(json.dumps(saved))
+    _S2_MUTATIONS[mutation](changed)
+    # Compared as WRITTEN, not as Python values: `True == 1`, so a boolean count compares
+    # equal to the integer it replaces while the file on disk says `true`.
+    assert json.dumps(changed, sort_keys=True) != json.dumps(saved, sort_keys=True), (
+        "the mutation must actually change the record")
+    path.write_text(json.dumps(changed), encoding="utf-8")
+    assert not _served_from_cache(monkeypatch, mod, call), (
+        f"{stage} served a cached payload from a record where the {mutation}")
+
+
+@pytest.mark.parametrize("stage", ["replay", "shock"])
+def test_genuine_legacy_evidence_is_still_served(stage, tmp_path, monkeypatch):
+    """
+    The control these rules must not break. Every committed Replay and Shock envelope in
+    the worked exemplar has exactly this shape: no version, no provenance, no transport
+    count, and a usage block of token figures only. Absence there is history, not a defect.
+    """
+    path, saved, call, mod = _real_writer_cache(stage, tmp_path, monkeypatch)
+    legacy = {k: v for k, v in saved.items()
+              if k not in ("envelope_version", "provenance", "model_served",
+                           "transport_requests", "usage_final_response")}
+    legacy["usage"] = {k: v for k, v in saved["usage"].items()
+                       if k not in ("attempts_counted", "attempts_unknown",
+                                    "tokens_known", "is_complete")}
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    assert _served_from_cache(monkeypatch, mod, call), (
+        f"{stage} refused a genuine legacy record - the new checks belong to the current "
+        f"contract and must never be applied to history")
+
+
+@pytest.mark.parametrize("stage", ["replay", "shock"])
+@pytest.mark.parametrize("fault", ["missing access code", "forbidden model fallback"])
+def test_a_failure_that_sent_nothing_records_no_request(stage, fault, tmp_path,
+                                                        monkeypatch):
+    """
+    Found while checking the AI-use template against what the writers emit: a missing
+    access code and a forbidden model fallback were recorded as `transport_requests: 1`,
+    because the stages counted a failure with no transport stamp as one request. Nothing
+    was sent. The two faults are raised in different places - `get_client` before the
+    guard, `_no_substitution` inside it - so both paths are exercised.
+    """
+    from pydantic import BaseModel
+    import courseapi
+    import unsw_ai
+    import decision_replay as dr
+    import scenarios as sc
+
+    class CacheProbe(BaseModel):
+        value: int
+
+    if fault == "missing access code":
+        def get_client(*a, **k):
+            raise unsw_ai.MissingCredentialsError("synthetic: no access code")
+    else:
+        misconfigured = types.SimpleNamespace(
+            settings=types.SimpleNamespace(fallback_models=("another-deployment",)))
+
+        def get_client(*a, **k):
+            return misconfigured
+
+    mod = dr if stage == "replay" else sc
+    monkeypatch.setattr(unsw_ai, "get_client", get_client)
+    monkeypatch.setattr(unsw_ai.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(config, "ledger_add", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "RAW_DIR", tmp_path)
+    monkeypatch.setattr(mod, "client_", lambda *a, **k: courseapi.CourseClient())
+    try:
+        if stage == "replay":
+            dr._cached_call("probe", "system", "user", schema=CacheProbe)
+        else:
+            sc.llm_parsed("system", "user", CacheProbe)
+    except Exception:                                    # noqa: BLE001
+        pass                       # both stages raise AFTER writing the envelope
+    written = sorted(tmp_path.glob("*.json"))
+    assert len(written) == 1, f"{stage} wrote {len(written)} envelopes for one call"
+    rec = json.loads(written[0].read_text(encoding="utf-8"))
+    assert rec["transport_requests"] is None, (
+        f"{stage} recorded {rec['transport_requests']} request(s) for a call that sent none")
+    assert rec["failure"]["transport_attempts"] == 0, (
+        f"{stage}: failure.transport_attempts is {rec['failure']['transport_attempts']!r}; "
+        f"a failure raised before any request left is zero requests, not an unknown")
+    assert rec["usage"] is None, f"{stage} recorded a bill for a call that sent nothing"
+
+
+@pytest.mark.parametrize("stage", ["replay", "shock"])
+def test_a_run_without_a_sampling_temperature_is_validated_as_one(stage, tmp_path,
+                                                                  monkeypatch):
+    """Temperature is required WHILE the run samples - and refused when it does not."""
+    monkeypatch.setattr(config, "SAMPLING_TEMPERATURE", None)
+    path, saved, call, mod = _real_writer_cache(stage, tmp_path, monkeypatch)
+    assert "temperature" not in saved["request"], saved["request"]
+    assert _served_from_cache(monkeypatch, mod, call), (
+        f"{stage}: a record written with no sampling temperature, under a run that sets "
+        f"none, must be served")
+    changed = json.loads(json.dumps(saved))
+    changed["request"]["temperature"] = 1.0
+    path.write_text(json.dumps(changed), encoding="utf-8")
+    assert not _served_from_cache(monkeypatch, mod, call), (
+        f"{stage} served a record claiming a temperature this run never sends")
 
 
 @pytest.mark.parametrize("version,accepted", [
@@ -2049,14 +2287,17 @@ def two_exposures(monkeypatch, tmp_path):
     sub = _submission_module()
     monkeypatch.setattr(sub, "ROOT", tmp_path)
 
-    def artefact(event_id=None, events=None):
+    def artefact(event_id=None, events=None, flags=None, status=None):
         # Exactly what the real writer emits, flags included: a fixture that omits a
         # field the producer always writes is a fake of a defect, not of the producer.
+        # `flags` and `status` exist so a test can mutate the SUMMARY while leaving the
+        # files it summarises untouched - the shape of the defect S1 reported.
+        real_flags = dr.evidence_flags()
         return {"selection": dr._read_selection(),
                 "exposure": {
                     "events": dr.exposure_events() if events is None else events,
-                    "evidence_status": dr.evidence_status(),
-                    "evidence_flags": dr.evidence_flags(),
+                    "evidence_status": status or real_flags["status"],
+                    "evidence_flags": real_flags if flags is None else flags,
                     "holdout_event_id": event_id or b["event_id"]}}
 
     def validate(**kw):
@@ -2085,6 +2326,281 @@ def test_the_submission_check_reads_the_committed_log_not_the_embedded_copy(two_
     two_exposures.log.unlink()
     with pytest.raises(AssertionError, match="is missing"):
         two_exposures.validate(events=embedded)
+
+
+# ---------------------------------------------------------------------------------------
+# A SUMMARY IS CHECKED AGAINST WHAT IT SUMMARISES, NOT AGAINST ITSELF (recheck-5 S1)
+# ---------------------------------------------------------------------------------------
+# The check ran the shared classifier on the flags the REPORT supplied, so it asked only
+# whether a report agreed with itself. Every mutation below leaves the frozen selection
+# and the committed log exactly as the real producer wrote them, and changes ONE thing
+# in replay.json's summary. Each used to pass.
+
+def _relabelled(two_exposures, **changes):
+    flags = dict(dr.evidence_flags())
+    flags.update(changes)
+    return flags
+
+
+@pytest.mark.parametrize("field,value", [
+    ("logged_exposures", 1),
+    ("logged_exposures", 0),
+    ("exposures_under_this_freeze", 2),
+    ("exposures_under_earlier_freezes", 0),
+    ("revalidated", False),
+    ("prior_exposure_declared", True),
+    ("exposures_declared_lost", 1),
+    ("log_loss_declared", True),
+])
+def test_a_report_cannot_misstate_one_fact_about_its_own_evidence(two_exposures,
+                                                                  field, value):
+    real = dr.evidence_flags()
+    assert real[field] != value, "the mutation must actually change the fact"
+    flags = _relabelled(two_exposures, **{field: value})
+    # Keep the report's status CONSISTENT with its false flags, so the only thing that
+    # can catch this is comparison with the files - which is the point.
+    flags["status"] = dr._classify_evidence(
+        flags["logged_exposures"], flags["exposures_under_this_freeze"],
+        flags["prior_exposure_declared"], flags["revalidated"], True,
+        flags["log_loss_declared"])
+    with pytest.raises(AssertionError, match="contradicts the evidence"):
+        two_exposures.validate(flags=flags, status=flags["status"])
+
+
+def test_a_false_prospective_label_is_rejected(two_exposures):
+    """The reviewer's case: two real exposures relabelled as one clean prospective look."""
+    flags = _relabelled(two_exposures, logged_exposures=1,
+                        exposures_under_this_freeze=1,
+                        exposures_under_earlier_freezes=0,
+                        revalidated=False, status="prospective")
+    with pytest.raises(AssertionError, match="contradicts the evidence"):
+        two_exposures.validate(flags=flags, status="prospective")
+
+
+def test_a_status_the_files_do_not_support_is_rejected_even_with_true_flags(two_exposures):
+    with pytest.raises(AssertionError):
+        two_exposures.validate(status="prospective")
+
+
+_LATER_FLAGS = ("exposures_declared_lost", "log_loss_declared")
+
+
+def test_a_report_written_before_the_lost_log_flags_existed_still_passes(two_exposures):
+    """
+    FOUND BY THE WORKED EXEMPLAR. Its committed replay.json predates the two lost-log
+    flags, and the first version of the S1 check read their absence as a contradiction -
+    so honest evidence produced a day earlier failed submission. A report that could not
+    have recorded a declaration does not disagree with evidence that holds none.
+    """
+    flags = {k: v for k, v in dr.evidence_flags().items() if k not in _LATER_FLAGS}
+    two_exposures.validate(flags=flags, status=flags["status"])
+
+
+def test_omitting_the_lost_log_flags_cannot_hide_a_declared_loss(two_exposures):
+    two_exposures.log.unlink()
+    dr.freeze_selection(lost_log=True, note="synthetic: the log could not be restored")
+    flags = {k: v for k, v in dr.evidence_flags().items() if k not in _LATER_FLAGS}
+    with pytest.raises(AssertionError, match="contradicts the evidence"):
+        two_exposures.validate(flags=flags, status=flags["status"])
+
+
+def test_the_lost_log_route_ends_in_an_honest_submission_that_passes(two_exposures):
+    """
+    THE RECOVERY HAS TO FINISH. `--declare-lost-log` got the runtime unstuck, but the
+    submission check still demanded a logged or pre-log exposure - and a lost log has
+    neither - so a team that followed the supported route could never submit. It must
+    pass, classified `previously_exposed`, with the benchmark bound to a covered exposure.
+    """
+    two_exposures.log.unlink()
+    dr.freeze_selection(lost_log=True, note="synthetic: the log could not be restored")
+    two_exposures.validate()
+    assert dr.evidence_status() == "previously_exposed"
+
+
+def test_a_lost_log_declaration_cannot_carry_a_benchmark_from_an_uncovered_exposure(
+        two_exposures):
+    two_exposures.log.unlink()
+    dr.freeze_selection(lost_log=True, note="synthetic: the log could not be restored")
+    with pytest.raises(AssertionError, match="declaration covers"):
+        two_exposures.validate(event_id="an-exposure-nobody-recorded")
+
+
+def test_a_report_cannot_drop_the_history_behind_a_prior_exposure_declaration(
+        two_exposures, monkeypatch):
+    """
+    The second S1 case. The comparison with the committed log ran only when the EMBEDDED
+    history held an open event - so replacing it with [] and zeroing the counts, under a
+    genuine prior-exposure declaration, passed while the log recorded two exposures.
+    """
+    rec = dr._read_selection()
+    rec["prior_exposure_declared"] = True
+    rec["note"] = "synthetic: the holdout was run before the log existed"
+    dr.SELECTION_STAMP.write_text(json.dumps(rec), encoding="utf-8")
+    flags = _relabelled(two_exposures, logged_exposures=0,
+                        exposures_under_this_freeze=0,
+                        exposures_under_earlier_freezes=0,
+                        prior_exposure_declared=True, status="previously_exposed")
+    with pytest.raises(AssertionError, match="log records 2"):
+        two_exposures.validate(events=[], flags=flags, status="previously_exposed",
+                               event_id="none")
+
+
+# ---- the controls: every legitimate route must still pass ----------------------------
+
+def test_a_single_prospective_exposure_passes(monkeypatch, tmp_path):
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    monkeypatch.setattr(dr, "SELECTION_STAMP", outputs / "replay_selection.json")
+    monkeypatch.setattr(dr, "EXPOSURE_LOG", outputs / "replay_exposures.jsonl")
+    monkeypatch.setattr(dr, "dev_sample", lambda *a, **k: ["2020-01-01"])
+    monkeypatch.setattr(dr, "holdout_sample", lambda *a, **k: ["2020-02-01"])
+    dr.freeze_selection()
+    event = dr.record_holdout_exposure("the one prospective look")
+    dr.close_holdout_exposure(event["event_id"])
+    sub = _submission_module()
+    monkeypatch.setattr(sub, "ROOT", tmp_path)
+    monkeypatch.setattr(sub, "_artefact", lambda name: {
+        "selection": dr._read_selection(),
+        "exposure": {"events": dr.exposure_events(),
+                     "evidence_status": dr.evidence_status(),
+                     "evidence_flags": dr.evidence_flags(),
+                     "holdout_event_id": event["event_id"]}})
+    sub.test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposure()
+    assert dr.evidence_status() == "prospective"
+
+
+def test_a_declared_legacy_exposure_with_no_log_passes(monkeypatch, tmp_path):
+    """The documented no-log route: evidence that genuinely predates the log."""
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    monkeypatch.setattr(dr, "SELECTION_STAMP", outputs / "replay_selection.json")
+    monkeypatch.setattr(dr, "EXPOSURE_LOG", outputs / "replay_exposures.jsonl")
+    monkeypatch.setattr(dr, "dev_sample", lambda *a, **k: ["2020-01-01"])
+    monkeypatch.setattr(dr, "holdout_sample", lambda *a, **k: ["2020-02-01"])
+    dr.freeze_selection(prior_exposure=True,
+                        note="synthetic: holdout run before the freeze workflow existed")
+    assert not dr.EXPOSURE_LOG.exists()
+    sub = _submission_module()
+    monkeypatch.setattr(sub, "ROOT", tmp_path)
+    monkeypatch.setattr(sub, "_artefact", lambda name: {
+        "selection": dr._read_selection(),
+        "exposure": {"events": [], "evidence_status": dr.evidence_status(),
+                     "evidence_flags": dr.evidence_flags(),
+                     "holdout_event_id": None}})
+    sub.test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposure()
+    assert dr.evidence_status() == "previously_exposed"
+
+
+def test_a_same_configuration_revalidation_passes(monkeypatch, tmp_path):
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    monkeypatch.setattr(dr, "SELECTION_STAMP", outputs / "replay_selection.json")
+    monkeypatch.setattr(dr, "EXPOSURE_LOG", outputs / "replay_exposures.jsonl")
+    monkeypatch.setattr(dr, "dev_sample", lambda *a, **k: ["2020-01-01"])
+    monkeypatch.setattr(dr, "holdout_sample", lambda *a, **k: ["2020-02-01"])
+    dr.freeze_selection()
+    a = dr.record_holdout_exposure("first")
+    dr.close_holdout_exposure(a["event_id"])
+    dr.freeze_selection(revalidate=True, note="synthetic: same configuration, second look")
+    b = dr.record_holdout_exposure("second")
+    dr.close_holdout_exposure(b["event_id"])
+    sub = _submission_module()
+    monkeypatch.setattr(sub, "ROOT", tmp_path)
+    monkeypatch.setattr(sub, "_artefact", lambda name: {
+        "selection": dr._read_selection(),
+        "exposure": {"events": dr.exposure_events(),
+                     "evidence_status": dr.evidence_status(),
+                     "evidence_flags": dr.evidence_flags(),
+                     "holdout_event_id": b["event_id"]}})
+    sub.test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposure()
+    assert dr.evidence_status() == "retrospective"
+
+
+# ---------------------------------------------------------------------------------------
+# THE RECOVERY A MISSING-LOG ERROR RECOMMENDS MUST ACTUALLY RECOVER (recheck-5 S5)
+# ---------------------------------------------------------------------------------------
+
+def _advertised_command(message: str) -> str:
+    import re
+    found = re.findall(r"python src/decision_replay\.py (--dev[^\n]*)", message)
+    assert found, f"the error recommends no command at all:\n{message}"
+    return found[-1]
+
+
+@pytest.mark.parametrize("breakage", ["deleted", "damaged"])
+def test_following_the_recovery_advice_recovers_rather_than_looping(two_exposures,
+                                                                   breakage):
+    """
+    THE DEFECT THIS PINS. The missing-log error advised re-freezing with `--revalidate`,
+    and `freeze_selection()` runs the same guard before changing anything - so the
+    advertised command failed with the very error it was advertised to resolve. This
+    takes the command FROM THE MESSAGE and runs what it names, so the advice and the
+    code cannot drift apart again.
+    """
+    if breakage == "deleted":
+        two_exposures.log.unlink()
+    else:
+        two_exposures.log.write_text("not json at all\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError) as caught:
+        dr.require_readable_log()
+    command = _advertised_command(str(caught.value))
+    assert "--declare-lost-log" in command, (
+        f"the error must recommend the supported recovery, not {command!r}")
+
+    counted_before = 2
+    dr.freeze_selection(lost_log=True, note="synthetic: the log could not be restored")
+
+    dr.require_readable_log()                          # no longer refuses
+    assert dr.known_exposure_count() >= counted_before or breakage == "damaged", (
+        "declaring a loss must not reduce the exposures counted against the selection")
+    assert dr.evidence_status() == "previously_exposed"
+    assert dr.evidence_flags()["log_loss_declared"] is True
+    with pytest.raises(RuntimeError, match="authorises"):
+        dr.record_holdout_exposure("an attempt to spend a look the declaration freed")
+
+
+def test_the_recovery_route_makes_no_request(two_exposures, monkeypatch):
+    """A recovery that spends quota to record a fact about the past is not a recovery."""
+    monkeypatch.setattr(dr, "_prompts_written", lambda: True)
+    monkeypatch.setattr(dr, "evaluate_all", lambda *a, **k: pytest.fail(
+        "the lost-log declaration re-ran the development sample"))
+    monkeypatch.setattr(dr, "client_", lambda *a, **k: pytest.fail(
+        "the lost-log declaration made an API request"))
+    two_exposures.log.unlink()
+    dr.run_dev(lost_log=True, note="synthetic: the log could not be restored")
+    assert dr.evidence_flags()["exposures_declared_lost"] == 2
+
+
+def test_a_lost_log_cannot_be_declared_when_nothing_is_lost(two_exposures):
+    with pytest.raises(RuntimeError, match="nothing to declare"):
+        dr.freeze_selection(lost_log=True, note="synthetic")
+
+
+def test_a_lost_log_declaration_needs_a_note(two_exposures):
+    two_exposures.log.unlink()
+    with pytest.raises(RuntimeError, match="say what happened"):
+        dr.freeze_selection(lost_log=True)
+
+
+def test_an_exposure_is_stamped_into_the_freeze_when_it_is_recorded(monkeypatch, tmp_path):
+    """
+    Found while fixing S5. The freeze only learned an exposure's id at the NEXT freeze, so
+    deleting the log between recording an exposure and re-freezing - that is, during the
+    whole holdout run - erased it with nothing to notice.
+    """
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    monkeypatch.setattr(dr, "SELECTION_STAMP", outputs / "replay_selection.json")
+    monkeypatch.setattr(dr, "EXPOSURE_LOG", outputs / "replay_exposures.jsonl")
+    monkeypatch.setattr(dr, "dev_sample", lambda *a, **k: ["2020-01-01"])
+    monkeypatch.setattr(dr, "holdout_sample", lambda *a, **k: ["2020-02-01"])
+    dr.freeze_selection()
+    event = dr.record_holdout_exposure("recorded, never re-frozen")
+    assert event["event_id"] in dr._read_selection()["exposure_event_ids"]
+    dr.EXPOSURE_LOG.unlink()
+    with pytest.raises(RuntimeError, match="no longer contains"):
+        dr.require_readable_log()
 
 
 @pytest.mark.parametrize("damage,label", [

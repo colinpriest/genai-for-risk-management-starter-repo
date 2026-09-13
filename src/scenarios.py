@@ -824,7 +824,11 @@ def llm_parsed(system: str, user: str, schema, seed_offset: int = 0) -> dict:
             failure = courseapi.describe_failure(e, request=request)
             _last_exception = e
             attempted = courseapi.transport_attempts(e)
-            spent += attempted if isinstance(attempted, int) else 1
+            # AN UNSTAMPED FAILURE IS NOT EVIDENCE OF A REQUEST. The adapter stamps every
+            # failure that passed through its transport path with the real count; one with
+            # no stamp was not counted there, and treating it as one request wrote a
+            # request into the record of a draw that never contacted the service.
+            spent += attempted if isinstance(attempted, int) else 0
             spent_usage = courseapi.merge_usage(
                 spent_usage, courseapi.failed_attempt_usage(e))
             # One transport budget per logical call: the adapter says when it is spent.
