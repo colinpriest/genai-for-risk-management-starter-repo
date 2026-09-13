@@ -1616,13 +1616,30 @@ def exposure_accounting(selection: dict | None, events: list[dict]) -> dict:
     close_declared = set(lost_declared) | {e for e in (loss.get("lost_close_ids") or []) if e}
     missing_closes_declared = [e for e in missing_closes if e in close_declared]
 
-    declared_lines = {(d.get("line_number"), d.get("sha256"))
-                      for d in (loss.get("damaged_lines") or []) if isinstance(d, dict)}
+    # A DECLARATION COVERS THE DAMAGE IT DESCRIBED: those exact bytes, as many times as it
+    # named them, wherever the line now sits. Keyed by line number as well, restoring earlier
+    # records ahead of a declared damaged line moved its number, and the same damage read as
+    # new. A copy beyond the declared count, or different bytes, is still new damage. Lines
+    # still at their declared place are matched first, so each keeps its description.
+    declared_entries = [d for d in (loss.get("damaged_lines") or [])
+                        if isinstance(d, dict) and d.get("sha256")]
+    remaining: dict[str, int] = {}
+    for entry in declared_entries:
+        remaining[entry["sha256"]] = remaining.get(entry["sha256"], 0) + 1
+    in_place = {(d.get("line_number"), d["sha256"]) for d in declared_entries}
     damaged = [e for e in events if e.get("type") == "damaged"]
-    covered = [d for d in damaged
-               if (d.get("line_number"), d.get("sha256")) in declared_lines]
-    uncovered = [d for d in damaged
-                 if (d.get("line_number"), d.get("sha256")) not in declared_lines]
+    covered_at: set[int] = set()
+    for moved in (False, True):
+        for index, line in enumerate(damaged):
+            sha = line.get("sha256")
+            if index in covered_at or remaining.get(sha, 0) <= 0:
+                continue
+            if not moved and (line.get("line_number"), sha) not in in_place:
+                continue
+            covered_at.add(index)
+            remaining[sha] -= 1
+    covered = [d for i, d in enumerate(damaged) if i in covered_at]
+    uncovered = [d for i, d in enumerate(damaged) if i not in covered_at]
 
     freeze_of, order_of, undescribed = {}, {}, []
     for position, stamp in enumerate(stamps):
@@ -2062,8 +2079,10 @@ def unfinished_exposure(freeze_id: str,
                       f"and superseded it; a superseded exposure is not resumed, even when its "
                       f"records are restored")
     if a["completion"].get(eid) == "unknown":
-        return None, (f"exposure {eid} was recorded by a release that kept no completion "
-                      f"state, so nothing establishes that its benchmark did not finish")
+        return None, (f"exposure {eid} has no completion state in the selection - it was "
+                      f"recorded by a release that kept no completion state, or the run "
+                      f"stopped before the selection recorded it - so nothing establishes "
+                      f"that its benchmark did not finish")
     if any(p > a["open_position"][eid] for p in a["damaged_positions"]):
         return None, (f"exposure {eid} has a damaged line after its open record, and that "
                       f"line may be the record of its benchmark finishing")
