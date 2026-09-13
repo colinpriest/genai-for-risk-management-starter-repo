@@ -1002,10 +1002,12 @@ def evaluate_all(k: int | None = None, strategies: list[str] | None = None,
     if sample == "holdout" and event_id:
         close_holdout_exposure(
             event_id, f"{sample} benchmark completed on {n_meetings} meetings"
-            + ("" if _EXPOSURE_EVENT is not None else " (replayed from committed cache)"))
+            + ("" if _EXPOSURE_EVENT is not None else f" {_REPLAYED_CLOSE}"),
+            fresh=_EXPOSURE_EVENT is not None)
     elif _EXPOSURE_EVENT is not None:
         close_holdout_exposure(_EXPOSURE_EVENT.get("event_id"),
-                               f"{sample} benchmark completed on {n_meetings} meetings")
+                               f"{sample} benchmark completed on {n_meetings} meetings",
+                               fresh=True)
     df.attrs["exposure_event_id"] = event_id
     df.attrs["exposure_was_fresh"] = _EXPOSURE_EVENT is not None
     df.attrs["evidence_status"] = evidence_status()
@@ -1372,6 +1374,17 @@ _STAMP_FIELDS = ("event_id", "freeze_id", "sequence", "at", "selection_config_ha
 #: way let a finished benchmark resume and draw new answers from the held-out meetings.
 _COMPLETION_FIELD = "closed_at"
 
+#: WHICH LATER EXPOSURE REPLACED ONE LEFT UNFINISHED, recorded in the freeze the moment the
+#: later exposure begins. A superseded exposure is never resumed - not after its records are
+#: restored, not once the exposure that replaced it has finished. Resuming it used to send new
+#: requests to the held-out meetings after the replacement benchmark had completed, and a
+#: cached regeneration then hid which exposure had asked.
+_SUPERSEDED_FIELD = "superseded_by"
+
+#: What a run served entirely from the committed cache adds to its close record. Close records
+#: written before `fresh` was stored say whether their run sent requests only in these words.
+_REPLAYED_CLOSE = "(replayed from committed cache)"
+
 
 def parse_exposure_log(path=None) -> list[dict]:
     """Every line of an exposure log as an event, with damaged lines kept AS damage.
@@ -1480,6 +1493,7 @@ def exposure_accounting(selection: dict | None, events: list[dict]) -> dict:
 
     readable, first, open_position = [], {}, {}
     closes: dict[str, list] = {}
+    close_runs: dict[str, list] = {}
     damaged_positions = []
     for position, event in enumerate(events):
         kind = event.get("type")
@@ -1487,6 +1501,12 @@ def exposure_accounting(selection: dict | None, events: list[dict]) -> dict:
             damaged_positions.append(position)
         elif kind == "close" and event.get("event_id"):
             closes.setdefault(event["event_id"], []).append(event.get("at"))
+            # WHETHER THE RUN THAT CLOSED IT SENT REQUESTS - stored as `fresh`, or said by
+            # the words a cached run adds.
+            fresh = event.get("fresh")
+            if not isinstance(fresh, bool):
+                fresh = _REPLAYED_CLOSE not in str(event.get("outcome") or "")
+            close_runs.setdefault(event["event_id"], []).append((event.get("at"), fresh))
         elif kind == "open":
             eid = event.get("event_id")
             if eid in first:
@@ -1510,6 +1530,7 @@ def exposure_accounting(selection: dict | None, events: list[dict]) -> dict:
     merged: dict[str, dict] = {}
     held_by: dict[str, dict] = {}
     recorded_completion: dict[str, object] = {}
+    recorded_superseded: dict[str, str] = {}
     for label, entries in sources:
         for entry in entries or []:
             if not isinstance(entry, dict) or not entry.get("event_id"):
@@ -1529,6 +1550,8 @@ def exposure_accounting(selection: dict | None, events: list[dict]) -> dict:
                                    f"{stamp[field]!r}, {label} records {value!r}")
             if label == "the freeze's exposure stamps" and _COMPLETION_FIELD in entry:
                 recorded_completion[eid] = entry[_COMPLETION_FIELD]
+            if label == "the freeze's exposure stamps" and entry.get(_SUPERSEDED_FIELD):
+                recorded_superseded[eid] = entry[_SUPERSEDED_FIELD]
     # Ids remembered before any of those records existed stay undescribed where nothing
     # still describes them - a freeze or an order is never invented for an exposure nobody
     # can read.
@@ -1579,6 +1602,8 @@ def exposure_accounting(selection: dict | None, events: list[dict]) -> dict:
             completion[eid] = "open"
         else:
             completion[eid] = "unknown"
+        if recorded_superseded.get(eid):
+            stamp[_SUPERSEDED_FIELD] = recorded_superseded[eid]
         stamps.append(stamp)
 
     # A COMPLETION THE FREEZE RECORDED AND THE LOG NO LONGER HOLDS. A damaged line after the
@@ -1607,6 +1632,32 @@ def exposure_accounting(selection: dict | None, events: list[dict]) -> dict:
         order_of[eid] = (sequence if ordered else -1, position)
         if not ordered or not stamp.get("freeze_id"):
             undescribed.append(eid)
+
+    # SUPERSESSION. An exposure is superseded by the next exposure of its freeze the moment
+    # that one begins - whether or not the log still shows either - and the freeze records it
+    # as well. A close written afterwards by a run that SENT REQUESTS under the earlier
+    # exposure means the held-out meetings were asked under a look already replaced.
+    recorded_at = {s["event_id"]: s.get("at") for s in stamps}
+    superseded_by: dict[str, str] = {}
+    sampled_after_supersession = []
+    for eid in known:
+        if order_of[eid][0] < 0 or not freeze_of.get(eid):
+            continue
+        later = sorted((x for x in known if x != eid and freeze_of.get(x) == freeze_of[eid]
+                        and order_of[x][0] > order_of[eid][0]), key=lambda x: order_of[x])
+        if later:
+            superseded_by[eid] = later[0]
+        for at, fresh in close_runs.get(eid, []):
+            began = [x for x in later
+                     if fresh and _when(at) and _when(recorded_at.get(x))
+                     and _when(at) > _when(recorded_at[x])]
+            if began:
+                sampled_after_supersession.append(
+                    {"event_id": eid, "superseded_by": began[0], "closed_at": at,
+                     "began_at": recorded_at[began[0]]})
+                break
+    for eid, by in recorded_superseded.items():
+        superseded_by.setdefault(eid, by)
 
     # WHEN EACH LOST EXPOSURE WAS FIRST DECLARED LOST. An exposure declared lost before
     # another was recorded, or before a freeze began, happened before it - whatever else
@@ -1658,6 +1709,8 @@ def exposure_accounting(selection: dict | None, events: list[dict]) -> dict:
         "undescribed": undescribed,
         "declared_by": declared_by,
         "origin_declaration": origin if isinstance(origin, dict) else None,
+        "superseded_by": superseded_by,
+        "sampled_after_supersession": sampled_after_supersession,
     }
 
 
@@ -1899,6 +1952,17 @@ def exposure_history_problems(selection: dict | None, events: list[dict],
             f"declare it:\n{declare}\n"
             f"     That keeps the benchmark counted as finished: it can be replayed from "
             f"cache, and any new request to the held-out meetings is a new exposure.")
+    for sampled in a["sampled_after_supersession"]:
+        problems.append(
+            f"{name} records that the benchmark of exposure {sampled['event_id']} was "
+            f"completed at {sampled['closed_at']} by a run that sent new requests - after "
+            f"exposure {sampled['superseded_by']} had begun at {sampled['began_at']} and "
+            f"superseded it. Those requests asked the held-out meetings under a look that "
+            f"had already been replaced, without an authorised exposure of their own, and a "
+            f"benchmark regenerated from the cache cannot show which answers they "
+            f"contributed.\n"
+            f"This is not a loss a declaration can cover. Tell the course staff, and do not "
+            f"submit this history as it stands.")
     damage = a["undeclared_damage"]
     if damage:
         described = [f"line {d.get('line_number')}: {d.get('problem')}" for d in damage]
@@ -1972,6 +2036,13 @@ def unfinished_exposure(freeze_id: str,
     nothing. An exposure is resumable only when the freeze recorded it as unfinished, and
     nothing that could be its completion record stands in the way - no damaged line after
     its open record, and no record the log has lost since it began.
+
+    AND ONLY THE LATEST EXPOSURE OF THE FREEZE. An exposure left unfinished is superseded the
+    moment a later one begins. Restoring the records of an earlier interrupted exposure after
+    its declared replacement had finished used to make it resumable again: a real cache miss
+    sent a new request under the old id, with the count and the allowance unchanged, and a
+    cached regeneration then named the replacement and passed submission. Restored records are
+    history; they never restore permission to sample.
     """
     rec = _read_selection() if rec is None else rec
     a = exposure_accounting(rec, exposure_events())
@@ -1981,6 +2052,15 @@ def unfinished_exposure(freeze_id: str,
         return None, None
     event = max(left_open, key=lambda e: a["order_of"].get(e.get("event_id"), (-1, -1)))
     eid = event["event_id"]
+    latest, doubtful = _origin_evidence(a, freeze_id)
+    if doubtful:
+        return None, (f"exposure(s) {doubtful} have no recorded order and may have begun after "
+                      f"exposure {eid}, superseding it")
+    by = a["superseded_by"].get(eid) or (latest if latest != eid else None)
+    if by:
+        return None, (f"exposure {eid} was left unfinished, but exposure {by} began after it "
+                      f"and superseded it; a superseded exposure is not resumed, even when its "
+                      f"records are restored")
     if a["completion"].get(eid) == "unknown":
         return None, (f"exposure {eid} was recorded by a release that kept no completion "
                       f"state, so nothing establishes that its benchmark did not finish")
@@ -2378,6 +2458,11 @@ def record_holdout_exposure(reason: str = "fresh holdout draw") -> dict:
             # THE FREEZE KNOWS THIS BENCHMARK HAS NOT FINISHED - the positive evidence a
             # later resume needs, and the only kind a resume accepts.
             stamp[_COMPLETION_FIELD] = None
+        elif (accounting["completion"].get(stamp["event_id"]) != "closed"
+              and not stamp.get(_SUPERSEDED_FIELD)):
+            # EVERY EXPOSURE LEFT UNFINISHED IS SUPERSEDED BY THIS ONE, and the freeze keeps
+            # that for good: restoring its records later restores no permission to sample.
+            stamp[_SUPERSEDED_FIELD] = event["event_id"]
     rec["exposure_event_ids"] = accounting["known_ids"]
     rec["exposure_stamps"] = stamps
     rec["exposures"] = exposures_recorded()
@@ -2388,19 +2473,34 @@ def record_holdout_exposure(reason: str = "fresh holdout draw") -> dict:
                 exposures=exposures_recorded())
 
 
-def close_holdout_exposure(event_id: str, outcome: str = "benchmark completed") -> None:
+def close_holdout_exposure(event_id: str, outcome: str = "benchmark completed",
+                           fresh: bool | None = None) -> None:
     """Append the fact that an exposure finished, then record it in the freeze.
 
     Never edits the `open` line. THE FREEZE RECORDS THE COMPLETION TOO, so a benchmark stays
     finished when its close line is later damaged or lost: a finished benchmark whose close
     could not be read used to be resumed, and sampled the held-out meetings again. Written
     after the log line is durable, so a crash in between leaves a readable close rather
-    than a completion the log never saw.
+    than a completion the log never saw. `fresh` records whether the run sent requests.
+
+    A SUPERSEDED EXPOSURE IS NOT CLOSED. A benchmark completed under it now ran after a later
+    exposure had replaced it; the runner reports the latest exposure's benchmark instead.
     """
     if not event_id:
         return
-    _append_event({"type": "close", "event_id": event_id, "outcome": outcome,
-                   "at": datetime.now(timezone.utc).isoformat()})
+    rec = _read_selection()
+    if rec:
+        by = exposure_accounting(rec, exposure_events())["superseded_by"].get(event_id)
+        if by:
+            raise RuntimeError(
+                f"exposure {event_id} cannot be recorded as finished: exposure {by} began "
+                f"after it and superseded it, so a benchmark completed under it now ran after "
+                f"that look was replaced. Report the latest exposure's benchmark instead.")
+    event = {"type": "close", "event_id": event_id, "outcome": outcome,
+             "at": datetime.now(timezone.utc).isoformat()}
+    if fresh is not None:
+        event["fresh"] = bool(fresh)
+    _append_event(event)
     rec = _read_selection()
     if not rec:
         return
@@ -2459,6 +2559,25 @@ def _require_frozen_selection() -> None:
               f"and why. See {EXPOSURE_LOG.name} for the events.")
 
 
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" + ("" if count == 1 else "s")
+
+
+def _declared_records(*declarations: dict) -> str:
+    """What declarations cover, in words. Missing exposure records, missing completion records
+    and damaged lines are three different things, and none of them is an exposure count."""
+    exposures = sum(len(d.get("lost_event_ids") or []) for d in declarations)
+    completions = sum(len(d.get("lost_close_ids") or []) for d in declarations)
+    lines = sum(len(d.get("damaged_lines") or d.get("damaged_lines_at_declaration") or [])
+                for d in declarations)
+    parts = ([f"the missing records of {_plural(exposures, 'exposure')}"] if exposures else []) \
+        + ([_plural(completions, "missing completion record")] if completions else []) \
+        + ([_plural(lines, "damaged line")] if lines else [])
+    if not parts:
+        return "nothing"
+    return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
 def run_dev(revalidate: bool = False, note: str = "",
             prior_exposure: bool = False, lost_log: bool = False,
             origin: str = "") -> pd.DataFrame:
@@ -2485,10 +2604,22 @@ def run_dev(revalidate: bool = False, note: str = "",
         rec = freeze_selection(note=note, revalidate=revalidate,
                                prior_exposure=prior_exposure, lost_log=True)
         loss = declared_log_loss(rec)
-        print(f"\n  DECLARED: {EXPOSURE_LOG.name} is unrecoverable.")
-        print(f"  {len(loss.get('lost_event_ids') or [])} exposure(s) stay counted "
-              f"against this selection; the evidence is now "
+        declarations = [d for d in (loss.get("declarations") or []) if isinstance(d, dict)]
+        # EXPOSURES AND MISSING RECORDS ARE DIFFERENT NUMBERS. This used to print how many
+        # exposure ids the declaration named as the number still counted, so a damaged or
+        # missing close - every open record still readable - reported "0 exposure(s) stay
+        # counted" while one did, and a partial loss reported only the missing part.
+        known = known_exposure_count(rec)
+        allowance = int(rec.get("authorised_exposures", 1))
+        print(f"\n  DECLARED: part or all of {EXPOSURE_LOG.name} cannot be recovered.")
+        print(f"  {_plural(known, 'exposure')} {'remains' if known == 1 else 'remain'} "
+              f"counted against an allowance of {allowance}; the evidence is now "
               f"{evidence_status()!r}.")
+        if declarations:
+            print(f"  This declaration covers {_declared_records(declarations[-1])}.")
+        if len(declarations) > 1:
+            print(f"  All {len(declarations)} declarations on this freeze cover "
+                  f"{_declared_records(*declarations)}.")
         print(f"  Say so in the report. Written to {SELECTION_STAMP.name}.")
         return pd.DataFrame()
     print("  CHOOSING THE STRATEGY - development sample (the holdout is NOT touched)")
