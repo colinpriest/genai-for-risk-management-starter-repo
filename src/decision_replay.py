@@ -1350,48 +1350,70 @@ _OPEN_EVENT_FIELDS = ("type", "event_id", "sequence", "at", "freeze_id",
 _LOSS_EVENT_FIELDS = ("type", "event_id", "at", "freeze_id", "lost_event_ids", "note")
 
 
-def exposure_events() -> list[dict]:
-    """Every event ever appended, oldest first. Damaged lines are kept as damage.
+#: Fields a `close` event must carry. A close with no event id closes nothing, yet it used to
+#: be read as a harmless line, so a corrupted close became an unclosed exposure that no check
+#: described as damage.
+_CLOSE_EVENT_FIELDS = ("type", "event_id", "at")
 
-    A LINE THAT WILL NOT PARSE IS NOT AN ABSENT LINE. Skipping it, or turning it into a
-    harmless marker the counters ignore, makes a corrupted log read as a SHORTER history -
-    so damaging one line was a way to reduce the recorded exposure count and buy another
-    look at the held-out sample. `log_damage()` is what callers must consult before
-    trusting any count derived from this list.
+#: What the freeze remembers about each exposure at the moment it is recorded. A bare id
+#: says an exposure happened; it cannot say which benchmark it produced once the log line
+#: that described it is gone.
+_STAMP_FIELDS = ("event_id", "freeze_id", "sequence", "at", "selection_config_hash")
+
+
+def parse_exposure_log(path=None) -> list[dict]:
+    """Every line of an exposure log as an event, with damaged lines kept AS damage.
+
+    THE ONE PARSER. The runtime guard and the submission check both read the log through
+    this function, so they cannot disagree about which lines are damaged. They did: a
+    declared corruption was accepted at runtime and rejected at submission, which then
+    told the team to restore the file they had just declared unrecoverable.
+
+    A LINE THAT WILL NOT PARSE IS NOT AN ABSENT LINE. Skipping it would make a corrupted
+    log read as a SHORTER history, and damaging one line would buy another look at the
+    held-out sample. Each damaged entry carries its line number and the SHA-256 of the
+    line's exact bytes - what a lost-log declaration records - so a declaration covers
+    exactly the damage it was made about, and a line damaged afterwards is new damage.
     """
-    if not EXPOSURE_LOG.exists():
+    path = EXPOSURE_LOG if path is None else path
+    if not path.exists():
         return []
     events = []
-    for n, line in enumerate(
-            EXPOSURE_LOG.read_text(encoding="utf-8").splitlines(), start=1):
-        line = line.strip()
-        if not line:
+    for n, raw in enumerate(path.read_bytes().split(b"\n"), start=1):
+        line = raw.rstrip(b"\r")
+        if not line.strip():
             continue
+        problem = None
         try:
-            parsed = json.loads(line)
+            parsed = json.loads(line.decode("utf-8"))
+        except UnicodeDecodeError:
+            problem = "not UTF-8 text"
         except json.JSONDecodeError as exc:
+            problem = f"not JSON ({exc.msg})"
+        else:
+            if not isinstance(parsed, dict):
+                problem = f"a {type(parsed).__name__}, not an event object"
+            else:
+                required = {"open": _OPEN_EVENT_FIELDS, "close": _CLOSE_EVENT_FIELDS,
+                            "log_loss_declared": _LOSS_EVENT_FIELDS}.get(parsed.get("type"))
+                if required is None:
+                    problem = f"unknown event type {parsed.get('type')!r}"
+                else:
+                    missing = [f for f in required if parsed.get(f) is None]
+                    if missing:
+                        problem = f"a {parsed.get('type')} event missing {missing}"
+        if problem is None:
+            events.append(parsed)
+        else:
             events.append({"type": "damaged", "line_number": n,
-                           "problem": f"not JSON ({exc.msg})"})
-            continue
-        if not isinstance(parsed, dict):
-            events.append({"type": "damaged", "line_number": n,
-                           "problem": f"a {type(parsed).__name__}, not an event object"})
-            continue
-        if parsed.get("type") == "open":
-            missing = [f for f in _OPEN_EVENT_FIELDS if parsed.get(f) is None]
-            if missing:
-                parsed = dict(parsed, type="damaged", line_number=n,
-                              problem=f"an exposure event missing {missing}")
-        elif parsed.get("type") == "log_loss_declared":
-            missing = [f for f in _LOSS_EVENT_FIELDS if parsed.get(f) is None]
-            if missing:
-                parsed = dict(parsed, type="damaged", line_number=n,
-                              problem=f"a lost-log declaration missing {missing}")
-        elif parsed.get("type") not in ("close",):
-            parsed = dict(parsed, type="damaged", line_number=n,
-                          problem=f"unknown event type {parsed.get('type')!r}")
-        events.append(parsed)
+                           "sha256": hashlib.sha256(line).hexdigest(),
+                           "problem": problem})
     return events
+
+
+def exposure_events() -> list[dict]:
+    """Every event ever appended to this repository's log, oldest first."""
+    return parse_exposure_log(EXPOSURE_LOG)
 
 
 def log_damage(events: list[dict] | None = None) -> list[str]:
@@ -1401,12 +1423,128 @@ def log_damage(events: list[dict] | None = None) -> list[str]:
             for e in events if e.get("type") == "damaged"]
 
 
+def exposure_accounting(selection: dict | None, events: list[dict]) -> dict:
+    """THE identity and count rule for holdout exposures, from a selection and a log.
+
+    The runtime guard, the evidence flags and the submission check all call this, so the
+    three cannot count differently. From files alone it answers:
+
+    * which exposures are KNOWN - the distinct union of what the log shows, what the freeze
+      stamped as each exposure was recorded, and what a declaration says was lost. A UNION,
+      not a sum: restoring a declared-lost event used to count it twice, and the restored
+      evidence was refused against an allowance it had not exceeded;
+    * which known exposures are STILL MISSING from the readable log, and whether a
+      declaration covers each - so a historical declaration and an event that is still
+      gone are told apart;
+    * which damaged lines a declaration covers, by line number and exact bytes, and which
+      are new;
+    * which freeze each exposure belongs to, and in what order - so a benchmark's
+      originating exposure is the latest one its freeze made, not whichever happens to
+      survive in a shortened log.
+    """
+    selection = selection or {}
+    loss = selection.get("log_loss") if isinstance(selection.get("log_loss"), dict) else {}
+
+    readable, conflicts, first = [], set(), {}
+    for event in events:
+        if event.get("type") != "open":
+            continue
+        eid = event.get("event_id")
+        if eid in first:
+            # THE SAME EVENT RESTORED TWICE is still one exposure. The same id carrying
+            # different content is not a restoration but a contradiction.
+            if first[eid] != event:
+                conflicts.add(eid)
+            continue
+        first[eid] = event
+        readable.append(event)
+    readable_ids = [e.get("event_id") for e in readable]
+
+    stamps, stamped = [], set()
+    for stamp in selection.get("exposure_stamps") or []:
+        if isinstance(stamp, dict) and stamp.get("event_id") \
+                and stamp["event_id"] not in stamped:
+            stamps.append({k: stamp.get(k) for k in _STAMP_FIELDS})
+            stamped.add(stamp["event_id"])
+    # Ids remembered before stamps carried a freeze and a sequence take those from the
+    # readable log where it still has them, and stay unknown where it does not - a freeze
+    # is never invented for an exposure nobody can read.
+    for eid in list(selection.get("exposure_event_ids") or []) + readable_ids:
+        if eid and eid not in stamped:
+            event = first.get(eid, {})
+            stamps.append({"event_id": eid,
+                           **{k: event.get(k) for k in _STAMP_FIELDS if k != "event_id"}})
+            stamped.add(eid)
+    for stamp in stamps:
+        event = first.get(stamp["event_id"])
+        if event is not None:
+            for k in _STAMP_FIELDS:
+                if stamp.get(k) is None:
+                    stamp[k] = event.get(k)
+
+    lost_declared = [e for e in (loss.get("lost_event_ids") or []) if e]
+    known = [s["event_id"] for s in stamps] + [e for e in lost_declared if e not in stamped]
+    present = set(readable_ids)
+    still_missing = [e for e in known if e not in present]
+    still_missing_declared = [e for e in still_missing if e in lost_declared]
+
+    declared_lines = {(d.get("line_number"), d.get("sha256"))
+                      for d in (loss.get("damaged_lines") or []) if isinstance(d, dict)}
+    damaged = [e for e in events if e.get("type") == "damaged"]
+    covered = [d for d in damaged
+               if (d.get("line_number"), d.get("sha256")) in declared_lines]
+    uncovered = [d for d in damaged
+                 if (d.get("line_number"), d.get("sha256")) not in declared_lines]
+
+    freeze_of, order_of = {}, {}
+    for position, stamp in enumerate(stamps):
+        freeze_of[stamp["event_id"]] = stamp.get("freeze_id")
+        sequence = stamp.get("sequence")
+        order_of[stamp["event_id"]] = (sequence if isinstance(sequence, int)
+                                       and not isinstance(sequence, bool) else -1, position)
+    return {
+        "readable": readable,
+        "conflicts": sorted(c for c in conflicts if c),
+        "stamps": stamps,
+        "known_ids": known,
+        "lost_declared": lost_declared,
+        "still_missing": still_missing,
+        "still_missing_declared": still_missing_declared,
+        "undeclared_missing": [e for e in still_missing if e not in lost_declared],
+        "damaged": damaged,
+        "declared_damage_present": covered,
+        "undeclared_damage": uncovered,
+        # THE LOSS IS IN EFFECT while anything it declared is still unreadable. Restoring
+        # the evidence ends it; the declaration itself stays on record as history.
+        "loss_in_effect": bool(still_missing_declared or covered),
+        "freeze_of": freeze_of,
+        "order_of": order_of,
+    }
+
+
+def latest_exposure_for(accounting: dict, freeze_id: str | None) -> str | None:
+    """The most recent exposure a freeze made, from its stamps - readable or lost."""
+    if not freeze_id:
+        return None
+    mine = [eid for eid in accounting["known_ids"]
+            if accounting["freeze_of"].get(eid) == freeze_id]
+    if not mine:
+        return None
+    return max(mine, key=lambda eid: accounting["order_of"].get(eid, (-1, -1)))
+
+
 def _declare_lost_log(old: dict, note: str) -> dict:
-    """Build the lost-history declaration, refusing the cases that are not a loss.
+    """Build, or extend, the lost-history declaration - refusing anything that is not a loss.
 
     DECLARING COSTS SOMETHING AND PROVES NOTHING, which is what keeps it honest: the
-    ids stay counted, the evidence drops to `previously_exposed`, and no further look
-    is authorised. What it buys is a way forward that is not deleting the evidence.
+    exposures stay counted, the evidence is `previously_exposed` for as long as the loss is
+    in effect, and no further look is authorised. What it buys is a way forward that is not
+    deleting the evidence.
+
+    EXACTLY WHAT WAS LOST, NOTHING MORE. A declaration names the missing exposure ids, and
+    each damaged line by its number and the SHA-256 of its bytes. It used to waive every
+    damaged line from then on, so corruption introduced AFTER a declaration was accepted
+    too. A later loss now needs a later declaration; the earlier ones stay as history.
     """
     if not str(note).strip():
         raise RuntimeError(
@@ -1414,52 +1552,54 @@ def _declare_lost_log(old: dict, note: str) -> dict:
             "it has to say what happened, in words a marker reads:\n"
             '    python src/decision_replay.py --dev --declare-lost-log '
             '--note="the outputs directory was deleted before it was committed"')
-    already = declared_log_loss(old)
-    if already:
+    accounting = exposure_accounting(old, exposure_events())
+    if accounting["conflicts"]:
         raise RuntimeError(
-            f"this freeze already carries a lost-log declaration, made "
-            f"{str(already.get('declared_at'))[:19]}, covering "
-            f"{len(already.get('lost_event_ids') or [])} exposure(s):\n"
-            f"  {already.get('note')}\n"
-            f"Declaring again would say nothing new. Amend the note in the report "
-            f"instead, or restore the log from version control.")
-    known = [e for e in (old.get("exposure_event_ids") or []) if e]
-    present = {e.get("event_id") for e in exposures_recorded()}
-    missing = [e for e in known if e not in present]
-    damage = log_damage()
+            f"{EXPOSURE_LOG.name} records different events under the same id "
+            f"({accounting['conflicts']}). That is not a lost history but a contradictory "
+            f"one, and declaring it lost would hide which account is true. Restore the "
+            f"log from version control and tell the course staff.")
+    missing = accounting["undeclared_missing"]
+    damage = accounting["undeclared_damage"]
+    previous = declared_log_loss(old)
     if not missing and not damage:
-        # Nothing is lost. Declaring anyway would put a false qualification on sound
-        # evidence, and a team that did it by mistake would be marked down for it.
+        already = (f" This freeze already declares "
+                   f"{len(previous.get('lost_event_ids') or [])} lost exposure(s) and "
+                   f"{len(previous.get('damaged_lines') or [])} damaged line(s); nothing "
+                   f"has been lost since." if previous else "")
         raise RuntimeError(
             f"there is nothing to declare: {EXPOSURE_LOG.name} still contains every "
-            f"exposure this freeze recorded ({len(known)}) and has no damaged lines.\n"
+            f"exposure this freeze knows about ({len(accounting['known_ids'])}) and has no "
+            f"undeclared damaged lines.{already}\n"
             f"If you meant to authorise ANOTHER look at the holdout, that is "
             f'--revalidate --note="why". If you meant to declare that the holdout was '
             f"run before this log existed, that is --prior-exposure.")
+    at = datetime.now(timezone.utc).isoformat()
+    lines = [{k: d.get(k) for k in ("line_number", "sha256", "problem")} for d in damage]
+    entry = {"declared_at": at, "note": str(note), "lost_event_ids": list(missing),
+             "damaged_lines": lines}
+    lost = list(previous.get("lost_event_ids") or [])
+    all_lines = list(previous.get("damaged_lines") or []) + lines
     return {
-        "declared_at": datetime.now(timezone.utc).isoformat(),
+        "declared_at": at,
         "note": str(note),
-        # THE COUNT OF RECORD, carried forward so it keeps counting against the
-        # authorisation. These are ids the freeze itself stamped when the exposures
-        # happened; nothing here is reconstructed from the damaged file.
-        "lost_event_ids": list(missing),
-        "damaged_lines_at_declaration": list(damage),
+        "declarations": list(previous.get("declarations") or []) + [entry],
+        # THE COUNT OF RECORD, carried forward: ids the freeze stamped when the exposures
+        # happened. Nothing here is reconstructed from a damaged file.
+        "lost_event_ids": lost + [e for e in missing if e not in lost],
+        "damaged_lines": all_lines,
+        "damaged_lines_at_declaration": [f"line {d.get('line_number')}: {d.get('problem')}"
+                                         for d in all_lines],
     }
 
 
 def declared_log_loss(rec: dict | None = None) -> dict:
     """The lost-history declaration on the current freeze, or an empty dict.
 
-    Damage and deletion are not repairable by this code, and pretending otherwise is
-    how the previous error message sent teams round a loop: it advised re-freezing
-    with `--revalidate`, and `freeze_selection()` runs `require_readable_log()` before
-    it changes anything, so the advertised command failed with the very error it was
-    advertised to resolve.
-
-    A declaration is the supported way out. It does NOT restore the history and does
-    not reset anything: the ids the freeze stamped remain the count of record, and the
-    evidence is reported as `previously_exposed` from then on, because part of its
-    record cannot be produced.
+    Damage and deletion are not repairable by this code. A declaration is the supported
+    way out: it does NOT restore the history and does not reset anything - the ids the
+    freeze stamped remain the count of record, and the evidence is reported as
+    `previously_exposed` while the loss is in effect.
     """
     rec = _read_selection() if rec is None else rec
     loss = (rec or {}).get("log_loss")
@@ -1472,13 +1612,14 @@ def exposures_declared_lost(rec: dict | None = None) -> list[str]:
 
 
 def known_exposure_count(rec: dict | None = None) -> int:
-    """Exposures this selection has spent: what the log shows PLUS what was declared lost.
+    """DISTINCT exposures this selection has spent: logged, stamped or declared lost.
 
-    Authorisation is counted from this rather than from the log alone, so declaring a
-    loss can never buy a look at the holdout that the log would have refused.
+    Authorisation is counted from this rather than from the log alone, so declaring a loss
+    can never buy a look at the holdout that the log would have refused - and restoring a
+    declared-lost event cannot spend a look twice.
     """
     rec = _read_selection() if rec is None else rec
-    return len(exposures_recorded()) + len(exposures_declared_lost(rec))
+    return len(exposure_accounting(rec, exposure_events())["known_ids"])
 
 
 def require_readable_log() -> None:
@@ -1488,44 +1629,56 @@ def require_readable_log() -> None:
     is ignored answers "zero exposures so far" to a question it cannot answer - and so
     does a log that has been DELETED.
 
-    THE FREEZE REMEMBERS WHAT THE LOG SHOULD CONTAIN. `freeze_selection()` stamps the
-    event ids it saw, so a missing or shortened log is detectable rather than simply
-    believed: without this, removing the file reset the count to zero and the runtime
-    handed out exposure number 1 again. The submission check caught it afterwards, but by
-    then the holdout had already been asked.
+    THE FREEZE REMEMBERS WHAT THE LOG SHOULD CONTAIN. Each exposure is stamped into the
+    freeze when it is recorded, so a missing or shortened log is detectable rather than
+    simply believed.
 
-    A DECLARED LOSS IS ACCOUNTED FOR, NOT FORGIVEN. Ids covered by `--declare-lost-log`
-    stop raising here, and go on counting against the authorisation through
-    `known_exposure_count()`.
+    A DECLARED LOSS IS ACCOUNTED FOR, NOT FORGIVEN - AND ONLY FOR WHAT IT DECLARED. The
+    missing ids and the exact damaged lines a declaration names stop raising here; any
+    other missing exposure, and any line damaged since, still does.
     """
     rec = _read_selection()
-    declared = set(exposures_declared_lost(rec))
-    known = [e for e in (rec.get("exposure_event_ids") or []) if e]
-    if known:
-        present = {e.get("event_id") for e in exposures_recorded()}
-        lost = [e for e in known if e not in present and e not in declared]
-        if lost:
-            raise RuntimeError(
-                f"the frozen selection records {len(known)} holdout exposure(s) but "
-                f"{EXPOSURE_LOG.name} no longer contains {lost}.\n"
-                f"That file is append-only evidence and the count in it decides whether "
-                f"the held-out sample may be asked anything more, so a shorter log is "
-                f"not a clean slate.\n"
-                f"  1. Restore it from version control - `git checkout -- "
-                f"outputs/{EXPOSURE_LOG.name}` - which is the outcome to want.\n"
-                f"  2. If it is genuinely unrecoverable, tell the course staff and "
-                f"declare it:\n"
-                f'       python src/decision_replay.py --dev --declare-lost-log '
-                f'--note="what happened to the log"\n'
-                f"     That keeps the {len(known)} exposure(s) counted against you and "
-                f"reports the evidence as previously_exposed. It does not restore the "
-                f"history and does not authorise another look.")
-    damage = log_damage()
-    if damage and not declared_log_loss(rec):
+    accounting = exposure_accounting(rec, exposure_events())
+    if accounting["conflicts"]:
+        raise RuntimeError(
+            f"{EXPOSURE_LOG.name} records different events under the same id "
+            f"({accounting['conflicts']}), so the exposures it describes cannot be "
+            f"counted. Restore it from version control rather than editing it.")
+    lost = accounting["undeclared_missing"]
+    if lost:
+        known = accounting["known_ids"]
+        # A DAMAGED LINE IS OFTEN WHERE THE MISSING EXPOSURE WAS. Reporting only the missing
+        # id hid the damage that caused it, and the team was told nothing about the line.
+        unread = accounting["undeclared_damage"]
+        where = ("" if not unread else
+                 f"\nIt also has {len(unread)} damaged line(s) - "
+                 + "; ".join(f"line {d.get('line_number')}: {d.get('problem')}"
+                             for d in unread)
+                 + " - which may be where those exposures were recorded.")
+        raise RuntimeError(
+            f"the frozen selection records {len(known)} holdout exposure(s) but "
+            f"{EXPOSURE_LOG.name} no longer contains {lost}.{where}\n"
+            f"That file is append-only evidence and the count in it decides whether "
+            f"the held-out sample may be asked anything more, so a shorter log is "
+            f"not a clean slate.\n"
+            f"  1. Restore it from version control - `git checkout -- "
+            f"outputs/{EXPOSURE_LOG.name}` - which is the outcome to want.\n"
+            f"  2. If it is genuinely unrecoverable, tell the course staff and "
+            f"declare it:\n"
+            f'       python src/decision_replay.py --dev --declare-lost-log '
+            f'--note="what happened to the log"\n'
+            f"     That keeps the {len(known)} exposure(s) counted against you and "
+            f"reports the evidence as previously_exposed. It does not restore the "
+            f"history and does not authorise another look.")
+    damage = accounting["undeclared_damage"]
+    if damage:
+        described = [f"line {d.get('line_number')}: {d.get('problem')}" for d in damage]
+        since = (" A declaration on this freeze covers other lines; these are new."
+                 if declared_log_loss(rec) else "")
         raise RuntimeError(
             f"{EXPOSURE_LOG.name} has {len(damage)} damaged line(s), so the number of "
             f"holdout exposures it records cannot be read:\n  "
-            + "\n  ".join(damage)
+            + "\n  ".join(described) + since
             + f"\nThis file is append-only evidence and the count in it decides whether "
               f"the held-out sample may be asked anything more.\n"
               f"  1. Restore it from version control - `git checkout -- "
@@ -1538,6 +1691,16 @@ def require_readable_log() -> None:
 
 def _append_event(event: dict) -> dict:
     EXPOSURE_LOG.parent.mkdir(parents=True, exist_ok=True)
+    # A LOG WHOSE LAST LINE WAS CUT OFF would have this event glued onto the fragment: the
+    # bytes of a line a declaration may cover would change, and a good event would be
+    # buried inside damage. Start on a fresh line; the fragment stays exactly as it was.
+    if EXPOSURE_LOG.exists() and EXPOSURE_LOG.stat().st_size:
+        with EXPOSURE_LOG.open("rb") as tail:
+            tail.seek(-1, os.SEEK_END)
+            ends_cleanly = tail.read(1) == b"\n"
+        if not ends_cleanly:
+            with EXPOSURE_LOG.open("ab") as fix:
+                fix.write(b"\n")
     with EXPOSURE_LOG.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(event, sort_keys=True) + "\n")
         fh.flush()
@@ -1546,8 +1709,11 @@ def _append_event(event: dict) -> dict:
 
 
 def exposures_recorded() -> list[dict]:
-    """The `open` events - one per time the holdout was actually asked something new."""
-    return [e for e in exposure_events() if e.get("type") == "open"]
+    """The DISTINCT `open` events - one per time the holdout was asked something new.
+
+    The same event restored twice is one exposure, not two.
+    """
+    return exposure_accounting({}, exposure_events())["readable"]
 
 
 def open_exposure(freeze_id: str) -> dict | None:
@@ -1573,17 +1739,18 @@ def open_exposure(freeze_id: str) -> dict | None:
 def originating_exposure_id(freeze_id: str | None = None) -> str | None:
     """The exposure whose requests produced the evidence this freeze reports on.
 
-    The LAST event recorded against this freeze - open or closed. A run served entirely
-    from cache creates no event, and must still be able to say which exposure its numbers
-    came from; `None` means this freeze has never asked the holdout anything, which is a
-    different statement and is left as one.
+    THE LATEST EXPOSURE THIS FREEZE MADE, read from the freeze's own stamps - not the last
+    one that happens to survive in the log. Reading only the readable log returned `None`
+    once the log was lost, which severed a cached benchmark from its evidence; after a
+    PARTIAL loss it silently attached the benchmark to an OLDER exposure, and the
+    submission check accepted that. A run served entirely from cache creates no event and
+    must still say which exposure its numbers came from; `None` still means this freeze
+    has never asked the holdout anything.
     """
+    rec = _read_selection() or {}
     if freeze_id is None:
-        freeze_id = (_read_selection() or {}).get("freeze_id")
-    if not freeze_id:
-        return None
-    mine = [e for e in exposures_recorded() if e.get("freeze_id") == freeze_id]
-    return mine[-1].get("event_id") if mine else None
+        freeze_id = rec.get("freeze_id")
+    return latest_exposure_for(exposure_accounting(rec, exposure_events()), freeze_id)
 
 
 def freeze_selection(note: str = "", revalidate: bool = False,
@@ -1623,7 +1790,7 @@ def freeze_selection(note: str = "", revalidate: bool = False,
         require_readable_log()
     # EXPOSURES SPENT, including any the declaration accounts for. Counting only what
     # the log still shows would make declaring a loss a way to buy a further look.
-    recorded = len(exposures_recorded()) + len(exposures_declared_lost(old))
+    recorded = known_exposure_count(old)
     same_configuration = bool(old) and old.get("config_hash") == selection_config_hash()
 
     # NOTE THE ABSENCE OF `old` FROM THIS CONDITION. It used to read `if old and ...`, so
@@ -1713,9 +1880,12 @@ def freeze_selection(note: str = "", revalidate: bool = False,
     # log alone would make a declaration self-erasing: the ids it exists to preserve are
     # exactly the ones the log no longer has, so the next freeze would stamp a shorter
     # list and the exposures would be gone for good.
-    logged_ids = [e.get("event_id") for e in rec["exposures"]]
-    rec["exposure_event_ids"] = logged_ids + [
-        e for e in exposures_declared_lost(rec) if e not in logged_ids]
+    accounting = exposure_accounting(
+        dict(rec, exposure_stamps=(old or {}).get("exposure_stamps"),
+             exposure_event_ids=(old or {}).get("exposure_event_ids")),
+        exposure_events())
+    rec["exposure_stamps"] = accounting["stamps"]
+    rec["exposure_event_ids"] = accounting["known_ids"]
     config.atomic_write_text(SELECTION_STAMP, json.dumps(rec, indent=1))
     if loss is not None:
         # Appended AFTER the freeze is written, and dated NOW. It is a record that the
@@ -1728,9 +1898,9 @@ def freeze_selection(note: str = "", revalidate: bool = False,
                        "freeze_id": rec.get("freeze_id"),
                        "selection_config_hash": rec.get("config_hash"),
                        "at": loss["declared_at"],
-                       "lost_event_ids": loss["lost_event_ids"],
-                       "damaged_lines_at_declaration":
-                           loss["damaged_lines_at_declaration"],
+                       # THIS declaration's loss - earlier ones have their own events.
+                       "lost_event_ids": loss["declarations"][-1]["lost_event_ids"],
+                       "damaged_lines": loss["declarations"][-1]["damaged_lines"],
                        "note": loss["note"]})
     return rec
 
@@ -1751,29 +1921,32 @@ EVIDENCE_STATUSES = ("unexposed", "prospective", "retrospective", "previously_ex
 def evidence_flags() -> dict:
     """Every fact about how the reported holdout evidence stands. Computed once, here."""
     rec = _read_selection()
-    events = exposures_recorded()
+    accounting = exposure_accounting(rec, exposure_events())
+    events = accounting["readable"]
     freeze_id = rec.get("freeze_id") if rec else None
     mine = [e for e in events if e.get("freeze_id") == freeze_id] if freeze_id else []
     declared_prior = bool(rec.get("prior_exposure_declared")) if rec else False
-    lost = exposures_declared_lost(rec)
+    revalidated = bool(rec.get("revalidated")) if rec else False
+    in_effect = accounting["loss_in_effect"]
     return {
         "logged_exposures": len(events),
         "exposures_under_this_freeze": len(mine),
         "exposures_under_earlier_freezes": len(events) - len(mine),
         "prior_exposure_declared": declared_prior,
-        "revalidated": bool(rec.get("revalidated")) if rec else False,
-        # Exposures whose RECORD is gone but whose occurrence is not in doubt: the
-        # freeze stamped their ids when they happened. They keep counting.
-        "exposures_declared_lost": len(lost),
+        "revalidated": revalidated,
+        # HISTORY: what was ever declared lost. It stays on record after a restoration.
+        "exposures_declared_lost": len(accounting["lost_declared"]),
         "log_loss_declared": bool(declared_log_loss(rec)),
-        "status": _classify_evidence(len(events), len(mine), declared_prior,
-                                     bool(rec.get("revalidated")) if rec else False,
-                                     bool(rec), bool(declared_log_loss(rec))),
+        # THE PRESENT: what a declaration covers that is still unreadable now.
+        "exposures_still_missing": len(accounting["still_missing_declared"]),
+        "log_loss_in_effect": in_effect,
+        "status": _classify_evidence(len(events), len(mine), declared_prior, revalidated,
+                                     bool(rec), in_effect),
     }
 
 
 def _classify_evidence(logged, mine, declared_prior, revalidated, have_freeze,
-                       log_loss_declared=False) -> str:
+                       log_loss_in_effect=False) -> str:
     """The strongest qualification on the evidence, as one word.
 
     `previously_exposed` outranks `retrospective`: a team that ran the holdout before any
@@ -1781,10 +1954,10 @@ def _classify_evidence(logged, mine, declared_prior, revalidated, have_freeze,
     even when a later declared exposure is also on the log. The other facts do not
     disappear - they are in `evidence_flags()` and the report must state them.
     """
-    # A LOST LOG IS THE SAME CLAIM AS A PRE-LOG RUN: exposures that happened and whose
-    # record cannot be produced. Declaring the loss is the honest route out of an
-    # unreadable log, and this is what it costs.
-    if log_loss_declared:
+    # A LOSS IN EFFECT IS THE SAME CLAIM AS A PRE-LOG RUN: exposures that happened and whose
+    # record cannot be produced. Once the declared evidence is restored the qualification
+    # no longer applies; the declaration itself stays in the flags as history.
+    if log_loss_in_effect:
         return "previously_exposed"
     if not have_freeze:
         return "unexposed" if not logged else "previously_exposed"
@@ -1869,9 +2042,14 @@ def record_holdout_exposure(reason: str = "fresh holdout draw") -> dict:
     # append is fsynced, so a crash in between leaves the exposure recorded rather than
     # only remembered.
     stamped = list(rec.get("exposure_event_ids") or [])
+    stamps = [s for s in (rec.get("exposure_stamps") or []) if isinstance(s, dict)]
     if event["event_id"] not in stamped:
         stamped.append(event["event_id"])
+        # WITH ITS FREEZE AND ITS ORDER, so the benchmark this exposure produces can still
+        # be bound to it after the log line describing it is lost.
+        stamps.append({k: event.get(k) for k in _STAMP_FIELDS})
         rec["exposure_event_ids"] = stamped
+        rec["exposure_stamps"] = stamps
         rec["exposures"] = exposures_recorded()
         rec["exposure_number"] = len(stamped)
         config.atomic_write_text(SELECTION_STAMP, json.dumps(rec, indent=1))

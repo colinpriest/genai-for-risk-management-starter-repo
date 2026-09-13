@@ -49,6 +49,9 @@ proxy's documented failure modes are translated into named exceptions.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
+import inspect
 import json
 import os
 import random
@@ -114,6 +117,7 @@ __all__ = [
     "SAMPLING_PARAMETERS",
     "SUPPORTED_REASONING_EFFORTS",
     "UsageTracker",
+    "dispatch_sink",
     "shared_limiter",
     "shared_token_limiter",
     "backoff_seconds",
@@ -158,8 +162,8 @@ DEFAULT_MAX_RETRIES = 2
 #   10,000 requests / 30 days     per student
 #
 # TEMPORARY. UNSW IT (Sina Ameli) raised the daily cap for Semester 3 only;
-# continuing beyond that needs fresh approval. Re-verify before each teaching
-# session with `test_api_connection.py` rather than trusting these numbers.
+# continuing beyond that needs fresh approval. Re-verify the limits before each
+# teaching session rather than trusting these numbers.
 #
 # These are PER STUDENT, keyed on the x-student-id header. An earlier version of
 # this comment described them as class-wide, and a second one a few lines down
@@ -249,11 +253,12 @@ class QuotaExceededError(UNSWAIError):
 
 
 class RequestTooLargeError(UNSWAIError):
-    """The request cannot fit the token-per-minute budget, so it can never run.
+    """The request is larger than the per-request ceiling, so it can never run.
 
     Distinct from :class:`QuotaExceededError` because the remedy is different and
     retrying is pointless: the proxy estimates the request size before running it
-    and refuses anything larger than the budget, however long you wait.
+    and refuses anything above the ceiling, however long you wait. The per-minute
+    budget is a separate limit, and it makes a call wait rather than fail.
     """
 
     def __init__(self, message: str, estimated_tokens: int | None = None,
@@ -272,7 +277,7 @@ class ParameterNotSupportedError(UNSWAIError):
 
 
 class DailyQuotaExceededError(UNSWAIError):
-    """The 100,000 token/day budget is spent.
+    """The daily token budget is spent (``DEFAULT_TOKENS_PER_DAY`` unless configured).
 
     Separate from :class:`QuotaExceededError` because there is no useful wait:
     the daily window refills over hours, not seconds, so a long-running job
@@ -806,27 +811,58 @@ class RateLimiter:
 
 
 class UsageTracker:
-    """Running token and request totals for a client.
+    """Running request and token totals for a client.
 
     APIM caps us on *request count*, which is a poor proxy for what a workload
     actually costs when the calls are small and schema-constrained.  Having real
     token figures per lab turns "we need a higher limit" into a number, and lets
     a lab be designed against a token or dollar budget instead.
+
+    THREE COUNTS, BECAUSE THEY ARE THREE DIFFERENT NUMBERS.
+
+    * ``requests``                - HTTP requests actually dispatched: admitted by
+                                    this client's own guards and handed to the
+                                    network.  A prompt refused locally - over the
+                                    per-request cap, past the daily budget - was
+                                    never sent and is not one.
+    * ``responses_with_usage``    - responses that reported token figures.  The
+                                    token totals below are exactly these.
+    * ``responses_without_usage`` - responses that reported no usage at all.
+
+    Requests that got no response - a timeout, a 429, a 5xx - are
+    ``requests - responses_with_usage - responses_without_usage``.  What those
+    cost is NOT KNOWN, and this class does not guess: ``tokens_complete`` says
+    whether the token totals cover every request.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.requests = 0
+        self.responses_with_usage = 0
+        self.responses_without_usage = 0
         self.input_tokens = 0
         self.output_tokens = 0
         self.reasoning_tokens = 0
         self.cached_tokens = 0
         self.by_model: dict[str, dict[str, int]] = {}
 
+    def count_attempt(self, *args: Any, **kwargs: Any) -> None:
+        """One request has been dispatched.
+
+        Called by the transport, through :func:`dispatch_sink`, after every local
+        guard has admitted the request and before its response is known - so a 429
+        or a timeout still counts, and a request this client refused never does.
+        """
+        with self._lock:
+            self.requests += 1
+
     def record(self, response: Any) -> None:
-        """Accumulate one response.  Silently ignores anything without usage."""
+        """Accumulate one response's token usage."""
         usage = getattr(response, "usage", None)
         if usage is None:
+            # A response that reported nothing. "No tokens reported" is not "zero billed".
+            with self._lock:
+                self.responses_without_usage += 1
             return
         model = str(getattr(response, "model", "unknown"))
         inp = int(getattr(usage, "input_tokens", 0) or 0)
@@ -837,30 +873,37 @@ class UsageTracker:
         cached = int(getattr(in_details, "cached_tokens", 0) or 0) if in_details else 0
 
         with self._lock:
-            self.requests += 1
+            self.responses_with_usage += 1
             self.input_tokens += inp
             self.output_tokens += out
             self.reasoning_tokens += reasoning
             self.cached_tokens += cached
             row = self.by_model.setdefault(
-                model, {"requests": 0, "input_tokens": 0, "output_tokens": 0}
+                model, {"responses_with_usage": 0, "input_tokens": 0, "output_tokens": 0}
             )
-            row["requests"] += 1
+            row["responses_with_usage"] += 1
             row["input_tokens"] += inp
             row["output_tokens"] += out
 
     def summary(self) -> dict[str, Any]:
         with self._lock:
+            counted = self.responses_with_usage
+            unanswered = max(self.requests - counted - self.responses_without_usage, 0)
             return {
                 "requests": self.requests,
+                "responses_with_usage": counted,
+                "responses_without_usage": self.responses_without_usage,
+                "attempts_without_response": unanswered,
+                "tokens_complete": (self.responses_without_usage == 0
+                                    and unanswered == 0),
                 "input_tokens": self.input_tokens,
                 "output_tokens": self.output_tokens,
                 "total_tokens": self.input_tokens + self.output_tokens,
                 "reasoning_tokens": self.reasoning_tokens,
                 "cached_input_tokens": self.cached_tokens,
-                "mean_tokens_per_request": (
-                    round((self.input_tokens + self.output_tokens) / self.requests, 1)
-                    if self.requests
+                "mean_tokens_per_counted_response": (
+                    round((self.input_tokens + self.output_tokens) / counted, 1)
+                    if counted
                     else 0.0
                 ),
                 "by_model": {m: dict(r) for m, r in self.by_model.items()},
@@ -872,13 +915,24 @@ class UsageTracker:
         if not s["requests"]:
             return "No requests recorded."
         lines = [
-            f"{s['requests']} requests, {s['total_tokens']:,} tokens "
+            f"{s['requests']} HTTP requests, {s['total_tokens']:,} known tokens "
             f"({s['input_tokens']:,} in / {s['output_tokens']:,} out), "
-            f"mean {s['mean_tokens_per_request']:g} tokens per request."
+            f"mean {s['mean_tokens_per_counted_response']:g} tokens per response "
+            f"that reported usage."
         ]
+        if not s["tokens_complete"]:
+            gaps = []
+            if s["attempts_without_response"]:
+                gaps.append(f"{s['attempts_without_response']} request(s) got no "
+                            f"response (timed out, rate-limited or rejected)")
+            if s["responses_without_usage"]:
+                gaps.append(f"{s['responses_without_usage']} response(s) reported "
+                            f"no usage")
+            lines.append("  Tokens are NOT the whole story here: " + "; ".join(gaps)
+                         + ". What those cost is unknown, not zero.")
         for model, row in s["by_model"].items():
             lines.append(
-                f"  {model}: {row['requests']} requests, "
+                f"  {model}: {row['responses_with_usage']} counted response(s), "
                 f"{row['input_tokens'] + row['output_tokens']:,} tokens"
             )
         return "\n".join(lines)
@@ -886,6 +940,7 @@ class UsageTracker:
     def reset(self) -> None:
         with self._lock:
             self.requests = self.input_tokens = self.output_tokens = 0
+            self.responses_with_usage = self.responses_without_usage = 0
             self.reasoning_tokens = self.cached_tokens = 0
             self.by_model.clear()
 
@@ -1174,6 +1229,91 @@ def _estimate_request_tokens(request: httpx.Request) -> int:
     return estimate_tokens(body)
 
 
+#: WHERE A REQUEST IS COUNTED. Every counter that reports "requests" - a client's session
+#: total, courseapi's per-call account - registers here for the span of its own call, and the
+#: transport notifies them at the one point a request actually leaves: after this client's own
+#: token and rate guards have admitted it, immediately before the network layer. Counting any
+#: earlier recorded prompts the client refused itself as HTTP requests that were never sent.
+#: A context variable, so the count is right however the transport was built and concurrent
+#: calls on other threads count apart.
+_dispatch_sinks: contextvars.ContextVar[tuple] = contextvars.ContextVar(
+    "unsw_ai_dispatch_sinks", default=())
+
+
+@contextlib.contextmanager
+def dispatch_sink(callback: Callable[[], None]):
+    """Call ``callback()`` once for every request dispatched while the block runs."""
+    token = _dispatch_sinks.set(_dispatch_sinks.get() + (callback,))
+    try:
+        yield
+    finally:
+        _dispatch_sinks.reset(token)
+
+
+def _note_dispatch() -> None:
+    for callback in _dispatch_sinks.get():
+        callback()
+
+
+def _counting(usage: Any) -> Any:
+    """The dispatch counter for ``usage``, or nothing to count into."""
+    return (dispatch_sink(usage.count_attempt) if usage is not None
+            else contextlib.nullcontext())
+
+
+def _counting_iterator(iterator: Any, callback: Callable[[], None]) -> Any:
+    """Keep a streamed result's requests on the account that asked for them."""
+    while True:
+        with dispatch_sink(callback):
+            try:
+                item = next(iterator)
+            except StopIteration:
+                return
+        yield item
+
+
+async def _counting_async_iterator(iterator: Any, callback: Callable[[], None]) -> Any:
+    """Async twin of :func:`_counting_iterator`."""
+    while True:
+        with dispatch_sink(callback):
+            try:
+                item = await iterator.__anext__()
+            except StopAsyncIteration:
+                return
+        yield item
+
+
+def _note_dispatch_hook(request: "httpx.Request") -> None:
+    _note_dispatch()
+
+
+async def _note_dispatch_hook_async(request: "httpx.Request") -> None:
+    _note_dispatch()
+
+
+def _ensure_dispatch_counted(sdk: Any) -> None:
+    """Make every request this client sends reach `dispatch_sink`, whatever carries it.
+
+    The wrapper's own ProxyTransport notifies the sinks itself, AFTER its token guards, so
+    a request it refuses is never counted. A client built on any other transport - a test
+    double, a caller's own httpx client - has no such guards and refuses nothing before
+    sending, so each request is counted as httpx hands it over. Without this, a client on
+    another transport counted no requests at all, and the records its real calls produced
+    were rejected on reload as having taken none.
+    """
+    http = getattr(sdk, "_client", None)
+    if not isinstance(http, (httpx.Client, httpx.AsyncClient)):
+        return
+    if isinstance(getattr(http, "_transport", None), (ProxyTransport, AsyncProxyTransport)):
+        return
+    hook = (_note_dispatch_hook_async if isinstance(http, httpx.AsyncClient)
+            else _note_dispatch_hook)
+    hooks = {name: list(fns) for name, fns in http.event_hooks.items()}
+    if hook not in hooks.setdefault("request", []):
+        hooks["request"].append(hook)
+        http.event_hooks = hooks
+
+
 class ProxyTransport(httpx.BaseTransport):
     """Sync transport that redirects SDK traffic to the UNSW proxy URL.
 
@@ -1199,6 +1339,8 @@ class ProxyTransport(httpx.BaseTransport):
             self._token_limiter.acquire(_estimate_request_tokens(proxied))
         if self._limiter is not None:
             self._limiter.acquire()
+        # ADMITTED BY EVERY LOCAL GUARD: from here the request is on the wire.
+        _note_dispatch()
         return self._inner.handle_request(proxied)
 
 
@@ -1224,6 +1366,8 @@ class AsyncProxyTransport(httpx.AsyncBaseTransport):
             await self._token_limiter.aacquire(_estimate_request_tokens(proxied))
         if self._limiter is not None:
             await self._limiter.aacquire()
+        # ADMITTED BY EVERY LOCAL GUARD: from here the request is on the wire.
+        _note_dispatch()
         return await self._inner.handle_async_request(proxied)
 
 
@@ -1709,6 +1853,7 @@ def _guard(
     rate_limit_retries: int,
     limiter: RateLimiter | None = None,
     fallback_models: Sequence[str] = (),
+    usage: "UsageTracker | None" = None,
 ) -> Callable[..., Any]:
     """Wrap instructor's patched ``create`` with kwarg fixes, backoff and error translation."""
 
@@ -1724,7 +1869,11 @@ def _guard(
             validate_parameters(call_kwargs)
             for attempt in range(rate_limit_retries + 1):
                 try:
-                    return create_fn(*args, **call_kwargs)
+                    with _counting(usage):
+                        result = create_fn(*args, **call_kwargs)
+                    if usage is not None and inspect.isgenerator(result):
+                        result = _counting_iterator(result, usage.count_attempt)
+                    return result
                 except Exception as exc:  # noqa: BLE001 - re-raised below
                     translated = translate_error(exc, settings)
                     if translated is exc:
@@ -1762,6 +1911,7 @@ def _aguard(
     rate_limit_retries: int,
     limiter: RateLimiter | None = None,
     fallback_models: Sequence[str] = (),
+    usage: "UsageTracker | None" = None,
 ) -> Callable[..., Any]:
     async def acreate(*args: Any, **kwargs: Any) -> Any:
         kwargs = _normalise_kwargs(kwargs, is_async=True)
@@ -1773,7 +1923,11 @@ def _aguard(
             validate_parameters(call_kwargs)
             for attempt in range(rate_limit_retries + 1):
                 try:
-                    return await create_fn(*args, **call_kwargs)
+                    with _counting(usage):
+                        result = await create_fn(*args, **call_kwargs)
+                    if usage is not None and inspect.isasyncgen(result):
+                        result = _counting_async_iterator(result, usage.count_attempt)
+                    return result
                 except Exception as exc:  # noqa: BLE001 - re-raised below
                     translated = translate_error(exc, settings)
                     if translated is exc:
@@ -1825,8 +1979,18 @@ def _retrying_for(max_retries: Any, is_async: bool) -> Any:
     """
     if tenacity is None or not isinstance(max_retries, int):
         return max_retries
-    retry_policy = tenacity.retry_if_not_exception_type(_DETERMINISTIC_FAILURES)
     stop = tenacity.stop_after_attempt(max_retries)
+
+    def retry_policy(retry_state) -> bool:
+        outcome = retry_state.outcome
+        exc = outcome.exception() if outcome is not None else None
+        if exc is None or isinstance(exc, _DETERMINISTIC_FAILURES):
+            return False
+        # REFUSED BY THIS CLIENT, NOT BY THE SERVICE. A prompt over the per-request cap or a
+        # call past the daily budget is raised inside the transport before anything is sent,
+        # and the SDK wraps it as a connection error - which read as transient, so it was
+        # asked again and refused identically. A local refusal is never worth a retry.
+        return not isinstance(_unwrap(exc), UNSWAIError)
     if is_async:
         return tenacity.AsyncRetrying(stop=stop, retry=retry_policy, reraise=True)
     return tenacity.Retrying(stop=stop, retry=retry_policy, reraise=True)
@@ -1978,9 +2142,9 @@ class UNSWInstructor(instructor.Instructor):
     settings:
         A ready-made :class:`ProxySettings`, bypassing environment lookup.
     rate_limit_retries:
-        How many times a call may wait out a 429 and try again (default 4).  The
-        quota is small and shared across the class, so transient rate limits are
-        normal; set 0 to fail immediately instead.
+        How many times a call may wait out a 429 and try again (default 4).  A
+        bulk run meets the per-student per-minute limits, so transient rate
+        limits are normal; set 0 to fail immediately instead.
     requests_per_minute:
         Client-side ceiling, default 60 to match the APIM limit.  Enforced
         before every HTTP request, so instructor's re-asks and streamed calls
@@ -2046,11 +2210,14 @@ class UNSWInstructor(instructor.Instructor):
         openai_client = build_openai_client(resolved, is_async=False, limiter=limiter, token_limiter=tokens)
         patched = instructor.from_openai(openai_client, mode=mode)
         defaults.setdefault("model", resolved.model)
+        # Created before the guard, which counts this client's dispatched requests into it.
+        usage = UsageTracker()
+        _ensure_dispatch_counted(openai_client)
 
         super().__init__(
             client=openai_client,
             create=_guard(patched.create_fn, resolved, rate_limit_retries, limiter,
-                          resolved.fallback_models),
+                          resolved.fallback_models, usage=usage),
             mode=mode,
             provider=patched.provider,
             **defaults,
@@ -2062,7 +2229,9 @@ class UNSWInstructor(instructor.Instructor):
         self.token_limiter = tokens
         # Token accounting: APIM caps request count, but tokens are what the
         # workload actually costs, so make the real figures available.
-        self.usage = UsageTracker()
+        # REQUESTS are counted where they are dispatched - see `dispatch_sink` - and TOKENS
+        # as each response arrives.
+        self.usage = usage
         self.on("completion:response", self.usage.record)
         self.on("completion:response", _remember_response)
 
@@ -2086,11 +2255,12 @@ class UNSWInstructor(instructor.Instructor):
         """
         for attempt in range(self.rate_limit_retries + 1):
             try:
-                response = self.client.responses.create(
-                    model=model or self.default_model,
-                    input="Reply with exactly: OK",
-                    max_output_tokens=max_output_tokens,
-                )
+                with dispatch_sink(self.usage.count_attempt):
+                    response = self.client.responses.create(
+                        model=model or self.default_model,
+                        input="Reply with exactly: OK",
+                        max_output_tokens=max_output_tokens,
+                    )
                 break
             except Exception as exc:  # noqa: BLE001
                 translated = translate_error(exc, self._settings)
@@ -2163,11 +2333,14 @@ class AsyncUNSWInstructor(instructor.AsyncInstructor):
         openai_client = build_openai_client(resolved, is_async=True, limiter=limiter, token_limiter=tokens)
         patched = instructor.from_openai(openai_client, mode=mode)
         defaults.setdefault("model", resolved.model)
+        # Created before the guard, which counts this client's dispatched requests into it.
+        usage = UsageTracker()
+        _ensure_dispatch_counted(openai_client)
 
         super().__init__(
             client=openai_client,
             create=_aguard(patched.create_fn, resolved, rate_limit_retries, limiter,
-                           resolved.fallback_models),
+                           resolved.fallback_models, usage=usage),
             mode=mode,
             provider=patched.provider,
             **defaults,
@@ -2179,7 +2352,9 @@ class AsyncUNSWInstructor(instructor.AsyncInstructor):
         self.token_limiter = tokens
         # Token accounting: APIM caps request count, but tokens are what the
         # workload actually costs, so make the real figures available.
-        self.usage = UsageTracker()
+        # REQUESTS are counted where they are dispatched - see `dispatch_sink` - and TOKENS
+        # as each response arrives.
+        self.usage = usage
         self.on("completion:response", self.usage.record)
         self.on("completion:response", _remember_response)
 

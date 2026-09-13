@@ -734,33 +734,28 @@ def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposur
     declared_prior = bool(selection.get("prior_exposure_declared"))
 
     # ---- the COMMITTED LOG is the authority, not the copy inside the artefact --------
+    # READ WITH THE RUNTIME'S OWN PARSER AND ACCOUNTING. This check used to parse the log
+    # itself and rejected ANY damaged line, while the runtime accepted the lines a lost-log
+    # declaration covered - so a team that followed the supported recovery could never
+    # submit, and was told to restore the file it had just declared unrecoverable. Both now
+    # read the same lines the same way, and only damage NO declaration covers is refused.
     log_path = ROOT / "outputs" / dr.EXPOSURE_LOG.name
-    committed = None
-    if log_path.exists():
-        events, damage = [], []
-        for n, line in enumerate(
-                log_path.read_text(encoding="utf-8").splitlines(), start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                parsed = json.loads(line)
-            except json.JSONDecodeError as exc:
-                damage.append(f"line {n}: not JSON ({exc.msg})")
-                continue
-            if not isinstance(parsed, dict):
-                damage.append(f"line {n}: a {type(parsed).__name__}, not an event")
-                continue
-            if parsed.get("type") == "open":
-                missing = [f for f in dr._OPEN_EVENT_FIELDS if parsed.get(f) is None]
-                if missing:
-                    damage.append(f"line {n}: exposure event missing {missing}")
-            events.append(parsed)
-        assert not damage, (
-            f"outputs/{dr.EXPOSURE_LOG.name} is damaged, so the number of holdout "
-            f"exposures it records cannot be read:\n  " + "\n  ".join(damage)
-            + "\nRestore it from version control rather than editing it.")
-        committed = events
+    committed = dr.parse_exposure_log(log_path) if log_path.exists() else None
+    accounting = dr.exposure_accounting(selection, committed or [])
+    assert not accounting["conflicts"], (
+        f"outputs/{dr.EXPOSURE_LOG.name} records different events under the same id "
+        f"{accounting['conflicts']}. Restore it from version control rather than editing "
+        f"it.")
+    undeclared = accounting["undeclared_damage"]
+    assert not undeclared, (
+        f"outputs/{dr.EXPOSURE_LOG.name} is damaged, so the number of holdout "
+        f"exposures it records cannot be read:\n  "
+        + "\n  ".join(f"line {d.get('line_number')}: {d.get('problem')}"
+                      for d in undeclared)
+        + ("\nA lost-log declaration covers other lines of this file; these are not "
+           "among them." if selection.get("log_loss") else "")
+        + "\nRestore it from version control rather than editing it. If it is genuinely "
+          "unrecoverable, tell the course staff and declare it with --declare-lost-log.")
 
     if any(e.get("type") == "open" for e in embedded_events):
         assert committed is not None, (
@@ -785,12 +780,12 @@ def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposur
     # THE AUTHORITATIVE HISTORY, from here on. `committed` is the file; the embedded copy
     # has just been required to equal it, so anything derived below rests on the file.
     authoritative = committed if committed is not None else []
-    opened = [e for e in authoritative if e.get("type") == "open"]
+    # DISTINCT readable exposures: the same event restored twice is one exposure, not two.
+    opened = accounting["readable"]
     # A DECLARED LOSS OF THE LOG is the third way a holdout result can stand: the exposures
-    # happened - the freeze stamped their ids when they did - and their record cannot be
+    # happened - the freeze stamped them when they did - and their record cannot be
     # produced. It is read from the SELECTION, where it is declared, never from the report.
     log_loss = selection.get("log_loss") or {}
-    lost_ids = [e for e in (log_loss.get("lost_event_ids") or []) if e]
     # EITHER the log records the exposure, OR the team declares that it happened before
     # the log existed. An empty log means one of two opposite things - untouched, or
     # exposed by a process that never recorded it - and the difference has to be stated
@@ -801,47 +796,59 @@ def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposur
         "declare an exposure that predates the log:\n"
         '    python src/decision_replay.py --dev --prior-exposure --note="..."')
 
-    # ---- the REPORTED benchmark is bound to ONE event, and that event to this freeze --
-    if opened:
+    # ---- the REPORTED benchmark is bound to ONE exposure: the latest this freeze made --
+    known = accounting["known_ids"]
+    if known:
         event_id = exposure.get("holdout_event_id")
         assert event_id, (
             "replay.json reports holdout numbers without naming the exposure they came "
             "from. Regenerate the Replay stage so the benchmark carries its event id.")
-        named = [e for e in opened if e.get("event_id") == event_id]
-        assert len(named) == 1, (
-            f"holdout_event_id {event_id!r} names "
-            f"{'no' if not named else len(named)} event(s) in the exposure log")
-        event = named[0]
-        assert event.get("selection_config_hash") == selection.get("config_hash"), (
-            f"the reported holdout benchmark belongs to exposure {event_id} of selection "
-            f"{event.get('selection_config_hash')!r}, but the frozen selection is "
-            f"{selection.get('config_hash')!r}. Older exposures of older configurations "
-            f"are legitimate history; the one this report rests on must be the current "
-            f"freeze. Re-run the holdout under the frozen selection.")
-        assert event.get("freeze_id") == selection.get("freeze_id"), (
-            f"exposure {event_id} was recorded against freeze "
-            f"{event.get('freeze_id')!r}, not the current freeze "
-            f"{selection.get('freeze_id')!r}")
-        closed = {e.get("event_id") for e in authoritative
-                  if e.get("type") == "close"}
-        assert event_id in closed, (
-            f"exposure {event_id} was never closed, so the benchmark it reports did not "
-            f"finish. Re-run the stage to completion before submitting.")
-        # Every exposure must have been authorised: the freeze says how many looks at the
-        # holdout the selection allows, and the log says how many were taken.
+        current_freeze = selection.get("freeze_id")
+        latest = dr.latest_exposure_for(accounting, current_freeze)
+        readable = {e.get("event_id"): e for e in opened}
+        if event_id in readable:
+            event = readable[event_id]
+            assert event.get("selection_config_hash") == selection.get("config_hash"), (
+                f"the reported holdout benchmark belongs to exposure {event_id} of "
+                f"selection {event.get('selection_config_hash')!r}, but the frozen "
+                f"selection is {selection.get('config_hash')!r}. Older exposures of older "
+                f"configurations are legitimate history; the one this report rests on must "
+                f"be the current freeze. Re-run the holdout under the frozen selection.")
+            assert event.get("freeze_id") == current_freeze, (
+                f"exposure {event_id} was recorded against freeze "
+                f"{event.get('freeze_id')!r}, not the current freeze {current_freeze!r}")
+            closed = {e.get("event_id") for e in authoritative if e.get("type") == "close"}
+            assert event_id in closed, (
+                f"exposure {event_id} was never closed, so the benchmark it reports did not "
+                f"finish. Re-run the stage to completion before submitting.")
+        else:
+            # AN EXPOSURE WHOSE RECORD WAS DECLARED LOST AND IS STILL MISSING. This branch
+            # used to be reachable only when NO readable exposure remained, so a benchmark
+            # honestly bound to a lost exposure was refused whenever any older one survived.
+            # Its open and close events cannot be produced; what can be checked is that the
+            # declaration covers it and the freeze stamped it.
+            assert event_id in accounting["still_missing_declared"], (
+                f"holdout_event_id {event_id!r} names no event in the exposure log and is "
+                f"not one of the exposures the lost-log declaration covers "
+                f"({accounting['still_missing_declared']})")
+            stamped_freeze = accounting["freeze_of"].get(event_id)
+            assert stamped_freeze in (None, current_freeze), (
+                f"exposure {event_id} was stamped against freeze {stamped_freeze!r}, not "
+                f"the current freeze {current_freeze!r}")
+        # NOT AN OLDER EXPOSURE THAT HAPPENED TO SURVIVE. After a partial loss the producer
+        # attached the benchmark to the last exposure still readable, and this check
+        # accepted it. A benchmark belongs to the latest exposure its freeze made.
+        assert event_id == latest, (
+            f"replay.json binds the holdout benchmark to exposure {event_id!r}, but the "
+            f"latest exposure this freeze made is {latest!r}. Regenerate the Replay stage: "
+            f"a benchmark is bound to the exposure that produced it.")
+        # Every exposure must have been authorised - counted as DISTINCT exposures, so a
+        # restored record is not a second look.
         authorised = int(selection.get("authorised_exposures", 1))
-        assert len(opened) + len(lost_ids) <= authorised, (
-            f"the log records {len(opened)} holdout exposure(s) but the freeze authorises "
-            f"{authorised}. A further look has to be declared with --revalidate.")
-    elif log_loss:
-        # THE REPORT RESTS ON AN EXPOSURE WHOSE RECORD WAS DECLARED LOST. Its open and close
-        # events cannot be produced, so they cannot be checked. What can be checked is that
-        # the event it names is one the freeze stamped and the declaration covers - so a
-        # declaration cannot be used to attach a benchmark to an exposure nobody recorded.
-        event_id = exposure.get("holdout_event_id")
-        assert event_id in lost_ids, (
-            f"holdout_event_id {event_id!r} is not one of the exposures the lost-log "
-            f"declaration covers ({lost_ids})")
+        assert len(known) <= authorised, (
+            f"{len(known)} distinct holdout exposure(s) are known and the freeze "
+            f"authorises {authorised}. A further look has to be declared with "
+            f"--revalidate.")
 
     # ---- the status comes from ONE classifier, and this check reads it -------------
     # It used to re-derive the rule here, and the two derivations disagreed: a team that
@@ -871,8 +878,6 @@ def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposur
     # had said nothing about. A summary that contradicts its own evidence is the one
     # thing this check exists to catch, so the facts are now DERIVED from the frozen
     # selection and the committed log and the report is compared against them.
-    lost = [e for e in ((selection.get("log_loss") or {}).get("lost_event_ids") or [])
-            if e]
     freeze_id = selection.get("freeze_id")
     mine = [e for e in opened if e.get("freeze_id") == freeze_id] if freeze_id else []
     derived = {
@@ -881,24 +886,28 @@ def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposur
         "exposures_under_earlier_freezes": len(opened) - len(mine),
         "prior_exposure_declared": bool(selection.get("prior_exposure_declared")),
         "revalidated": bool(selection.get("revalidated")),
-        "exposures_declared_lost": len(lost),
+        "exposures_declared_lost": len(accounting["lost_declared"]),
         "log_loss_declared": bool(selection.get("log_loss")),
+        "exposures_still_missing": len(accounting["still_missing_declared"]),
+        "log_loss_in_effect": accounting["loss_in_effect"],
     }
     # ONE CLASSIFIER STILL - fed verified facts rather than reported ones.
     derived["status"] = dr._classify_evidence(
         derived["logged_exposures"], derived["exposures_under_this_freeze"],
         derived["prior_exposure_declared"], derived["revalidated"], True,
-        derived["log_loss_declared"])
-    # FLAGS ADDED AFTER A REPORT COULD ALREADY EXIST. A replay.json written before a
-    # lost-log declaration was possible cannot have recorded one, so for these two fields -
-    # and only these - absence reads as "not declared", and is accepted only when the frozen
-    # selection agrees that nothing was declared. A report that omits them while the
-    # selection carries a declaration still disagrees, and is rejected. Every other flag
+        derived["log_loss_in_effect"])
+    # FLAGS ADDED AFTER A REPORT COULD ALREADY EXIST. A replay.json written before lost-log
+    # declarations were possible cannot have recorded one, so for these fields - and only
+    # these - absence reads as "nothing declared", and is accepted only when the frozen
+    # selection and the log agree that nothing was declared. A report that omits them while
+    # the evidence holds a declaration still disagrees, and is rejected. Every other flag
     # existed when replay.json gained evidence_flags: its absence is a disagreement like any
     # other, and the fix is to regenerate the report, never to assume a value for it.
     reported = dict(flags)
     for field, not_declared in (("exposures_declared_lost", 0),
-                                ("log_loss_declared", False)):
+                                ("log_loss_declared", False),
+                                ("exposures_still_missing", 0),
+                                ("log_loss_in_effect", False)):
         if field not in reported and derived[field] == not_declared:
             reported[field] = not_declared
     disagreements = [
@@ -925,8 +934,7 @@ def test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposur
     if derived["log_loss_declared"]:
         assert str((selection.get("log_loss") or {}).get("note", "")).strip(), (
             "a declared loss of the exposure log must say what happened to it")
-    if derived["logged_exposures"] + derived["exposures_declared_lost"] > 1 \
-            or derived["revalidated"]:
+    if len(accounting["known_ids"]) > 1 or derived["revalidated"]:
         assert str(selection.get("authorisation", "")).strip(), (
             "a second exposure must carry the declared reason it was authorised for")
 

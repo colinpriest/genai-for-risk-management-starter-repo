@@ -1129,12 +1129,22 @@ def _mock_stack(monkeypatch, responder):
     settings = unsw_ai.ProxySettings(proxy_url="https://mock.invalid",
                                      access_code="synthetic", student_id="9999999",
                                      fallback_models=())
-    sdk = openai.OpenAI(api_key="synthetic", base_url="https://mock.invalid",
-                        max_retries=0,
-                        http_client=httpx.Client(transport=httpx.MockTransport(transport)))
-    monkeypatch.setattr(unsw_ai, "build_openai_client", lambda *a, **k: sdk)
+    # ONLY THE NETWORK IS SCRIPTED. The wrapper's own ProxyTransport and its token guard run
+    # for real; replacing the whole transport hid every request the client refuses itself,
+    # which is exactly where request counting went wrong.
+    built = []
+
+    def build(settings, **kwargs):
+        proxy = unsw_ai.ProxyTransport(settings, inner=httpx.MockTransport(transport),
+                                       token_limiter=kwargs.get("token_limiter"))
+        built.append(openai.OpenAI(api_key="synthetic", base_url="https://mock.invalid",
+                                   max_retries=0, http_client=httpx.Client(transport=proxy)))
+        return built[-1]
+
+    monkeypatch.setattr(unsw_ai, "build_openai_client", build)
     monkeypatch.setattr(unsw_ai.time, "sleep", lambda *a, **k: None)
     client = unsw_ai.UNSWInstructor(settings=settings)
+    sdk = built[-1]
     monkeypatch.setattr(unsw_ai, "get_client", lambda *a, **k: client)
     monkeypatch.setattr(courseapi, "client_", lambda: courseapi.CourseClient())
     return sent
@@ -1587,12 +1597,22 @@ def _sequence_transport(monkeypatch, responses):
     settings = unsw_ai.ProxySettings(proxy_url="https://mock.invalid",
                                      access_code="synthetic", student_id="9999999",
                                      fallback_models=())
-    sdk = openai.OpenAI(api_key="synthetic", base_url="https://mock.invalid",
-                        max_retries=0,
-                        http_client=httpx.Client(transport=httpx.MockTransport(transport)))
-    monkeypatch.setattr(unsw_ai, "build_openai_client", lambda *a, **k: sdk)
+    # ONLY THE NETWORK IS SCRIPTED. The wrapper's own ProxyTransport and its token guard run
+    # for real; replacing the whole transport hid every request the client refuses itself,
+    # which is exactly where request counting went wrong.
+    built = []
+
+    def build(settings, **kwargs):
+        proxy = unsw_ai.ProxyTransport(settings, inner=httpx.MockTransport(transport),
+                                       token_limiter=kwargs.get("token_limiter"))
+        built.append(openai.OpenAI(api_key="synthetic", base_url="https://mock.invalid",
+                                   max_retries=0, http_client=httpx.Client(transport=proxy)))
+        return built[-1]
+
+    monkeypatch.setattr(unsw_ai, "build_openai_client", build)
     monkeypatch.setattr(unsw_ai.time, "sleep", lambda *a, **k: None)
     client = unsw_ai.UNSWInstructor(settings=settings)
+    sdk = built[-1]
     monkeypatch.setattr(unsw_ai, "get_client", lambda *a, **k: client)
     monkeypatch.setattr(courseapi, "client_", lambda: courseapi.CourseClient())
     return sent, sdk
@@ -1998,13 +2018,18 @@ def _real_writer_cache(stage, tmp_path, monkeypatch):
             "usage": {"input_tokens": 10, "output_tokens": 10, "total_tokens": 20}})
 
     mod = dr if stage == "replay" else sc
-    sdk = openai.OpenAI(api_key="synthetic", base_url="https://synthetic.invalid",
-                        max_retries=0,
-                        http_client=httpx.Client(transport=httpx.MockTransport(respond)))
     settings = unsw_ai.ProxySettings(proxy_url="https://synthetic.invalid",
                                      access_code="synthetic", student_id="9999999",
                                      fallback_models=())
-    monkeypatch.setattr(unsw_ai, "build_openai_client", lambda *a, **k: sdk)
+
+    def build(settings, **kwargs):
+        # Only the network is scripted: the real ProxyTransport and token guard run.
+        proxy = unsw_ai.ProxyTransport(settings, inner=httpx.MockTransport(respond),
+                                       token_limiter=kwargs.get("token_limiter"))
+        return openai.OpenAI(api_key="synthetic", base_url="https://synthetic.invalid",
+                             max_retries=0, http_client=httpx.Client(transport=proxy))
+
+    monkeypatch.setattr(unsw_ai, "build_openai_client", build)
     monkeypatch.setattr(unsw_ai.time, "sleep", lambda *a, **k: None)
     monkeypatch.setattr(config, "ledger_add", lambda *a, **k: None)
     monkeypatch.setattr(mod, "RAW_DIR", tmp_path)
@@ -2351,6 +2376,8 @@ def _relabelled(two_exposures, **changes):
     ("prior_exposure_declared", True),
     ("exposures_declared_lost", 1),
     ("log_loss_declared", True),
+    ("exposures_still_missing", 1),
+    ("log_loss_in_effect", True),
 ])
 def test_a_report_cannot_misstate_one_fact_about_its_own_evidence(two_exposures,
                                                                   field, value):
@@ -2362,7 +2389,7 @@ def test_a_report_cannot_misstate_one_fact_about_its_own_evidence(two_exposures,
     flags["status"] = dr._classify_evidence(
         flags["logged_exposures"], flags["exposures_under_this_freeze"],
         flags["prior_exposure_declared"], flags["revalidated"], True,
-        flags["log_loss_declared"])
+        flags["log_loss_in_effect"])
     with pytest.raises(AssertionError, match="contradicts the evidence"):
         two_exposures.validate(flags=flags, status=flags["status"])
 
@@ -2382,7 +2409,8 @@ def test_a_status_the_files_do_not_support_is_rejected_even_with_true_flags(two_
         two_exposures.validate(status="prospective")
 
 
-_LATER_FLAGS = ("exposures_declared_lost", "log_loss_declared")
+_LATER_FLAGS = ("exposures_declared_lost", "log_loss_declared",
+                "exposures_still_missing", "log_loss_in_effect")
 
 
 def test_a_report_written_before_the_lost_log_flags_existed_still_passes(two_exposures):
@@ -2993,3 +3021,536 @@ def test_the_shipped_signposts_do_not_satisfy_any_gate(tmp_path, monkeypatch):
     (tmp_path / "docs/meetings/README.md").write_text(
         "SUBMISSION ROUTE: Moodle\n", encoding="utf-8")
     sub.test_meeting_records_are_paired_transcripts_and_minutes()
+
+
+# -------------------------------------------------------------------------------------------
+# THE LOST-LOG ROUTE, FROM THE PRODUCER TO SUBMISSION  (recheck-6 T1, T2, T3)
+# -------------------------------------------------------------------------------------------
+# Every case runs the REAL cached benchmark producer after the damage, and passes what it
+# emits - event id, history and flags, unchanged - to the submission check. The earlier
+# route test supplied a fixture's saved event id: exactly the thing the producer lost.
+
+_CACHED_RECOMMENDATION = {"ok": True,
+                          "result": {"recommendation": "hold", "size_bp": 0,
+                                     "confidence": 0.8},
+                          "shot_mix": {"hold_share": 1.0}}
+
+
+@pytest.fixture()
+def cached_holdout(monkeypatch, tmp_path):
+    """A frozen workspace whose holdout benchmark is served entirely from cache."""
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    monkeypatch.setattr(dr, "SELECTION_STAMP", outputs / "replay_selection.json")
+    monkeypatch.setattr(dr, "EXPOSURE_LOG", outputs / "replay_exposures.jsonl")
+    monkeypatch.setattr(dr, "dev_sample", lambda *a, **k: ["2020-01-01"])
+    monkeypatch.setattr(dr, "holdout_sample", lambda *a, **k: ["2020-02-01"])
+    monkeypatch.setattr(dr, "_prompts_written", lambda: True)
+    requests = {"n": 0}
+
+    def no_network(*a, **k):
+        requests["n"] += 1
+        raise RuntimeError("a cached benchmark must not make a request")
+
+    monkeypatch.setattr(dr, "client_", no_network)
+    monkeypatch.setattr(dr, "recommend", lambda *a, **k: dict(_CACHED_RECOMMENDATION))
+    monkeypatch.setattr(dr, "feasible_everywhere",
+                        lambda meetings, strategies, k: (meetings, {}))
+    monkeypatch.setattr(dr, "actual_decision",
+                        lambda *a, **k: {"word": "hold", "size_bp": 0, "decision": 0})
+    sub = _submission_module()
+    monkeypatch.setattr(sub, "ROOT", tmp_path)
+
+    def benchmark():
+        return dr.evaluate_all(meetings=["2020-02-01"], strategies=["recent"], n_seeds=1,
+                               max_workers=1, sample="holdout")
+
+    def report(df):
+        return {"selection": dr._read_selection(),
+                "exposure": {"events": dr.exposure_events(),
+                             "evidence_status": dr.evidence_status(),
+                             "evidence_flags": dr.evidence_flags(),
+                             "holdout_event_id": df.attrs["exposure_event_id"]}}
+
+    def submit(rep):
+        monkeypatch.setattr(sub, "_artefact", lambda name: rep)
+        sub.test_the_holdout_result_belongs_to_a_frozen_selection_and_a_recorded_exposure()
+
+    def expose(reason):
+        event = dr.record_holdout_exposure(reason)
+        dr.close_holdout_exposure(event["event_id"])
+        return event["event_id"]
+
+    def lines():
+        return dr.EXPOSURE_LOG.read_text(encoding="utf-8").splitlines()
+
+    def write(kept, *, newline_at_end=True):
+        body = "\n".join(kept) + ("\n" if newline_at_end else "")
+        dr.EXPOSURE_LOG.write_bytes(body.encode("utf-8"))
+
+    return types.SimpleNamespace(benchmark=benchmark, report=report, submit=submit,
+                                 expose=expose, lines=lines, write=write,
+                                 requests=requests)
+
+
+def _without_event(lines, event_id):
+    return [line for line in lines if json.loads(line).get("event_id") != event_id]
+
+
+def _declare(note="synthetic: the log could not be restored from version control"):
+    dr.run_dev(lost_log=True, note=note)
+
+
+def test_after_a_complete_loss_the_cached_producer_keeps_the_benchmark_origin(
+        cached_holdout):
+    """
+    THE DEFECT THIS PINS (T1). The origin came from the readable log alone, so after a
+    declared loss the cached producer emitted `exposure_event_id: null` and submission
+    refused the recovery the error message had recommended.
+    """
+    w = cached_holdout
+    dr.freeze_selection()
+    origin = w.expose("the one look at the holdout")
+    before = w.benchmark()
+    assert before.attrs["exposure_event_id"] == origin
+    authorised = dr._read_selection()["authorised_exposures"]
+
+    dr.EXPOSURE_LOG.unlink()
+    _declare()
+    after = w.benchmark()
+
+    assert after.attrs["exposure_event_id"] == origin, (
+        "the cached producer lost the benchmark's originating exposure")
+    assert after.to_dict("records") == before.to_dict("records"), (
+        "recovery must not change the numbers the benchmark reports")
+    assert dr._read_selection()["authorised_exposures"] == authorised
+    assert dr.known_exposure_count() == 1
+    assert w.requests["n"] == 0
+    w.submit(w.report(after))
+    assert dr.evidence_status() == "previously_exposed"
+
+
+@pytest.mark.parametrize("lost", ["the later exposure", "the earlier exposure"])
+def test_a_partial_loss_never_moves_the_benchmark_to_another_exposure(cached_holdout, lost):
+    """
+    THE DEFECT THIS PINS (T1). With two exposures under one freeze, losing the later one's
+    records made the producer attach the benchmark to the EARLIER one - the last survivor -
+    and submission accepted it, while the honestly preserved id was refused because any
+    readable event sent the check down the readable-log branch.
+    """
+    w = cached_holdout
+    dr.freeze_selection()
+    first = w.expose("the first look")
+    dr.freeze_selection(revalidate=True, note="synthetic: a declared second look")
+    second = w.expose("the second look")
+    before = w.benchmark()
+    assert before.attrs["exposure_event_id"] == second
+
+    gone = second if lost == "the later exposure" else first
+    w.write(_without_event(w.lines(), gone))
+    _declare()
+    after = w.benchmark()
+
+    assert after.attrs["exposure_event_id"] == second, (
+        f"after losing {lost}, the producer bound the benchmark to "
+        f"{after.attrs['exposure_event_id']!r} instead of the latest exposure {second!r}")
+    assert after.to_dict("records") == before.to_dict("records")
+    assert dr.known_exposure_count() == 2
+    assert w.requests["n"] == 0
+    rep = w.report(after)
+    w.submit(rep)
+
+    older = json.loads(json.dumps(rep))
+    older["exposure"]["holdout_event_id"] = first
+    with pytest.raises(AssertionError, match="latest exposure"):
+        w.submit(older)
+
+
+def test_a_partial_loss_under_a_changed_freeze_keeps_the_current_freezes_exposure(
+        cached_holdout, monkeypatch):
+    w = cached_holdout
+    dr.freeze_selection()
+    first = w.expose("a look under the first selection")
+    monkeypatch.setattr(config, "CALL_INDEX_BASE", config.CALL_INDEX_BASE + 100)
+    dr.freeze_selection(revalidate=True, note="synthetic: re-selected and declared")
+    second = w.expose("a look under the new selection")
+    before = w.benchmark()
+
+    w.write(_without_event(w.lines(), second))
+    _declare()
+    after = w.benchmark()
+
+    assert after.attrs["exposure_event_id"] == second
+    assert after.to_dict("records") == before.to_dict("records")
+    rep = w.report(after)
+    w.submit(rep)
+    older = json.loads(json.dumps(rep))
+    older["exposure"]["holdout_event_id"] = first
+    with pytest.raises(AssertionError):
+        w.submit(older)
+
+
+_DAMAGE = ("malformed JSON", "truncated final line", "incomplete open event",
+           "corrupt close event")
+
+
+@pytest.mark.parametrize("damage", _DAMAGE)
+def test_declared_damage_is_accepted_end_to_end_and_later_damage_is_not(cached_holdout,
+                                                                        damage):
+    """
+    THE DEFECT THIS PINS (T2). A declared corruption passed the runtime guard but failed
+    submission unconditionally, which told the team to restore the file it had just
+    declared unrecoverable. And the runtime waived EVERY damaged line once any declaration
+    existed, so corruption added afterwards was accepted too.
+    """
+    w = cached_holdout
+    dr.freeze_selection()
+    origin = w.expose("the one look at the holdout")
+    before = w.benchmark()
+    lines = w.lines()
+    open_at = next(i for i, l in enumerate(lines) if json.loads(l).get("type") == "open")
+    close_at = next(i for i, l in enumerate(lines) if json.loads(l).get("type") == "close")
+    newline_at_end = True
+    if damage == "malformed JSON":
+        lines[open_at] = "{synthetic damage"
+    elif damage == "truncated final line":
+        lines[-1] = lines[-1][: len(lines[-1]) // 2]
+        newline_at_end = False
+    elif damage == "incomplete open event":
+        event = json.loads(lines[open_at])
+        event.pop("freeze_id")
+        lines[open_at] = json.dumps(event, sort_keys=True)
+    else:
+        event = json.loads(lines[close_at])
+        event.pop("event_id")
+        lines[close_at] = json.dumps(event, sort_keys=True)
+    w.write(lines, newline_at_end=newline_at_end)
+    damaged_bytes = dr.EXPOSURE_LOG.read_bytes()
+
+    with pytest.raises(RuntimeError, match="damaged"):
+        dr.require_readable_log()
+    _declare()
+    dr.require_readable_log()
+    after = w.benchmark()
+
+    assert after.attrs["exposure_event_id"] == origin
+    assert after.to_dict("records") == before.to_dict("records")
+    assert dr.known_exposure_count() == 1
+    assert dr._read_selection()["authorised_exposures"] == 1
+    assert w.requests["n"] == 0
+    assert dr.EXPOSURE_LOG.read_bytes().startswith(damaged_bytes), (
+        "the damaged history must be kept byte for byte - never deleted or rebuilt")
+    w.submit(w.report(after))
+
+    with dr.EXPOSURE_LOG.open("a", encoding="utf-8") as fh:
+        fh.write("{damage introduced after the declaration\n")
+    with pytest.raises(RuntimeError, match="damaged"):
+        dr.require_readable_log()
+    with pytest.raises(AssertionError, match="damaged"):
+        w.submit(w.report(after))
+
+
+@pytest.mark.parametrize("restored", ["every record", "every record twice",
+                                      "the open event only"])
+def test_restored_records_are_the_same_exposure_not_a_second_one(cached_holdout, restored):
+    """
+    THE DEFECT THIS PINS (T3). The count ADDED readable events to declared-lost ids, so
+    restoring a lost exposure's own records counted it twice; submission then refused the
+    restored evidence against its unchanged allowance and asked for --revalidate.
+    """
+    w = cached_holdout
+    dr.freeze_selection()
+    origin = w.expose("the one look at the holdout")
+    original = w.lines()
+    dr.EXPOSURE_LOG.unlink()
+    _declare()
+    declaration = w.lines()
+
+    back = original if restored != "the open event only" else [
+        l for l in original if json.loads(l).get("type") == "open"]
+    w.write(back * (2 if restored == "every record twice" else 1) + declaration)
+
+    assert dr.known_exposure_count() == 1
+    dr.require_readable_log()
+    after = w.benchmark()
+    assert after.attrs["exposure_event_id"] == origin
+    assert w.requests["n"] == 0
+    w.submit(w.report(after))
+    flags = dr.evidence_flags()
+    assert flags["log_loss_declared"] is True, "the declaration stays on record as history"
+    assert flags["exposures_still_missing"] == 0
+    assert flags["log_loss_in_effect"] is False
+    assert dr.evidence_status() == "prospective"
+
+    # A GENUINELY new exposure is still a new look, and still needs declared authority.
+    with pytest.raises(RuntimeError, match="authorises"):
+        dr.record_holdout_exposure("an undeclared second look")
+    dr.freeze_selection(revalidate=True, note="synthetic: a declared second look")
+    newer = w.expose("the declared second look")
+    assert dr.known_exposure_count() == 2
+    latest = w.benchmark()
+    assert latest.attrs["exposure_event_id"] == newer
+    w.submit(w.report(latest))
+
+
+def test_restoring_some_of_several_lost_exposures_keeps_the_rest_declared(cached_holdout):
+    """
+    Two exposures declared lost, one restored: the count stays at two, the loss stays in
+    effect for the one still missing, and the benchmark stays bound to the latest exposure
+    while it is still gone. Restoring the other ends the loss without adding a look.
+    """
+    w = cached_holdout
+    dr.freeze_selection()
+    first = w.expose("the first look")
+    dr.freeze_selection(revalidate=True, note="synthetic: a declared second look")
+    second = w.expose("the second look")
+    original = w.lines()
+    dr.EXPOSURE_LOG.unlink()
+    _declare()
+    declaration = w.lines()
+
+    def records_of(event_id):
+        return [line for line in original if json.loads(line).get("event_id") == event_id]
+
+    w.write(records_of(first) + declaration)
+    assert dr.known_exposure_count() == 2
+    flags = dr.evidence_flags()
+    assert flags["exposures_declared_lost"] == 2
+    assert flags["exposures_still_missing"] == 1
+    assert flags["log_loss_in_effect"] is True
+    assert dr.evidence_status() == "previously_exposed"
+    after = w.benchmark()
+    assert after.attrs["exposure_event_id"] == second
+    w.submit(w.report(after))
+
+    w.write(w.lines() + records_of(second))
+    assert dr.known_exposure_count() == 2
+    flags = dr.evidence_flags()
+    assert flags["exposures_still_missing"] == 0
+    assert flags["log_loss_in_effect"] is False
+    assert dr.evidence_status() == "retrospective"
+    assert dr._read_selection()["authorised_exposures"] == 2
+    latest = w.benchmark()
+    assert latest.attrs["exposure_event_id"] == second
+    w.submit(w.report(latest))
+    assert w.requests["n"] == 0
+
+
+def test_a_client_on_some_other_transport_still_writes_records_with_their_requests(
+        tmp_path, monkeypatch):
+    """
+    Counting at dispatch relies on the transport telling the counters. A client built on a
+    plain transport - the way a review probe or a test double builds one - has no token
+    guards and refuses nothing, so each request it carries must still be counted. Otherwise
+    a real success is written as having taken no request, and refused on its next reload.
+    """
+    import warnings
+    import httpx
+    import openai
+    from pydantic import BaseModel
+    import courseapi
+    import unsw_ai
+
+    class CacheProbe(BaseModel):
+        value: int
+
+    sent = []
+
+    def network(request):
+        sent.append(request)
+        return httpx.Response(200, json={
+            "id": "resp_synthetic", "object": "response", "created_at": 1,
+            "model": config.MODEL, "status": "completed", "incomplete_details": None,
+            "output": [{"type": "function_call", "id": "f", "call_id": "c",
+                        "name": "CacheProbe", "arguments": '{"value":1}',
+                        "status": "completed"}],
+            "usage": {"input_tokens": 10, "output_tokens": 10, "total_tokens": 20}})
+
+    sdk = openai.OpenAI(api_key="synthetic", base_url="https://synthetic.invalid",
+                        max_retries=0,
+                        http_client=httpx.Client(transport=httpx.MockTransport(network)))
+    settings = unsw_ai.ProxySettings(proxy_url="https://synthetic.invalid",
+                                     access_code="synthetic", student_id="9999999",
+                                     fallback_models=())
+    monkeypatch.setattr(unsw_ai, "build_openai_client", lambda *a, **k: sdk)
+    monkeypatch.setattr(unsw_ai.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(config, "ledger_add", lambda *a, **k: None)
+    monkeypatch.setattr(dr, "RAW_DIR", tmp_path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        client = unsw_ai.UNSWInstructor(settings=settings)
+        monkeypatch.setattr(unsw_ai, "get_client", lambda *a, **k: client)
+        monkeypatch.setattr(dr, "client_", lambda *a, **k: courseapi.CourseClient())
+        dr._cached_call("probe", "system", "user", schema=CacheProbe)
+    sdk.close()
+    rec = json.loads(next(tmp_path.glob("*.json")).read_text(encoding="utf-8"))
+    assert rec["transport_requests"] == len(sent) == 1
+    assert courseapi.envelope_contradictions(rec) == []
+    assert client.usage.summary()["requests"] == len(sent)
+
+
+# -------------------------------------------------------------------------------------------
+# A REQUEST IS COUNTED WHERE IT IS DISPATCHED - envelopes AND session totals  (recheck-6 T4)
+# -------------------------------------------------------------------------------------------
+# Only the network is scripted. The wrapper's ProxyTransport and its token guard run for real,
+# so a request the client refuses itself can be told apart from one it sends - the one thing
+# the earlier harnesses, which replaced the whole transport, could never see. Requests were
+# counted before those guards, and a prompt over the per-request cap wrote an envelope saying
+# one real request of unknown cost had been made.
+
+_T4_OUTCOMES = ("success", "HTTP 400", "HTTP 429", "timeout", "500 then success",
+                "schema repaired", "schema never satisfied", "per-request cap",
+                "daily budget", "a parameter the adapter refuses")
+_T4_REFUSED_BEFORE_SENDING = ("per-request cap", "daily budget",
+                              "a parameter the adapter refuses")
+
+
+def _t4_responder(outcome, structured):
+    import httpx
+
+    def answer(arguments='{"value":1}'):
+        if structured:
+            output = [{"type": "function_call", "id": "f", "call_id": "c",
+                       "name": "DispatchProbe", "arguments": arguments,
+                       "status": "completed"}]
+        else:
+            output = [{"type": "message", "id": "m", "role": "assistant",
+                       "status": "completed",
+                       "content": [{"type": "output_text", "text": "synthetic",
+                                    "annotations": []}]}]
+        return httpx.Response(200, json={
+            "id": "resp_synthetic", "object": "response", "created_at": 1,
+            "model": config.MODEL, "status": "completed", "incomplete_details": None,
+            "output": output,
+            "usage": {"input_tokens": 10, "output_tokens": 10, "total_tokens": 20}})
+
+    def respond(request, n):
+        if outcome in _T4_REFUSED_BEFORE_SENDING:
+            raise AssertionError(f"{outcome}: a request refused before sending reached "
+                                 f"the network")
+        if outcome == "success":
+            return answer()
+        if outcome == "HTTP 400":
+            return httpx.Response(400, json={"error": {"message": "synthetic bad request",
+                                                       "code": "invalid_request"}})
+        if outcome == "HTTP 429":
+            return httpx.Response(429, json={"error": {"message": "Rate limit reached",
+                                                       "code": "rate_limit"}})
+        if outcome == "timeout":
+            raise httpx.ReadTimeout("synthetic timeout", request=request)
+        if outcome == "500 then success":
+            return (httpx.Response(500, json={"error": {"message": "synthetic upstream"}})
+                    if n == 1 else answer())
+        if outcome == "schema repaired":
+            return answer('{"value":"bad"}') if n == 1 else answer()
+        if outcome == "schema never satisfied":
+            return answer('{"value":"bad"}')
+        raise AssertionError(outcome)
+
+    return respond
+
+
+@pytest.mark.parametrize("outcome", _T4_OUTCOMES)
+@pytest.mark.parametrize("route", ["replay", "shock", "free_text"])
+def test_every_request_count_equals_what_reached_the_network(route, outcome, tmp_path,
+                                                             monkeypatch):
+    """
+    THE DEFECT THIS PINS. Requests were counted at instructor's attempt hook and just before
+    the raw SDK call - both before the transport's token guards - so a call the client
+    refused itself was written as one transmitted request of unknown cost, in envelopes that
+    passed the contract. Every figure a record or the session reports must now equal what
+    actually reached the network: the envelope's count, its usage attempts, and the
+    process's own total.
+    """
+    if route == "free_text" and outcome.startswith("schema"):
+        pytest.skip("a free-text call has no schema to repair")
+    if route != "free_text" and outcome == "a parameter the adapter refuses":
+        pytest.skip("the stages never pass a parameter the adapter refuses")
+    import warnings
+    import httpx
+    import openai
+    from pydantic import BaseModel
+    import courseapi
+    import unsw_ai
+    import scenarios as sc
+
+    class DispatchProbe(BaseModel):
+        value: int
+
+    sent = []
+    respond = _t4_responder(outcome, structured=route != "free_text")
+
+    def network(request):
+        sent.append(request)
+        return respond(request, len(sent))
+
+    built = []
+
+    def build(settings, **kwargs):
+        proxy = unsw_ai.ProxyTransport(settings, inner=httpx.MockTransport(network),
+                                       token_limiter=kwargs.get("token_limiter"))
+        built.append(openai.OpenAI(api_key="synthetic", base_url="https://synthetic.invalid",
+                                   max_retries=0, http_client=httpx.Client(transport=proxy)))
+        return built[-1]
+
+    guard = unsw_ai.TokenLimiter(
+        max_tokens_per_minute=1_000_000,
+        max_request_tokens=1 if outcome == "per-request cap" else 1_000_000,
+        max_tokens_per_day=1 if outcome == "daily budget" else 10_000_000)
+    settings = unsw_ai.ProxySettings(proxy_url="https://synthetic.invalid",
+                                     access_code="synthetic", student_id="9999999",
+                                     fallback_models=())
+    monkeypatch.setattr(unsw_ai, "build_openai_client", build)
+    monkeypatch.setattr(unsw_ai.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(config, "ledger_add", lambda *a, **k: None)
+    monkeypatch.setattr(dr, "RAW_DIR", tmp_path)
+    monkeypatch.setattr(sc, "RAW_DIR", tmp_path)
+    recorded = usage = None
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        client = unsw_ai.UNSWInstructor(settings=settings, token_limiter=guard)
+        monkeypatch.setattr(unsw_ai, "get_client", lambda *a, **k: client)
+        monkeypatch.setattr(dr, "client_", lambda *a, **k: courseapi.CourseClient())
+        monkeypatch.setattr(sc, "client_", lambda *a, **k: courseapi.CourseClient())
+        try:
+            if route == "replay":
+                dr._cached_call("probe", "system", "user", schema=DispatchProbe)
+            elif route == "shock":
+                sc.llm_parsed("system", "user", DispatchProbe)
+            else:
+                extra = {"seed": 1} if outcome == "a parameter the adapter refuses" else {}
+                reply = courseapi.CourseClient().chat.completions.create(
+                    messages=[{"role": "user", "content": "synthetic"}],
+                    temperature=config.SAMPLING_TEMPERATURE, **extra)
+                recorded = reply.provenance.get("transport_requests") or 0
+                usage = getattr(reply, "call_usage", None)
+        except Exception as exc:                          # noqa: BLE001
+            if route == "free_text":
+                recorded = courseapi.transport_attempts(exc) or 0
+                usage = courseapi.failed_attempt_usage(exc)
+    for sdk in built:
+        sdk.close()
+
+    where = f"{route} / {outcome}"
+    if route != "free_text":
+        written = sorted(tmp_path.glob("*.json"))
+        assert len(written) == 1, f"{where}: {len(written)} envelope(s) written"
+        record = json.loads(written[0].read_text(encoding="utf-8"))
+        assert courseapi.envelope_contradictions(record) == [], where
+        recorded = record.get("transport_requests") or 0
+        usage = record.get("usage")
+    assert recorded == len(sent), (
+        f"{where}: {len(sent)} request(s) reached the network, but the record says "
+        f"{recorded}")
+    if usage is None:
+        assert len(sent) == 0, f"{where}: requests were sent, yet no usage was recorded"
+    else:
+        assert usage["attempts_counted"] + usage["attempts_unknown"] == len(sent), (
+            f"{where}: usage accounts for "
+            f"{usage['attempts_counted'] + usage['attempts_unknown']} request(s); "
+            f"{len(sent)} were sent")
+    assert client.usage.summary()["requests"] == len(sent), (
+        f"{where}: the session total reports {client.usage.summary()['requests']} "
+        f"request(s); {len(sent)} were sent")
+    if outcome in _T4_REFUSED_BEFORE_SENDING:
+        assert client.usage.report() == "No requests recorded."

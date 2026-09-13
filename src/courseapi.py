@@ -49,6 +49,7 @@ STUDENT_ID. There is no OpenAI key; the university proxy holds the credential.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import threading
@@ -923,7 +924,10 @@ def _account_reset() -> None:
     _http.usage = []
     _http.unknown = 0
     _http.seen = []
-    _http.accounted = False
+    # NO ATTEMPT IS OPEN until a request is dispatched. Opening one here booked a call the
+    # client refused itself - over the per-request cap, past the daily budget - as an
+    # attempt of unknown cost, although nothing was ever sent.
+    _http.accounted = True
 
 
 def _account_attempt_start() -> None:
@@ -949,7 +953,13 @@ def _http_count() -> int:
 
 
 def _http_tick(_retry_state=None) -> None:
-    """One real HTTP request is about to be made: count it, and open its attempt.
+    """One HTTP request has been DISPATCHED: count it, and open its attempt.
+
+    Called by the wrapper's transport, through `unsw_ai.dispatch_sink`, after its local
+    token and rate guards have admitted the request and immediately before the network.
+    It used to be called at instructor's attempt hook and just before the raw SDK call -
+    both BEFORE those guards - so a prompt the client refused itself was recorded as one
+    real request of unknown cost, in envelopes that passed the contract.
 
     THE ATTEMPT BOUNDARY IS THE REQUEST, not the adapter call. Opening it once per
     adapter call meant the wrapper's five internal 429 retries shared a single attempt
@@ -1093,7 +1103,7 @@ def _repair_policy():
         return status in (None, "completed")
     return tenacity.Retrying(
         stop=tenacity.stop_after_attempt(REPAIR_ATTEMPTS),
-        retry=worth_repairing, before=_http_tick, reraise=True)
+        retry=worth_repairing, reraise=True)
 
 
 def _sha(value: Any, n: int = 16) -> str:
@@ -1262,9 +1272,10 @@ class _Completions:
             # call's content filter.
             unsw_ai._recent.response = None
             try:
-                if not wrapper_retries:
-                    _http_tick()      # the raw path is one request per attempt
-                value = fn()      # accounts for its own response before returning
+                # COUNTED AT DISPATCH, on both paths: the transport ticks this call's account
+                # for each request its guards admit - and for nothing they refuse.
+                with unsw_ai.dispatch_sink(_http_tick):
+                    value = fn()      # accounts for its own response before returning
                 return value, attempt + 1
             except Exception as exc:  # noqa: BLE001 - re-raised below
                 # A response that came back 200-but-unfinished makes instructor
@@ -1323,8 +1334,17 @@ class _Completions:
         # meant the resulting IncompleteResponseError carried neither the transport
         # count nor the usage the service had just reported - the one failure path that
         # knew exactly what it had cost was the one that threw the figure away.
+        session = getattr(client, "usage", None)
+        count_session = getattr(session, "count_attempt", None)
+
         def _ask():
-            raw = client.client.responses.create(input=list(messages), **req)
+            # THE SESSION TOTAL SEES THIS PATH TOO. The raw SDK call bypasses the wrapper's
+            # own guard, so neither its requests nor its tokens reached `usage_report()`.
+            with (unsw_ai.dispatch_sink(count_session) if count_session is not None
+                  else contextlib.nullcontext()):
+                raw = client.client.responses.create(input=list(messages), **req)
+            if session is not None and hasattr(session, "record"):
+                session.record(raw)
             _account_response(raw)
             validate_response(raw, client.settings)
             return raw
