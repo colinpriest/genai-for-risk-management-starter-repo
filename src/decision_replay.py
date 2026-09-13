@@ -1397,8 +1397,9 @@ def parse_exposure_log(path=None) -> list[dict]:
     A LINE THAT WILL NOT PARSE IS NOT AN ABSENT LINE. Skipping it would make a corrupted
     log read as a SHORTER history, and damaging one line would buy another look at the
     held-out sample. Each damaged entry carries its line number and the SHA-256 of the
-    line's exact bytes - what a lost-log declaration records - so a declaration covers
-    exactly the damage it was made about, and a line damaged afterwards is new damage.
+    line's exact bytes - what a lost-log declaration records. A declaration covers those
+    bytes as many times as it named them, wherever the lines now sit, so a line damaged
+    afterwards - or a further copy of declared damage - is new damage.
     """
     path = EXPOSURE_LOG if path is None else path
     if not path.exists():
@@ -1483,8 +1484,9 @@ def exposure_accounting(selection: dict | None, events: list[dict]) -> dict:
       freeze recorded - and which completion records the log has lost;
     * which known exposures are STILL MISSING from the readable log, and whether a
       declaration covers each;
-    * which damaged lines a declaration covers, by line number and exact bytes, and which
-      are new.
+    * which damaged lines a declaration covers - by their exact bytes, as many times as it
+      named them, wherever they now sit - which are new, and WHEN each was declared: the
+      durable order that says whether damage could be an exposure's completion record.
     """
     selection = selection or {}
     loss = selection.get("log_loss") if isinstance(selection.get("log_loss"), dict) else {}
@@ -1592,7 +1594,7 @@ def exposure_accounting(selection: dict | None, events: list[dict]) -> dict:
     for eid in known:
         stamp = {k: merged[eid].get(k) for k in _STAMP_FIELDS}
         if closes.get(eid):
-            stamp[_COMPLETION_FIELD] = recorded_completion.get(eid) or closes[eid][0]
+            stamp[_COMPLETION_FIELD] = recorded_completion.get(eid) or min(closes[eid])
             completion[eid] = "closed"
         elif recorded_completion.get(eid):
             stamp[_COMPLETION_FIELD] = recorded_completion[eid]
@@ -1605,16 +1607,6 @@ def exposure_accounting(selection: dict | None, events: list[dict]) -> dict:
         if recorded_superseded.get(eid):
             stamp[_SUPERSEDED_FIELD] = recorded_superseded[eid]
         stamps.append(stamp)
-
-    # A COMPLETION THE FREEZE RECORDED AND THE LOG NO LONGER HOLDS. A damaged line after the
-    # exposure's open record may be that very record, and is accounted for as damage.
-    missing_closes = [e for e in known
-                      if e in open_position and recorded_completion.get(e)
-                      and not closes.get(e)
-                      and not any(p > open_position[e] for p in damaged_positions)]
-    # Declaring an exposure lost declares all of its records, its completion included.
-    close_declared = set(lost_declared) | {e for e in (loss.get("lost_close_ids") or []) if e}
-    missing_closes_declared = [e for e in missing_closes if e in close_declared]
 
     # A DECLARATION COVERS THE DAMAGE IT DESCRIBED: those exact bytes, as many times as it
     # named them, wherever the line now sits. Keyed by line number as well, restoring earlier
@@ -1640,6 +1632,41 @@ def exposure_accounting(selection: dict | None, events: list[dict]) -> dict:
             remaining[sha] -= 1
     covered = [d for i, d in enumerate(damaged) if i in covered_at]
     uncovered = [d for i, d in enumerate(damaged) if i not in covered_at]
+
+    # WHEN EACH DAMAGED LINE WAS DECLARED: the durable order of damage. Restoring records moves
+    # lines around a damaged one; it cannot move the time its damage was declared. Nothing opens
+    # an exposure on a log with undeclared damage, so damage declared BEFORE an exposure began
+    # was already there and cannot be that exposure's completion record; damage declared later,
+    # or never, may be. Where a damaged line sits in the file is not evidence either way - reading
+    # it as evidence let an open record restored after surviving damage make a finished
+    # benchmark resumable again.
+    damage_declared_at: dict[str, list] = {}
+    for entry in loss.get("declarations") or []:
+        if isinstance(entry, dict):
+            for line in entry.get("damaged_lines") or []:
+                if isinstance(line, dict) and line.get("sha256"):
+                    damage_declared_at.setdefault(line["sha256"], []).append(
+                        entry.get("declared_at"))
+
+    def may_be_the_close_of(eid: str) -> list:
+        began = _when((first.get(eid) or {}).get("at"))
+        risky = list(uncovered)
+        for line in covered:
+            declared = [_when(t) for t in damage_declared_at.get(line.get("sha256"), [])]
+            if not began or not declared or any(t is None or t >= began for t in declared):
+                risky.append(line)
+        return risky
+
+    damage_may_be_close_of = {eid: may_be_the_close_of(eid) for eid in first}
+
+    # A COMPLETION THE FREEZE RECORDED AND THE LOG DOES NOT HOLD. Damage that may be that very
+    # record is accounted for as damage instead.
+    missing_closes = [e for e in known
+                      if e in open_position and recorded_completion.get(e)
+                      and not closes.get(e) and not damage_may_be_close_of.get(e)]
+    # Declaring an exposure lost declares all of its records, its completion included.
+    close_declared = set(lost_declared) | {e for e in (loss.get("lost_close_ids") or []) if e}
+    missing_closes_declared = [e for e in missing_closes if e in close_declared]
 
     freeze_of, order_of, undescribed = {}, {}, []
     for position, stamp in enumerate(stamps):
@@ -1728,6 +1755,8 @@ def exposure_accounting(selection: dict | None, events: list[dict]) -> dict:
         "origin_declaration": origin if isinstance(origin, dict) else None,
         "superseded_by": superseded_by,
         "sampled_after_supersession": sampled_after_supersession,
+        "damage_declared_at": damage_declared_at,
+        "damage_may_be_close_of": damage_may_be_close_of,
     }
 
 
@@ -1811,9 +1840,9 @@ def _declare_lost_log(old: dict, note: str) -> dict:
     deleting the evidence.
 
     EXACTLY WHAT WAS LOST, NOTHING MORE. A declaration names the missing exposure ids, the
-    exposures whose completion record is missing, and each damaged line by its number and
-    the SHA-256 of its bytes. A later loss needs a later declaration; the earlier ones stay
-    as history.
+    exposures whose completion record is missing, and each damaged line by the SHA-256 of its
+    bytes (with the line number it had, for the record), and it is dated. A later loss needs a
+    later declaration; the earlier ones stay as history.
     """
     if not str(note).strip():
         raise RuntimeError(
@@ -1960,7 +1989,8 @@ def exposure_history_problems(selection: dict | None, events: list[dict],
     if unfinished:
         problems.append(
             f"the frozen selection records that the benchmark of exposure(s) {unfinished} "
-            f"finished, but {name} no longer contains the record of it finishing. A "
+            f"finished, but {name} does not contain the record of it finishing - it was "
+            f"lost, or the run stopped before writing it. A "
             f"benchmark whose completion record is missing could be taken for an unfinished "
             f"one and resumed with new requests to the held-out meetings.\n"
             f"  1. Restore it from version control - `git checkout -- "
@@ -2051,8 +2081,8 @@ def unfinished_exposure(freeze_id: str,
     line, declaring the damage and hitting a cache miss used to reopen it: fresh answers
     were drawn from the held-out meetings under a look already spent, and counted as
     nothing. An exposure is resumable only when the freeze recorded it as unfinished, and
-    nothing that could be its completion record stands in the way - no damaged line after
-    its open record, and no record the log has lost since it began.
+    nothing that could be its completion record stands in the way - no damage declared after
+    it began, and no record the log has lost since it began.
 
     AND ONLY THE LATEST EXPOSURE OF THE FREEZE. An exposure left unfinished is superseded the
     moment a later one begins. Restoring the records of an earlier interrupted exposure after
@@ -2083,9 +2113,13 @@ def unfinished_exposure(freeze_id: str,
                       f"recorded by a release that kept no completion state, or the run "
                       f"stopped before the selection recorded it - so nothing establishes "
                       f"that its benchmark did not finish")
-    if any(p > a["open_position"][eid] for p in a["damaged_positions"]):
-        return None, (f"exposure {eid} has a damaged line after its open record, and that "
-                      f"line may be the record of its benchmark finishing")
+    risky = a["damage_may_be_close_of"].get(eid) or []
+    if risky:
+        return None, (f"exposure {eid} may have finished: {len(risky)} damaged line(s) in the "
+                      f"log were declared after it began, or have not been declared, and any of "
+                      f"them may be the record of its benchmark finishing. Where a damaged line "
+                      f"sits in the file does not settle it - restoring records moves lines, not "
+                      f"the time their damage was declared")
     began = _when(event.get("at"))
     recorded_at = {s["event_id"]: s.get("at") for s in a["stamps"]}
     finished_at = {s["event_id"]: s.get(_COMPLETION_FIELD) for s in a["stamps"]}
@@ -2494,43 +2528,49 @@ def record_holdout_exposure(reason: str = "fresh holdout draw") -> dict:
 
 def close_holdout_exposure(event_id: str, outcome: str = "benchmark completed",
                            fresh: bool | None = None) -> None:
-    """Append the fact that an exposure finished, then record it in the freeze.
+    """Record that an exposure finished: in the freeze first, then in the log.
 
-    Never edits the `open` line. THE FREEZE RECORDS THE COMPLETION TOO, so a benchmark stays
+    Never edits the `open` line. THE FREEZE RECORDS THE COMPLETION, so a benchmark stays
     finished when its close line is later damaged or lost: a finished benchmark whose close
-    could not be read used to be resumed, and sampled the held-out meetings again. Written
-    after the log line is durable, so a crash in between leaves a readable close rather
-    than a completion the log never saw. `fresh` records whether the run sent requests.
+    could not be read used to be resumed, and sampled the held-out meetings again.
+
+    AND IT IS WRITTEN BEFORE THE CLOSE LINE. The log line used to come first, so a crash
+    between the two left a completion only the log knew about; once that line was damaged and
+    the open record restored after the damage, nothing durable said the benchmark had finished,
+    and a cache miss resumed it. Now a crash in between leaves a completion the log does not
+    hold - a missing record, refused until it is restored or declared - never a benchmark that
+    looks unfinished. `fresh` records whether the run sent requests.
 
     A SUPERSEDED EXPOSURE IS NOT CLOSED. A benchmark completed under it now ran after a later
     exposure had replaced it; the runner reports the latest exposure's benchmark instead.
     """
     if not event_id:
         return
+    at = datetime.now(timezone.utc).isoformat()
     rec = _read_selection()
     if rec:
-        by = exposure_accounting(rec, exposure_events())["superseded_by"].get(event_id)
+        accounting = exposure_accounting(rec, exposure_events())
+        by = accounting["superseded_by"].get(event_id)
         if by:
             raise RuntimeError(
                 f"exposure {event_id} cannot be recorded as finished: exposure {by} began "
                 f"after it and superseded it, so a benchmark completed under it now ran after "
                 f"that look was replaced. Report the latest exposure's benchmark instead.")
-    event = {"type": "close", "event_id": event_id, "outcome": outcome,
-             "at": datetime.now(timezone.utc).isoformat()}
+        # A CONTRADICTORY HISTORY IS LEFT EXACTLY AS IT IS: rewriting the stamps would settle
+        # the contradiction in favour of whichever record happened to be read first.
+        if not accounting["conflicts"]:
+            stamps = accounting["stamps"]
+            for stamp in stamps:
+                if stamp["event_id"] == event_id and not stamp.get(_COMPLETION_FIELD):
+                    stamp[_COMPLETION_FIELD] = at
+            if stamps != rec.get("exposure_stamps"):
+                rec["exposure_stamps"] = stamps
+                rec["exposure_event_ids"] = accounting["known_ids"]
+                config.atomic_write_text(SELECTION_STAMP, json.dumps(rec, indent=1))
+    event = {"type": "close", "event_id": event_id, "outcome": outcome, "at": at}
     if fresh is not None:
         event["fresh"] = bool(fresh)
     _append_event(event)
-    rec = _read_selection()
-    if not rec:
-        return
-    accounting = exposure_accounting(rec, exposure_events())
-    # A CONTRADICTORY HISTORY IS LEFT EXACTLY AS IT IS: rewriting the stamps would settle the
-    # contradiction in favour of whichever record happened to be read first.
-    if accounting["conflicts"] or accounting["stamps"] == rec.get("exposure_stamps"):
-        return
-    rec["exposure_stamps"] = accounting["stamps"]
-    rec["exposure_event_ids"] = accounting["known_ids"]
-    config.atomic_write_text(SELECTION_STAMP, json.dumps(rec, indent=1))
 
 
 #: Which sample the benchmark is currently running, so `_cached_call` can record an

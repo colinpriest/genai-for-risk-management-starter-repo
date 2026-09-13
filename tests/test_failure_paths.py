@@ -3760,7 +3760,7 @@ def test_an_open_benchmark_is_not_resumed_past_damage_that_may_be_its_close(
     _declare()
     refused, sent = _holdout_request(monkeypatch, tmp_path, "an attempted resume")
     assert isinstance(refused, RuntimeError), refused
-    assert "damaged line after its open record" in str(refused)
+    assert "declared after it began" in str(refused)
     assert sent == 0 and dr.known_exposure_count() == 1
 
 
@@ -4939,34 +4939,65 @@ def test_a_crash_after_an_exposure_is_logged_counts_it_and_sends_nothing_on_rest
     assert again["known"] == 2 and again["allowance"] == 2, again
 
 
-def test_a_crash_after_a_close_is_logged_keeps_the_benchmark_finished_on_restart(
+def test_a_crash_before_the_close_is_logged_leaves_a_missing_record_until_declared(
         cached_holdout, monkeypatch, tmp_path):
-    """The close record is durable and the selection still says unfinished. The readable close
-    wins: a restart sends nothing, a restarted cached replay completes the record, and the
-    benchmark submits."""
+    """The freeze records a completion BEFORE the log does (recheck-10 W1), so the crash window
+    is now the other way round: the selection says finished, the log has no close. That is a
+    missing record - refused on restart until declared - never a benchmark that looks unfinished;
+    once declared, a restart sends nothing and a restarted cached replay writes the close."""
     w = cached_holdout
     dr.freeze_selection()
     first, sent = _holdout_request(monkeypatch, tmp_path, "the one look")
     assert sent == 1 and not first["resumed"]
-    stop = _crash_selection_writes(monkeypatch)
+    real_append = dr._append_event
+
+    def append(event):
+        if event.get("type") == "close":
+            raise _Crash("synthetic crash before the close was logged")
+        return real_append(event)
+
+    monkeypatch.setattr(dr, "_append_event", append)
     with pytest.raises(_Crash):
         dr.close_holdout_exposure(first["event_id"], "holdout benchmark completed on 1 meetings",
                                   fresh=True)
-    stop()
+    monkeypatch.setattr(dr, "_append_event", real_append)
+    assert dr._read_selection()["exposure_stamps"][0]["closed_at"], (
+        "the selection must record the completion before the log line is written")
+    assert not any(json.loads(line).get("type") == "close" for line in w.lines())
+
+    after = _restart(tmp_path)
+    assert after["outcome"] == "refused" and after["requests"] == 0, after
+    assert "record of it finishing" in after["message"], after
+    _declare()
+    again = _restart(tmp_path)
+    assert again["outcome"] == "refused" and again["requests"] == 0 and again["known"] == 1, again
+    replayed = _restart(tmp_path, "replay")
+    assert replayed["outcome"] == "replayed" and replayed["requests"] == 0, replayed
+    assert replayed["event_id"] == first["event_id"], replayed
     assert any(json.loads(line).get("type") == "close" for line in w.lines())
-    assert dr._read_selection()["exposure_stamps"][0]["closed_at"] is None, (
-        "the crash must leave the completion logged and unrecorded in the selection")
+    w.submit(_report_naming(first["event_id"]))
+
+
+def test_a_workspace_left_by_the_log_first_close_order_keeps_the_benchmark_finished(
+        cached_holdout, monkeypatch, tmp_path):
+    """Files the released b825b4e writer left after a crash between its close line and its
+    selection update: the readable close wins, a restart sends nothing, and a restarted cached
+    replay records the completion in the selection."""
+    w = cached_holdout
+    ids = _released("b825b4e: completion logged, selection update lost in a crash", monkeypatch)
+    assert dr._read_selection()["exposure_stamps"][0]["closed_at"] is None
+    assert any(json.loads(line).get("type") == "close" for line in w.lines())
 
     after = _restart(tmp_path)
     assert after["outcome"] == "refused" and after["requests"] == 0 and after["known"] == 1, after
     replayed = _restart(tmp_path, "replay")
     assert replayed["outcome"] == "replayed" and replayed["requests"] == 0, replayed
-    assert replayed["event_id"] == first["event_id"], replayed
+    assert replayed["event_id"] == ids["first"], replayed
     assert dr._read_selection()["exposure_stamps"][0]["closed_at"], (
         "the restarted run must record the completion in the selection")
     again = _restart(tmp_path)
     assert again["outcome"] == "refused" and again["requests"] == 0, again
-    w.submit(_report_naming(first["event_id"]))
+    w.submit(_report_naming(ids["first"]))
 
 
 def test_a_crash_while_a_replacement_is_recorded_never_revives_what_it_superseded(
@@ -5310,7 +5341,7 @@ _RELEASED_WORKSPACES = {
 
 def _released(name, monkeypatch):
     """Write a Replay workspace exactly as a released version wrote it."""
-    fixture = _RELEASED_WORKSPACES[name]
+    fixture = _RELEASED_WORKSPACES.get(name) or _RELEASED_CRASH_WORKSPACES[name]
     selection = json.loads(fixture["selection"])
     dr.SELECTION_STAMP.write_bytes(json.dumps(selection, indent=1).encode("utf-8"))
     dr.EXPOSURE_LOG.write_bytes("".join(line + "\n" for line in fixture["log"]).encode("utf-8"))
@@ -5384,3 +5415,302 @@ def test_a_declared_damaged_line_stays_covered_when_restored_records_move_it(cac
         dr.require_readable_log()
     with pytest.raises(AssertionError, match="damaged"):
         w.submit(_report_naming(second))
+
+
+# -------------------------------------------------------------------------------------------
+# WHETHER DAMAGE COULD BE A COMPLETION RECORD IS DECIDED BY WHEN IT WAS DECLARED  (recheck-10 W1)
+# -------------------------------------------------------------------------------------------
+# A benchmark finished; the run crashed before the selection recorded it; the log lost the open
+# record and the close became unreadable; the loss was declared; the open record was restored.
+# Whether surviving damage could be the completion record was decided by where the damaged line
+# sat relative to the open record, so restoring the open record AFTER the damage made the
+# finished benchmark resumable: a real cache miss sent a request under the used exposure, and
+# submission accepted it. Restored records move lines; they cannot move the time the damage was
+# declared, which is what decides it now. Requests are counted at the scripted network.
+
+_RELEASED_CRASH_WORKSPACES = {
+    'b825b4e: completion logged, selection update lost in a crash': {
+        'ids': {'first': '384429073f9d'},
+        'selection': ('{"freeze_id": "a7c64d4632d3", "config_hash": "67e653ace5b9", "strategy": "strati'
+                      'fied", "k": 9, "n_seeds": 3, "call_index_base": 20260818, "max_output_tokens": 8'
+                      '000, "frozen_at": "2026-09-13T07:35:13.977501+00:00", "authorised_exposures": 1,'
+                      ' "authorisation": "prospective selection freeze", "note": "", "history": [], "re'
+                      'validated": false, "prior_exposure_declared": false, "exposure_number": 1, "expo'
+                      'sure_log": "replay_exposures.jsonl", "exposures": [{"at": "2026-09-13T07:35:14.9'
+                      '30390+00:00", "authorisation": "prospective selection freeze", "call_index_base"'
+                      ': 20260818, "event_id": "384429073f9d", "freeze_id": "a7c64d4632d3", "k": 9, "n_'
+                      'seeds": 3, "reason": "fresh probe call on the holdout sample", "selection_config'
+                      '_hash": "67e653ace5b9", "sequence": 1, "strategy": "stratified", "type": "open"}'
+                      '], "exposure_stamps": [{"event_id": "384429073f9d", "freeze_id": "a7c64d4632d3",'
+                      ' "sequence": 1, "at": "2026-09-13T07:35:14.930390+00:00", "selection_config_hash'
+                      '": "67e653ace5b9", "closed_at": null}], "exposure_event_ids": ["384429073f9d"]}'),
+        'log': [
+            ('{"at": "2026-09-13T07:35:14.930390+00:00", "authorisation": "prospective selecti'
+             'on freeze", "call_index_base": 20260818, "event_id": "384429073f9d", "freeze_id"'
+             ': "a7c64d4632d3", "k": 9, "n_seeds": 3, "reason": "fresh probe call on the holdo'
+             'ut sample", "selection_config_hash": "67e653ace5b9", "sequence": 1, "strategy": '
+             '"stratified", "type": "open"}'),
+            ('{"at": "2026-09-13T07:35:15.685176+00:00", "event_id": "384429073f9d", "fresh": '
+             'true, "outcome": "holdout benchmark completed on 1 meetings", "type": "close"}'),
+        ],
+    },
+}
+
+
+_W1_LAYOUTS = ("before the damage", "after the declaration", "twice, around the damage",
+               "between the damage and the declaration")
+
+
+def _w1_layouts(open_line, declared, close_line=None):
+    """The restored open record placed before, after, twice around and inside the surviving
+    damaged evidence and its declaration - the same lines in different physical orders."""
+    head, _, rest = declared.partition(b"\n")
+    layouts = {"before the damage": open_line + declared,
+               "after the declaration": declared + open_line,
+               "twice, around the damage": open_line + declared + open_line,
+               "between the damage and the declaration": head + b"\n" + open_line + rest}
+    if close_line is not None:
+        layouts["with its readable close"] = open_line + close_line + declared
+    return layouts
+
+
+def _completion_crash(monkeypatch, tmp_path, question="the original question"):
+    """Run the real benchmark and fail only the selection write that records its completion.
+    Returns (the exposure id, its open line, the cached answers)."""
+    real = config.atomic_write_text
+
+    def completion_write_fails(path, text, *args, **kwargs):
+        if pathlib.Path(path) == pathlib.Path(dr.SELECTION_STAMP) and any(
+                s.get("closed_at") for s in json.loads(text).get("exposure_stamps") or []):
+            raise _Crash("synthetic crash while the selection recorded completion")
+        return real(path, text, *args, **kwargs)
+
+    monkeypatch.setattr(config, "atomic_write_text", completion_write_fails)
+    crashed, sent = _run_benchmark(monkeypatch, tmp_path, question)
+    monkeypatch.setattr(config, "atomic_write_text", real)
+    assert isinstance(crashed, _Crash) and sent == 1, (crashed, sent)
+    stamp = dr._read_selection()["exposure_stamps"][0]
+    assert stamp["closed_at"] is None, "the crash must leave the completion unrecorded"
+    lines = dr.EXPOSURE_LOG.read_text(encoding="utf-8").splitlines()
+    open_line = next(line for line in lines
+                     if json.loads(line).get("type") == "open").encode("utf-8") + b"\n"
+    cache = {p: p.read_bytes() for p in (tmp_path / "benchmark-raw").glob("*.json")}
+    assert len(cache) == 1
+    return stamp["event_id"], open_line, cache
+
+
+def _unreadable_completion(event_id, damage):
+    """What is left of a completion record that can no longer be read."""
+    if damage == "malformed":
+        return b"{synthetic damaged completion record\n"
+    close = json.dumps({"at": "2026-09-13T00:00:00+00:00", "event_id": event_id,
+                        "fresh": True, "outcome": "holdout benchmark completed on 1 meetings",
+                        "type": "close"}, sort_keys=True).encode("utf-8")
+    return close[: len(close) // 2]
+
+
+@pytest.mark.parametrize("layout", _W1_LAYOUTS)
+@pytest.mark.parametrize("damage", ["malformed", "truncated"])
+def test_restoring_an_open_record_after_damage_never_reopens_a_finished_benchmark(
+        cached_holdout, monkeypatch, tmp_path, damage, layout):
+    """
+    THE DEFECT THIS PINS (W1), through this release's writer: the completion-write crash, the
+    damage, the declaration and the restored open record in every position. Whatever the order,
+    a fresh cache miss is refused at allowance one - here and in a fresh process - and leaves no
+    answer in the cache; the original answer replays under the same exposure with no request;
+    an authorised look is a new exposure.
+    """
+    w = cached_holdout
+    dr.freeze_selection()
+    first, open_line, cache = _completion_crash(monkeypatch, tmp_path)
+    dr.EXPOSURE_LOG.write_bytes(_unreadable_completion(first, damage))
+    _declare()
+    dr.EXPOSURE_LOG.write_bytes(_w1_layouts(open_line, dr.EXPOSURE_LOG.read_bytes())[layout])
+    dr.require_readable_log()
+    assert dr.known_exposure_count() == 1
+    assert dr._read_selection()["authorised_exposures"] == 1
+    assert dr.open_exposure(dr._read_selection()["freeze_id"]) is None
+
+    for path in cache:
+        path.unlink()
+    refused, sent = _run_benchmark(monkeypatch, tmp_path, "the original question")
+    assert isinstance(refused, RuntimeError) and sent == 0, (refused, sent)
+    assert not list((tmp_path / "benchmark-raw").glob("*.json")), (
+        "a refused request must leave no answer in the cache")
+    restarted = _restart(tmp_path)
+    assert restarted["outcome"] == "refused" and restarted["requests"] == 0, restarted
+
+    for path, data in cache.items():
+        path.write_bytes(data)
+    recovered, sent = _run_benchmark(monkeypatch, tmp_path, "the original question")
+    assert not isinstance(recovered, Exception), recovered
+    assert sent == 0 and not recovered.attrs["exposure_was_fresh"]
+    assert recovered.attrs["exposure_event_id"] == first
+    w.submit(w.report(recovered))
+
+    dr.freeze_selection(revalidate=True, note="synthetic: a declared second look")
+    for path in cache:
+        path.unlink()
+    second, sent = _run_benchmark(monkeypatch, tmp_path, "the original question")
+    assert not isinstance(second, Exception), second
+    assert sent == 1 and second.attrs["exposure_was_fresh"]
+    assert second.attrs["exposure_event_id"] != first
+    assert dr.known_exposure_count() == 2
+    assert dr._read_selection()["authorised_exposures"] == 2
+    w.submit(w.report(second))
+
+
+@pytest.mark.parametrize("layout", _W1_LAYOUTS + ("with its readable close",))
+@pytest.mark.parametrize("damage", ["malformed", "truncated"])
+def test_a_crash_state_left_by_the_log_first_release_is_never_reopened_after_damage(
+        cached_holdout, monkeypatch, tmp_path, damage, layout):
+    """
+    The same recovery from the files the released b825b4e writer left after a crash between its
+    close line and its selection update - the order that opened the window. The open record
+    restored anywhere relative to the declared damage never permits a fresh request; restoring
+    the readable close as well is a clean recovery.
+    """
+    w = cached_holdout
+    ids = _released("b825b4e: completion logged, selection update lost in a crash", monkeypatch)
+    first = ids["first"]
+    lines = w.lines()
+    open_line = next(line for line in lines
+                     if json.loads(line).get("type") == "open").encode("utf-8") + b"\n"
+    close_line = next(line for line in lines
+                      if json.loads(line).get("type") == "close").encode("utf-8") + b"\n"
+    assert dr._read_selection()["exposure_stamps"][0]["closed_at"] is None
+    damaged = (b"{synthetic damaged completion record\n" if damage == "malformed"
+               else close_line[: len(close_line) // 2])
+    dr.EXPOSURE_LOG.write_bytes(damaged)
+    _declare()
+    dr.EXPOSURE_LOG.write_bytes(
+        _w1_layouts(open_line, dr.EXPOSURE_LOG.read_bytes(), close_line)[layout])
+    dr.require_readable_log()
+    assert dr.known_exposure_count() == 1
+    assert dr._read_selection()["authorised_exposures"] == 1
+
+    refused, sent = _holdout_request(monkeypatch, tmp_path, "a question after the restoration")
+    assert isinstance(refused, RuntimeError) and sent == 0, (refused, sent)
+    restarted = _restart(tmp_path)
+    assert restarted["outcome"] == "refused" and restarted["requests"] == 0, restarted
+
+    replayed = w.benchmark()
+    assert replayed.attrs["exposure_event_id"] == first and w.requests["n"] == 0
+    w.submit(w.report(replayed))
+    dr.freeze_selection(revalidate=True, note="synthetic: a declared second look")
+    second, sent = _holdout_request(monkeypatch, tmp_path, "the declared second look")
+    assert not isinstance(second, Exception) and not second["resumed"], second
+    assert sent == 1 and second["sequence"] == 2 and second["event_id"] != first
+
+
+@pytest.mark.parametrize("moved", [False, True],
+                         ids=["damage where it was written", "damage moved after the new exposure"])
+def test_an_exposure_begun_after_older_declared_damage_still_resumes(cached_holdout, monkeypatch,
+                                                                      tmp_path, moved):
+    """
+    The control for W1: damage declared before an exposure began cannot be its completion
+    record - wherever the damaged line ends up - so an interrupted latest exposure created after
+    it resumes under its own id, in this process and in a fresh one.
+    """
+    w = cached_holdout
+    dr.freeze_selection()
+    w.expose("the first look")
+    with dr.EXPOSURE_LOG.open("ab") as fh:
+        fh.write(_DAMAGED_LINE)
+    _declare()
+    dr.freeze_selection(revalidate=True, note="synthetic: a declared second look")
+    second, sent = _holdout_request(monkeypatch, tmp_path, "the second look, interrupted")
+    assert sent == 1 and not second["resumed"]
+    if moved:
+        lines = w.lines()
+        w.write([line for line in lines if not line.startswith("{synthetic damaged line")]
+                + [line for line in lines if line.startswith("{synthetic damaged line")])
+    resumed, sent = _holdout_request(monkeypatch, tmp_path, "the second look, resumed")
+    assert not isinstance(resumed, Exception), resumed
+    assert resumed["resumed"] and resumed["event_id"] == second["event_id"] and sent == 1
+    restarted = _restart(tmp_path)
+    assert restarted["outcome"] == "resumed" and restarted["requests"] == 1, restarted
+    assert restarted["event_id"] == second["event_id"] and restarted["known"] == 2, restarted
+
+
+def _unparsable(line):
+    try:
+        return not isinstance(json.loads(line.decode("utf-8")), dict)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return True
+
+
+_REORDERINGS = {
+    "reversed": lambda lines: lines[::-1],
+    "rotated": lambda lines: lines[1:] + lines[:1],
+    "damage first": lambda lines: ([l for l in lines if _unparsable(l)]
+                                   + [l for l in lines if not _unparsable(l)]),
+    "damage last": lambda lines: ([l for l in lines if not _unparsable(l)]
+                                  + [l for l in lines if _unparsable(l)]),
+}
+
+
+def _sampling_permissions():
+    rec = dr._read_selection()
+    event, _ = dr.unfinished_exposure(rec["freeze_id"], rec)
+    return {"resumable": (event or {}).get("event_id"),
+            "known": dr.known_exposure_count(),
+            "history problems": len(dr.exposure_history_problems(rec, dr.exposure_events())),
+            "origin": dr.originating_exposure_id()}
+
+
+def _history_completion_crash(w, monkeypatch, tmp_path):
+    dr.freeze_selection()
+    first, open_line, _ = _completion_crash(monkeypatch, tmp_path)
+    dr.EXPOSURE_LOG.write_bytes(_unreadable_completion(first, "malformed"))
+    _declare()
+    dr.EXPOSURE_LOG.write_bytes(dr.EXPOSURE_LOG.read_bytes() + open_line)
+
+
+def _history_older_damage(w, monkeypatch, tmp_path):
+    dr.freeze_selection()
+    w.expose("the first look")
+    with dr.EXPOSURE_LOG.open("ab") as fh:
+        fh.write(_DAMAGED_LINE)
+    _declare()
+    dr.freeze_selection(revalidate=True, note="synthetic: a declared second look")
+    _holdout_request(monkeypatch, tmp_path, "the second look, interrupted")
+
+
+def _history_superseded(w, monkeypatch, tmp_path):
+    dr.freeze_selection()
+    _holdout_request(monkeypatch, tmp_path, "the first look, interrupted")
+    saved = dr.EXPOSURE_LOG.read_bytes()
+    dr.EXPOSURE_LOG.unlink()
+    _declare()
+    dr.freeze_selection(revalidate=True, note="synthetic: a declared replacement look")
+    w.expose("the replacement")
+    dr.EXPOSURE_LOG.write_bytes(saved + dr.EXPOSURE_LOG.read_bytes())
+
+
+_ORDER_HISTORIES = {
+    "a completion lost in a crash, damaged, and its open record restored":
+        _history_completion_crash,
+    "an interrupted exposure begun after older declared damage": _history_older_damage,
+    "a superseded exposure's records restored": _history_superseded,
+}
+
+
+@pytest.mark.parametrize("history", list(_ORDER_HISTORIES))
+def test_the_order_of_identical_records_never_changes_what_may_be_sampled(
+        cached_holdout, monkeypatch, tmp_path, history):
+    """
+    THE INVARIANT W1 BROKE: the same historical records in a different physical order must not
+    grant or withdraw sampling permission. Every reordering gives the same answers - which
+    exposure may resume, how many exposures count, whether the history is valid, and which
+    exposure the benchmark came from.
+    """
+    w = cached_holdout
+    _ORDER_HISTORIES[history](w, monkeypatch, tmp_path)
+    baseline = dr.EXPOSURE_LOG.read_bytes()
+    expected = _sampling_permissions()
+    lines = [line for line in baseline.split(b"\n") if line.strip()]
+    for name, reorder in _REORDERINGS.items():
+        dr.EXPOSURE_LOG.write_bytes(b"\n".join(reorder(lines)) + b"\n")
+        assert _sampling_permissions() == expected, f"{history}, {name}"
+    dr.EXPOSURE_LOG.write_bytes(baseline)
