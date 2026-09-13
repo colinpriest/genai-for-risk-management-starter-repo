@@ -5714,3 +5714,1162 @@ def test_the_order_of_identical_records_never_changes_what_may_be_sampled(
         dr.EXPOSURE_LOG.write_bytes(b"\n".join(reorder(lines)) + b"\n")
         assert _sampling_permissions() == expected, f"{history}, {name}"
     dr.EXPOSURE_LOG.write_bytes(baseline)
+
+
+# -------------------------------------------------------------------------------------------
+# CHRONOLOGY AT ITS BOUNDARIES  (recheck-11)
+# -------------------------------------------------------------------------------------------
+# Two decisions compare recorded times: whether declared damage could be the record of a look
+# finishing, and whether a record the log has lost could postdate it. Every record below is
+# written by the real writers under a controlled clock, and the question that follows is a real
+# cache miss through the course adapter and the wrapper's ProxyTransport. The times sit at the
+# edges of the comparison - the same instant, the same instant in another UTC offset, an earlier
+# instant that sorts later as text and a later one that sorts earlier, no offset at all - or
+# cannot be read. Uncertain chronology never grants a request; genuinely older damage or loss
+# never blocks the continuation it cannot be part of. Each case's outcome is written beside it.
+
+def _controlled_clock(monkeypatch):
+    """Every `datetime.now()` in the module returns the moment last set, in the UTC offset it
+    was written with, or with none. Returns the setter."""
+    from datetime import datetime as real_datetime
+    moment = {"now": real_datetime.fromisoformat("2026-09-12T12:00:00+00:00")}
+
+    class Clock(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return moment["now"]
+
+    monkeypatch.setattr(dr, "datetime", Clock)
+
+    def at(text):
+        moment["now"] = real_datetime.fromisoformat(text)
+
+    return at
+
+
+def _asked_again(monkeypatch, tmp_path, *, resumes, eid, known, reason):
+    """One more question once the records are written: resumed under `eid` with one request, or
+    refused for `reason` with none and no answer cached - after which a declared look is new."""
+    cached = sorted(tmp_path.glob("raw-*/*.json"))
+    event, sent = _holdout_request(monkeypatch, tmp_path, "one more question about the look")
+    if resumes:
+        assert not isinstance(event, Exception), event
+        assert event["resumed"] and event["event_id"] == eid and sent == 1, (event, sent)
+        assert dr.known_exposure_count() == known
+        return
+    assert isinstance(event, RuntimeError) and sent == 0, (event, sent)
+    assert reason in str(event), event
+    assert sorted(tmp_path.glob("raw-*/*.json")) == cached, (
+        "a refused request must leave no answer in the cache")
+    assert dr.known_exposure_count() == known
+    assert dr._read_selection()["authorised_exposures"] == known
+    dr.freeze_selection(revalidate=True, note="synthetic: a declared further look")
+    further, sent = _holdout_request(monkeypatch, tmp_path, "a declared further look")
+    assert not isinstance(further, Exception), further
+    assert not further["resumed"] and further["event_id"] != eid and sent == 1, (further, sent)
+    assert further["sequence"] == known + 1 and dr.known_exposure_count() == known + 1
+
+
+def _damage_declared_before_an_interrupted_look(w, monkeypatch, tmp_path, at, declared, began):
+    """A finished first look, a damaged line declared at `declared`, and a declared second look
+    that began at `began` and was interrupted. Returns the second look's exposure id."""
+    dr.freeze_selection()
+    w.expose("the first look")
+    with dr.EXPOSURE_LOG.open("ab") as fh:
+        fh.write(_DAMAGED_LINE)
+    at(declared)
+    _declare()
+    dr.freeze_selection(revalidate=True, note="synthetic: a declared second look")
+    at(began)
+    second, sent = _holdout_request(monkeypatch, tmp_path, "the second look, interrupted")
+    assert sent == 1 and not second["resumed"], (second, sent)
+    return second["event_id"]
+
+
+_DAMAGE_CHRONOLOGY = [
+    # (case, the damage was declared at, the interrupted look began at, may it resume?)
+    ("declared a microsecond before the look began",
+     "2026-09-13T00:00:00+00:00", "2026-09-13T00:00:00.000001+00:00", True),
+    ("declared at the instant the look began",
+     "2026-09-13T00:00:00+00:00", "2026-09-13T00:00:00+00:00", False),
+    ("the same instant, declared in another UTC offset",
+     "2026-09-13T10:00:00+10:00", "2026-09-13T00:00:00+00:00", False),
+    ("the same instant, the look recorded in another UTC offset",
+     "2026-09-13T00:00:00+00:00", "2026-09-12T14:00:00-10:00", False),
+    ("an earlier instant that sorts later as text",
+     "2026-09-13T09:59:59+10:00", "2026-09-13T00:00:00+00:00", True),
+    ("a later instant that sorts earlier as text",
+     "2026-09-12T23:30:00-02:00", "2026-09-13T00:00:00+00:00", False),
+    ("declared without an offset, a second before the look began",
+     "2026-09-12T23:59:59", "2026-09-13T00:00:00+00:00", True),
+    ("declared without an offset, at the instant the look began",
+     "2026-09-13T00:00:00", "2026-09-13T00:00:00+00:00", False),
+]
+
+
+@pytest.mark.parametrize("declared,began,resumes", [case[1:] for case in _DAMAGE_CHRONOLOGY],
+                         ids=[case[0] for case in _DAMAGE_CHRONOLOGY])
+def test_damage_declared_at_the_edge_of_a_looks_start_never_grants_a_request(
+        cached_holdout, monkeypatch, tmp_path, declared, began, resumes):
+    """
+    Damage declared before the interrupted look began cannot be the record of it finishing, so
+    the look resumes. Declared at the same instant - in any offset - or later, it may be; and an
+    instant is compared as an instant, never as text.
+    """
+    at = _controlled_clock(monkeypatch)
+    eid = _damage_declared_before_an_interrupted_look(cached_holdout, monkeypatch, tmp_path, at,
+                                                      declared, began)
+    _asked_again(monkeypatch, tmp_path, resumes=resumes, eid=eid, known=2,
+                 reason="declared after it began")
+
+
+_ABSENT = object()
+_UNREADABLE_DECLARATION_DATES = {
+    "absent": _ABSENT, "null": None, "empty": "", "not a date": "yesterday",
+    "a local date format": "13/09/2026", "an impossible date": "2026-02-30T00:00:00+00:00"}
+
+
+@pytest.mark.parametrize("date", list(_UNREADABLE_DECLARATION_DATES))
+def test_a_declaration_date_that_cannot_be_read_never_grants_a_request(
+        cached_holdout, monkeypatch, tmp_path, date):
+    """The same history as the resuming case above, with the declaration's date made unreadable:
+    nothing then shows the damage predates the look, so the look is not resumed."""
+    at = _controlled_clock(monkeypatch)
+    eid = _damage_declared_before_an_interrupted_look(
+        cached_holdout, monkeypatch, tmp_path, at,
+        "2026-09-12T23:00:00+00:00", "2026-09-13T00:00:00+00:00")
+    rec = dr._read_selection()
+    assert (dr.open_exposure(rec["freeze_id"]) or {}).get("event_id") == eid, (
+        "the control: with its date as written, the look resumes")
+    entry = rec["log_loss"]["declarations"][-1]
+    if _UNREADABLE_DECLARATION_DATES[date] is _ABSENT:
+        del entry["declared_at"]
+    else:
+        entry["declared_at"] = _UNREADABLE_DECLARATION_DATES[date]
+    dr.SELECTION_STAMP.write_text(json.dumps(rec, indent=1), encoding="utf-8")
+    dr.require_readable_log()
+    _asked_again(monkeypatch, tmp_path, resumes=False, eid=eid, known=2,
+                 reason="declared after it began")
+
+
+@pytest.mark.parametrize("copies_left", [2, 1], ids=["both copies left", "the later copy removed"])
+@pytest.mark.parametrize("second", ["declared before the look began", "declared after the look began"])
+def test_identical_damaged_lines_declared_at_different_times(cached_holdout, monkeypatch,
+                                                              tmp_path, second, copies_left):
+    """
+    Two damaged lines with the same bytes, declared at different times. The file cannot say which
+    copy survives an edit, so the look resumes only when every declaration of those bytes
+    precedes it - even once the copy added after it began has been removed.
+    """
+    w = cached_holdout
+    at = _controlled_clock(monkeypatch)
+    dr.freeze_selection()
+    w.expose("the first look")
+    earlier = ["2026-09-12T22:00:00+00:00"]
+    if second == "declared before the look began":
+        earlier.append("2026-09-12T23:00:00+00:00")
+    for declared in earlier:
+        with dr.EXPOSURE_LOG.open("ab") as fh:
+            fh.write(_DAMAGED_LINE)
+        at(declared)
+        _declare("synthetic: a line of the log was damaged")
+    dr.freeze_selection(revalidate=True, note="synthetic: a declared second look")
+    at("2026-09-13T00:00:00+00:00")
+    look, sent = _holdout_request(monkeypatch, tmp_path, "the second look, interrupted")
+    assert sent == 1 and not look["resumed"], (look, sent)
+    if second == "declared after the look began":
+        with dr.EXPOSURE_LOG.open("ab") as fh:
+            fh.write(_DAMAGED_LINE)
+        at("2026-09-13T01:00:00+00:00")
+        _declare("synthetic: another copy of the damage")
+    lines = w.lines()
+    copies = [i for i, line in enumerate(lines) if line.startswith("{synthetic damaged line")]
+    assert len(copies) == 2, lines
+    if copies_left == 1:
+        w.write(lines[:copies[-1]] + lines[copies[-1] + 1:])
+    dr.require_readable_log()
+    _asked_again(monkeypatch, tmp_path, resumes=second == "declared before the look began",
+                 eid=look["event_id"], known=2, reason="declared after it began")
+
+
+_RECORD_CHRONOLOGY = [
+    # (case, the lost record's time, the interrupted look began at, may it resume?)
+    ("recorded a microsecond before the look began",
+     "2026-09-13T00:00:00+00:00", "2026-09-13T00:00:00.000001+00:00", True),
+    ("recorded at the instant the look began",
+     "2026-09-13T00:00:00+00:00", "2026-09-13T00:00:00+00:00", False),
+    ("the same instant in another UTC offset",
+     "2026-09-13T10:00:00+10:00", "2026-09-13T00:00:00+00:00", False),
+    ("an earlier instant that sorts later as text",
+     "2026-09-13T09:59:59+10:00", "2026-09-13T00:00:00+00:00", True),
+    ("a later instant that sorts earlier as text",
+     "2026-09-12T23:30:00-02:00", "2026-09-13T00:00:00+00:00", False),
+]
+
+
+@pytest.mark.parametrize("lost,began,resumes", [case[1:] for case in _RECORD_CHRONOLOGY],
+                         ids=[case[0] for case in _RECORD_CHRONOLOGY])
+def test_a_lost_look_recorded_at_the_edge_of_the_next_ones_start_never_grants_a_request(
+        cached_holdout, monkeypatch, tmp_path, lost, began, resumes):
+    """An earlier look whose records were lost and declared could postdate the interrupted look
+    unless its recorded time is strictly earlier."""
+    at = _controlled_clock(monkeypatch)
+    dr.freeze_selection()
+    at(lost)
+    first, sent = _holdout_request(monkeypatch, tmp_path, "the first look, interrupted")
+    assert sent == 1 and not first["resumed"], (first, sent)
+    dr.EXPOSURE_LOG.unlink()
+    at("2026-09-12T18:00:00+00:00")
+    _declare()
+    dr.freeze_selection(revalidate=True, note="synthetic: a declared replacement look")
+    at(began)
+    second, sent = _holdout_request(monkeypatch, tmp_path, "the replacement, interrupted")
+    assert sent == 1 and not second["resumed"], (second, sent)
+    _asked_again(monkeypatch, tmp_path, resumes=resumes, eid=second["event_id"], known=2,
+                 reason="may postdate")
+
+
+@pytest.mark.parametrize("finished,began,resumes", [case[1:] for case in _RECORD_CHRONOLOGY],
+                         ids=[case[0] for case in _RECORD_CHRONOLOGY])
+def test_a_lost_completion_recorded_at_the_edge_of_the_next_looks_start_never_grants_a_request(
+        cached_holdout, monkeypatch, tmp_path, finished, began, resumes):
+    """A finished look whose completion record was lost and declared could have finished after
+    the interrupted look began unless the completion the freeze recorded is strictly earlier."""
+    w = cached_holdout
+    at = _controlled_clock(monkeypatch)
+    dr.freeze_selection()
+    first = dr.record_holdout_exposure("the first look")
+    at(finished)
+    dr.close_holdout_exposure(first["event_id"], "benchmark completed", fresh=True)
+    w.write([line for line in w.lines() if json.loads(line).get("type") != "close"])
+    at("2026-09-12T18:00:00+00:00")
+    _declare()
+    dr.freeze_selection(revalidate=True, note="synthetic: a declared second look")
+    at(began)
+    second, sent = _holdout_request(monkeypatch, tmp_path, "the second look, interrupted")
+    assert sent == 1 and not second["resumed"], (second, sent)
+    _asked_again(monkeypatch, tmp_path, resumes=resumes, eid=second["event_id"], known=2,
+                 reason="may postdate")
+
+
+# -------------------------------------------------------------------------------------------
+# A RUN KILLED AT A FILESYSTEM BOUNDARY, THEN RESTARTED IN A FRESH PROCESS  (recheck-11)
+# -------------------------------------------------------------------------------------------
+# The crashes above fail a whole write. These kill the process part-way through one: the
+# exposure log's line cut short, written but never flushed, flushed but never synced, or the
+# flush or the sync failing; the selection's temp file cut short, the process killed before or
+# after the replace, or the replace failing. A kill is `os._exit` inside the running benchmark,
+# so no handler, `finally` or buffer flush runs - the files are exactly what a dying process
+# leaves. Each boundary is crossed twice: recording the exposure before its request, and
+# recording the completion after it. A separate process then restarts against those files and
+# does what a team would - asks again through the runner's own guard, declares or authorises
+# where the message says to, replays the cached benchmark - with every expected outcome written
+# out below. Requests are counted at the scripted network, and written to disk as they happen.
+
+_BOUNDARY_CHILD = r"""
+import json, os, sys, warnings
+from pathlib import Path
+
+src, selection, log, raw, action, question, shift, config_hash = sys.argv[1:9]
+sys.path.insert(0, src)
+import config, courseapi, unsw_ai
+import decision_replay as dr
+import httpx, openai
+from pydantic import BaseModel
+
+dr.SELECTION_STAMP, dr.EXPOSURE_LOG, dr.RAW_DIR = Path(selection), Path(log), Path(raw)
+dr.dev_sample = lambda *a, **k: ["2020-01-01"]
+dr.holdout_sample = lambda *a, **k: ["2020-02-01"]
+dr.selection_config_hash = lambda: config_hash
+dr._prompts_written = lambda: True
+config.CALL_INDEX_BASE += int(shift)
+config.ledger_add = lambda *a, **k: None
+unsw_ai.time.sleep = lambda *a, **k: None
+REQUESTS, SYNC = os.environ.get("REPLAY_REQUESTS_FILE"), os.fsync
+
+
+class HoldoutProbe(BaseModel):
+    value: int
+
+
+sent = []
+
+
+def network(request):
+    sent.append(request)
+    if REQUESTS:
+        # Durable at once, so the count survives a process killed straight after the request.
+        with open(REQUESTS, "a", encoding="utf-8") as fh:
+            fh.write("request\n")
+            fh.flush()
+            SYNC(fh.fileno())
+    return httpx.Response(200, json={
+        "id": "resp_synthetic", "object": "response", "created_at": 1,
+        "model": config.MODEL, "status": "completed", "incomplete_details": None,
+        "output": [{"type": "function_call", "id": "f", "call_id": "c",
+                    "name": "HoldoutProbe", "arguments": '{"value":1}',
+                    "status": "completed"}],
+        "usage": {"input_tokens": 10, "output_tokens": 10, "total_tokens": 20}})
+
+
+def build(settings, **kwargs):
+    proxy = unsw_ai.ProxyTransport(settings, inner=httpx.MockTransport(network),
+                                   token_limiter=kwargs.get("token_limiter"))
+    return openai.OpenAI(api_key="synthetic", base_url="https://synthetic.invalid",
+                         max_retries=0, http_client=httpx.Client(transport=proxy))
+
+
+unsw_ai.build_openai_client = build
+settings = unsw_ai.ProxySettings(proxy_url="https://synthetic.invalid",
+                                 access_code="synthetic", student_id="9999999",
+                                 fallback_models=())
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    client = unsw_ai.UNSWInstructor(settings=settings)
+unsw_ai.get_client = lambda *a, **k: client
+dr.client_ = lambda *a, **k: courseapi.CourseClient()
+"""
+
+_BENCHMARK_STEP = r"""
+
+def ask(question, raw_dir):
+    # The runner's order: the frozen selection and a readable history first, then the real
+    # holdout benchmark, whose one call is a real `_cached_call` against `raw_dir`.
+    dr.RAW_DIR = Path(raw_dir)
+
+    def recommend(*a, **k):
+        dr._cached_call("probe", "system", f"synthetic holdout question: {question}",
+                        schema=HoldoutProbe)
+        return {"ok": True, "result": {"recommendation": "hold", "size_bp": 0,
+                                       "confidence": 0.8}, "shot_mix": {"hold_share": 1.0}}
+
+    dr.recommend = recommend
+    dr.feasible_everywhere = lambda meetings, strategies, k: (meetings, {})
+    dr.actual_decision = lambda *a, **k: {"word": "hold", "size_bp": 0, "decision": 0}
+    before = len(sent)
+    try:
+        dr._require_frozen_selection()
+        frame = dr.evaluate_all(meetings=["2020-02-01"], strategies=["recent"], n_seeds=1,
+                                max_workers=1, sample="holdout")
+        event = dr._EXPOSURE_EVENT
+        result = {"outcome": "replayed" if event is None
+                  else "resumed" if event.get("resumed") else "new",
+                  "event_id": frame.attrs["exposure_event_id"],
+                  "sequence": (event or {}).get("sequence")}
+    except (RuntimeError, OSError) as exc:
+        result = {"outcome": "refused" if isinstance(exc, RuntimeError) else "failed",
+                  "error": type(exc).__name__, "message": str(exc)}
+    result.update(requests=len(sent) - before, cached=len(list(Path(raw_dir).glob("*.json"))))
+    return result
+"""
+
+_KILL_STEP = _BOUNDARY_CHILD + _BENCHMARK_STEP + r"""
+import pathlib
+
+boundary = action
+real_open, real_write_text = pathlib.Path.open, pathlib.Path.write_text
+real_replace, real_fsync = os.replace, os.fsync
+writing = {"record": None, "line": None}
+
+
+def reached(point, where):
+    return boundary == f"{where} {point}"
+
+
+def die():
+    os._exit(86)
+
+
+class LogFile:
+    # The exposure log as `_append_event` holds it: text reaches the file when it is flushed.
+    def __init__(self, handle):
+        self.handle, self.pending = handle, ""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        writing["line"] = None
+        self.handle.close()
+        return False
+
+    def write(self, text):
+        writing["line"] = json.loads(text)["type"] + " line"
+        if reached("cut short", writing["line"]):
+            self.handle.write(text[: len(text) // 2])
+            self.handle.flush()
+            die()
+        self.pending += text
+        return len(text)
+
+    def flush(self):
+        if reached("never flushed", writing["line"]):
+            die()
+        if reached("flush fails", writing["line"]):
+            raise OSError(28, "synthetic: no space left on device")
+        self.handle.write(self.pending)
+        self.pending = ""
+        self.handle.flush()
+
+    def fileno(self):
+        return self.handle.fileno()
+
+
+def log_open(self, mode="r", *args, **kwargs):
+    handle = real_open(self, mode, *args, **kwargs)
+    return LogFile(handle) if self == dr.EXPOSURE_LOG and mode == "a" else handle
+
+
+def log_fsync(fd):
+    if reached("flushed, not synced", writing["line"]):
+        die()
+    if reached("fsync fails", writing["line"]):
+        raise OSError(5, "synthetic: input/output error")
+    return real_fsync(fd)
+
+
+def temp_write(self, data, *args, **kwargs):
+    if self.name == dr.SELECTION_STAMP.name + ".tmp-write" and reached(
+            "temp file cut short", writing["record"]):
+        real_write_text(self, data[: len(data) // 2], *args, **kwargs)
+        die()
+    return real_write_text(self, data, *args, **kwargs)
+
+
+def selection_replace(source, target):
+    if Path(target) != dr.SELECTION_STAMP:
+        return real_replace(source, target)
+    if reached("killed before the replace", writing["record"]):
+        die()
+    if reached("replace fails", writing["record"]):
+        raise OSError(13, "synthetic: access is denied")
+    real_replace(source, target)
+    if reached("killed after the replace", writing["record"]):
+        die()
+
+
+def recording(record, writer):
+    def wrapped(*a, **k):
+        writing["record"] = record
+        try:
+            return writer(*a, **k)
+        finally:
+            writing["record"] = None
+    return wrapped
+
+
+pathlib.Path.open, pathlib.Path.write_text = log_open, temp_write
+os.replace, os.fsync = selection_replace, log_fsync
+dr.record_holdout_exposure = recording("open stamp", dr.record_holdout_exposure)
+dr.close_holdout_exposure = recording("completion stamp", dr.close_holdout_exposure)
+print("RESULT " + json.dumps(ask(question, raw)))
+"""
+
+_RECOVERY_STEPS = _BOUNDARY_CHILD + _BENCHMARK_STEP + r"""
+for step in json.loads(question):
+    try:
+        if step["do"] == "ask":
+            result = ask(step["question"], step["answers"])
+        elif step["do"] == "declare":
+            dr.run_dev(lost_log=True, note="synthetic: the log could not be restored")
+            result = {"outcome": "declared"}
+        else:
+            dr.freeze_selection(revalidate=True, note="synthetic: a declared further look")
+            result = {"outcome": "authorised"}
+    except RuntimeError as exc:
+        result = {"outcome": "refused", "message": str(exc)}
+    result.update(known=dr.known_exposure_count(),
+                  allowance=dr._read_selection().get("authorised_exposures"))
+    print("RESULT " + json.dumps(result), flush=True)
+"""
+
+
+def _child_run(tmp_path, script, action, payload, raw, requests=None):
+    """`script` in a fresh process against this test's selection and log: (the run, its results)."""
+    import subprocess
+    path = tmp_path / f"child-{len(list(tmp_path.glob('child-*.py')))}.py"
+    path.write_text(script, encoding="utf-8")
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "DOTENV_PATH": "none"}
+    env.pop("OPENAI_API_KEY", None)
+    env.pop("REPLAY_REQUESTS_FILE", None)
+    if requests:
+        env["REPLAY_REQUESTS_FILE"] = str(requests)
+    src = pathlib.Path(__file__).resolve().parent.parent / "src"
+    run = subprocess.run(
+        [sys.executable, str(path), str(src), str(dr.SELECTION_STAMP), str(dr.EXPOSURE_LOG),
+         str(raw), action, payload, "0", dr.selection_config_hash()],
+        capture_output=True, text=True, env=env, timeout=600)
+    results = [json.loads(line[len("RESULT "):]) for line in run.stdout.splitlines()
+               if line.startswith("RESULT ")]
+    return run, results
+
+
+_KILL_BOUNDARIES = {
+    # boundary: (how the killed run ended, the state its files are left in)
+    "open line cut short": ("killed", "a damaged open record"),
+    "open line never flushed": ("killed", "nothing recorded"),
+    "open line flush fails": ("failed", "nothing recorded"),
+    "open line flushed, not synced": ("killed", "an open record the selection never stamped"),
+    "open line fsync fails": ("failed", "an open record the selection never stamped"),
+    "open stamp temp file cut short": ("killed", "an open record the selection never stamped"),
+    "open stamp killed before the replace": ("killed",
+                                             "an open record the selection never stamped"),
+    "open stamp replace fails": ("failed", "an open record the selection never stamped"),
+    "open stamp killed after the replace": ("killed", "a look interrupted before its request"),
+    "completion stamp temp file cut short": ("killed", "a look interrupted after its request"),
+    "completion stamp killed before the replace": ("killed",
+                                                   "a look interrupted after its request"),
+    "completion stamp replace fails": ("failed", "a look interrupted after its request"),
+    "completion stamp killed after the replace": ("killed", "a missing completion record"),
+    "close line cut short": ("killed", "a damaged completion record"),
+    "close line never flushed": ("killed", "a missing completion record"),
+    "close line flush fails": ("failed", "a missing completion record"),
+    "close line flushed, not synced": ("killed", "a finished benchmark"),
+    "close line fsync fails": ("failed", "a finished benchmark"),
+}
+
+_ORIGINAL = "the benchmark's own question"
+_NEVER_ASKED = "a question the benchmark never asked"
+_SPENT = "already been exposed 1 time"
+
+
+def _refused(reason, known=1, allowance=1):
+    return dict(outcome="refused", requests=0, reason=reason, known=known, allowance=allowance)
+
+
+#: What the restart does after each kill, and what each step must do.
+#:   ("ask", question, answers) - the runner's guard, then the real benchmark against a cache:
+#:       "none" is an empty cache, so the question is a real miss; "original" is what the killed
+#:       run cached; "step N" is what the Nth restart step cached
+#:   ("declare",) - --declare-lost-log;  ("authorise",) - --revalidate
+#: `look` names the exposure a step must use: "killed" is the one the killed run recorded,
+#: "step N" the one the Nth step named, "new" one never seen before.
+_RESTART_PLANS = {
+    "nothing recorded": [
+        (("ask", _ORIGINAL, "none"),
+         dict(outcome="new", requests=1, look="new", sequence=1, known=1, allowance=1)),
+        (("ask", _NEVER_ASKED, "none"), _refused(_SPENT)),
+        (("ask", _ORIGINAL, "step 1"),
+         dict(outcome="replayed", requests=0, look="step 1", known=1, allowance=1)),
+    ],
+    "a damaged open record": [
+        (("ask", _ORIGINAL, "none"), _refused("damaged line", known=0)),
+        (("declare",), dict(outcome="declared", known=0, allowance=1)),
+        (("ask", _ORIGINAL, "none"),
+         dict(outcome="new", requests=1, look="new", sequence=1, known=1, allowance=1)),
+        (("ask", _NEVER_ASKED, "none"), _refused(_SPENT)),
+        (("ask", _ORIGINAL, "step 3"),
+         dict(outcome="replayed", requests=0, look="step 3", known=1, allowance=1)),
+    ],
+    "an open record the selection never stamped": [
+        (("ask", _ORIGINAL, "none"), _refused(_SPENT)),
+        (("ask", _NEVER_ASKED, "none"), _refused(_SPENT)),
+        (("authorise",), dict(outcome="authorised", known=1, allowance=2)),
+        (("ask", _ORIGINAL, "none"),
+         dict(outcome="new", requests=1, look="new", sequence=2, known=2, allowance=2)),
+        (("ask", _ORIGINAL, "step 4"),
+         dict(outcome="replayed", requests=0, look="step 4", known=2, allowance=2)),
+    ],
+    "a look interrupted before its request": [
+        (("ask", _ORIGINAL, "none"),
+         dict(outcome="resumed", requests=1, look="killed", sequence=1, known=1, allowance=1)),
+        (("ask", _NEVER_ASKED, "none"), _refused(_SPENT)),
+        (("ask", _ORIGINAL, "step 1"),
+         dict(outcome="replayed", requests=0, look="killed", known=1, allowance=1)),
+    ],
+    "a look interrupted after its request": [
+        (("ask", _ORIGINAL, "none"),
+         dict(outcome="resumed", requests=1, look="killed", sequence=1, known=1, allowance=1)),
+        (("ask", _NEVER_ASKED, "none"), _refused(_SPENT)),
+        (("ask", _ORIGINAL, "original"),
+         dict(outcome="replayed", requests=0, look="killed", known=1, allowance=1)),
+    ],
+    "a missing completion record": [
+        (("ask", _ORIGINAL, "none"), _refused("record of it finishing")),
+        (("ask", _ORIGINAL, "original"), _refused("record of it finishing")),
+        (("declare",), dict(outcome="declared", known=1, allowance=1)),
+        (("ask", _ORIGINAL, "none"), _refused(_SPENT)),
+        (("ask", _ORIGINAL, "original"),
+         dict(outcome="replayed", requests=0, look="killed", known=1, allowance=1)),
+        (("ask", _NEVER_ASKED, "none"), _refused(_SPENT)),
+    ],
+    "a damaged completion record": [
+        (("ask", _ORIGINAL, "none"), _refused("damaged line")),
+        (("ask", _ORIGINAL, "original"), _refused("damaged line")),
+        (("declare",), dict(outcome="declared", known=1, allowance=1)),
+        (("ask", _ORIGINAL, "none"), _refused(_SPENT)),
+        (("ask", _ORIGINAL, "original"),
+         dict(outcome="replayed", requests=0, look="killed", known=1, allowance=1)),
+        (("ask", _NEVER_ASKED, "none"), _refused(_SPENT)),
+    ],
+    "a finished benchmark": [
+        (("ask", _ORIGINAL, "none"), _refused(_SPENT)),
+        (("ask", _ORIGINAL, "original"),
+         dict(outcome="replayed", requests=0, look="killed", known=1, allowance=1)),
+        (("ask", _NEVER_ASKED, "none"), _refused(_SPENT)),
+    ],
+}
+
+
+def _state_left_by_the_kill(state):
+    """Check the state from the bytes on disk, without the module's reader; return the id of the
+    exposure the killed run recorded, if one survives."""
+    data = dr.EXPOSURE_LOG.read_bytes() if dr.EXPOSURE_LOG.exists() else b""
+    records = []
+    for line in (line for line in data.split(b"\n") if line.strip()):
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            records.append(line)
+    stamps = json.loads(dr.SELECTION_STAMP.read_text(encoding="utf-8")).get("exposure_stamps")
+    kinds = [r.get("type") if isinstance(r, dict) else "damaged" for r in records]
+    opened = next((r["event_id"] for r in records
+                   if isinstance(r, dict) and r.get("type") == "open"), None)
+    expected_kinds, expected_stamps = {
+        "nothing recorded": ([], {}),
+        "a damaged open record": (["damaged"], {}),
+        "an open record the selection never stamped": (["open"], {}),
+        "a look interrupted before its request": (["open"], {opened: "unfinished"}),
+        "a look interrupted after its request": (["open"], {opened: "unfinished"}),
+        "a missing completion record": (["open"], {opened: "finished"}),
+        "a damaged completion record": (["open", "damaged"], {opened: "finished"}),
+        "a finished benchmark": (["open", "close"], {opened: "finished"}),
+    }[state]
+    assert kinds == expected_kinds, (state, records)
+    assert {s["event_id"]: "finished" if s.get("closed_at") else "unfinished"
+            for s in stamps or []} == expected_stamps, (state, stamps)
+    if "damaged" in kinds:
+        assert not data.endswith(b"\n") and records[-1].startswith(b'{"at": '), (
+            "the damage must be the first part of the record being written", records)
+    if "close" in kinds:
+        assert records[-1]["event_id"] == opened, records
+    return opened
+
+
+#: EACH CASE RUNS TWO FRESH PROCESSES, about twenty seconds, so the matrix is opt-in rather than
+#: part of the default run students repeat: set REPLAY_RECOVERY_MATRIX=1. The publishing gate sets
+#: it and refuses a release unless every case passes.
+_KILL_MATRIX = pytest.mark.skipif(
+    os.environ.get("REPLAY_RECOVERY_MATRIX") != "1",
+    reason="the kill-and-restart matrix is slow: set REPLAY_RECOVERY_MATRIX=1 to run it "
+           "(the publishing gate does)")
+
+
+@_KILL_MATRIX
+@pytest.mark.parametrize("boundary", list(_KILL_BOUNDARIES))
+def test_a_run_killed_at_a_filesystem_boundary_never_samples_again_after_a_restart(
+        cached_holdout, tmp_path, boundary):
+    """
+    Whatever a kill at the boundary leaves, the restart sends no request the files do not
+    authorise, caches no answer for a refused question, keeps what the killed run cached
+    replayable under the exposure that asked for it, and counts exactly the exposures recorded.
+    A run killed before anything durable costs nothing; one killed with its exposure and its
+    unfinished state both recorded resumes under its own id.
+    """
+    w = cached_holdout
+    dr.freeze_selection()
+    ended, state = _KILL_BOUNDARIES[boundary]
+    original = tmp_path / "answers-the-killed-run-cached"
+    original.mkdir()
+    requests = tmp_path / "requests-before-the-kill.log"
+    run, results = _child_run(tmp_path, _KILL_STEP, boundary, _ORIGINAL, original, requests)
+    output = f"exit {run.returncode}\n{run.stdout[-2000:]}\n{run.stderr[-3000:]}"
+    if ended == "killed":
+        assert run.returncode == 86 and not results, f"{boundary}: {output}"
+    else:
+        assert run.returncode == 0 and [r["outcome"] for r in results] == ["failed"], output
+        assert results[0]["error"] in ("OSError", "PermissionError"), results
+    after_its_request = boundary.startswith(("completion stamp", "close line"))
+    sent = len(requests.read_text(encoding="utf-8").splitlines()) if requests.exists() else 0
+    assert sent == (1 if after_its_request else 0), f"{boundary}: {sent} request(s) before it"
+    answers = {p.name: p.read_bytes() for p in original.glob("*.json")}
+    assert len(answers) == (1 if after_its_request else 0), answers
+    temp = dr.SELECTION_STAMP.with_name(dr.SELECTION_STAMP.name + ".tmp-write")
+    assert temp.exists() == (ended == "killed" and ("temp file" in boundary
+                                                    or "before the replace" in boundary)), (
+        "a killed write leaves its temp file behind; a failed one removes it")
+    killed = _state_left_by_the_kill(state)
+
+    plan = _RESTART_PLANS[state]
+    steps, caches = [], {}
+    for number, (step, _) in enumerate(plan, start=1):
+        if step[0] != "ask":
+            steps.append({"do": step[0]})
+            continue
+        answers_from = step[2]
+        if answers_from == "none":
+            caches[number] = tmp_path / f"answers-restart-step-{number}"
+            caches[number].mkdir()
+        else:
+            caches[number] = (original if answers_from == "original"
+                              else caches[int(answers_from.split()[1])])
+        steps.append({"do": "ask", "question": step[1], "answers": str(caches[number])})
+    run, seen = _child_run(tmp_path, _RECOVERY_STEPS, "steps", json.dumps(steps), original)
+    assert len(seen) == len(plan), f"{boundary}: {run.stdout[-3000:]}\n{run.stderr[-3000:]}"
+
+    ids = {}
+    for number, ((step, expected), result) in enumerate(zip(plan, seen), start=1):
+        where = f"{boundary} -> {state}, restart step {number} {step}: {result}"
+        for field in ("outcome", "known", "allowance", "requests", "sequence"):
+            if field in expected:
+                assert result.get(field) == expected[field], f"{field} - {where}"
+        if "reason" in expected:
+            assert expected["reason"] in result.get("message", ""), where
+        look = expected.get("look")
+        if look == "killed":
+            assert killed and result["event_id"] == killed, where
+        elif look == "new":
+            assert result["event_id"] not in {killed, *ids.values()}, where
+        elif look:
+            assert result["event_id"] == ids[int(look.split()[1])], where
+        if result.get("event_id"):
+            ids[number] = result["event_id"]
+        if step[0] == "ask" and step[2] == "none":
+            assert result["cached"] == (1 if result["outcome"] in ("new", "resumed") else 0), (
+                f"a refused question must leave no answer in the cache - {where}")
+
+    assert {p.name: p.read_bytes() for p in original.glob("*.json")} == answers, (
+        "what the killed run cached must survive the restart unchanged")
+    dr.require_readable_log()
+    replayed = [n for n, (_, expected) in enumerate(plan, start=1)
+                if expected["outcome"] == "replayed"]
+    w.submit(_report_naming(ids[replayed[-1]]))
+
+
+# -------------------------------------------------------------------------------------------
+# GENERATED RECOVERY SEQUENCES, HELD TO AN INDEPENDENT MODEL  (recheck-11)
+# -------------------------------------------------------------------------------------------
+# Bounded sequences of what happens to a Replay workspace: a look asked and interrupted, a
+# benchmark finished, a cached replay, a further look authorised, a loss declared, the log
+# deleted, a record dropped, a completion record damaged, identical damaged lines added and
+# declared at different times, saved records restored before, after, twice or over the damage,
+# the log shuffled, a record duplicated. Only records the real writers produced are ever moved,
+# copied or restored. Each step runs for real - requests counted at the scripted network - and is
+# held to `_RecoveryModel`, which restates the policy from the steps alone and never reads the
+# files or calls the module, so a helper computing something wrong cannot agree with itself.
+# After every step the count, the allowance, whether the history is valid and which look may
+# resume must all match. The writers run under a clock that moves one second a step, so "before"
+# and "after" are exact. Some sequences open with a history a random walk rarely assembles; every
+# one ends by asking, declaring whatever is left, asking again, replaying and submitting.
+
+class _RecoveryModel:
+    """THE POLICY, RESTATED FROM THE STEPS ALONE: the oracle for the generated sequences.
+
+    Looks are labelled A, B, C in the order they begin; `began` and `finished_at` are the steps the
+    clock recorded them at. The log is a list of tokens in file order: ("open", A); ("close", A, n),
+    A's nth completion record; ("declared", n), the nth loss declaration; ("junk",), a damaged
+    line whose bytes never vary; ("half", A, n), the first half of ("close", A, n). A declaration
+    keeps the step it was made at and exactly what it covered.
+
+    A request is refused while anything lost or damaged is undeclared. It resumes the latest look
+    only when that look's open record is readable, the freeze recorded it unfinished, no damaged
+    line could be its completion record - undeclared, or bytes that some declaration made at or
+    after the step it began also covered - and no lost record could postdate it. Otherwise it is a
+    new look while the count is below the allowance, and refused at it. A new look supersedes every
+    unfinished one. Authorising sets the allowance to the count plus one.
+    """
+
+    def __init__(self):
+        self.looks, self.lines, self.saved, self.declarations = [], [], [], []
+        self.allowance, self.closes, self.declared = 1, {}, 0
+
+    def latest(self):
+        return max(self.looks, key=lambda look: look["seq"]) if self.looks else None
+
+    def readable(self, look):
+        return ("open", look["label"]) in self.lines
+
+    def has_close(self, look):
+        return any(t[0] == "close" and t[1] == look["label"] for t in self.lines)
+
+    def closed(self, look):
+        return look["finished_at"] is not None or self.has_close(look)
+
+    def damage(self):
+        import collections
+        return collections.Counter(t for t in self.lines if t[0] in ("junk", "half"))
+
+    def declared_damage(self):
+        import collections
+        total = collections.Counter()
+        for declaration in self.declarations:
+            total.update(declaration["damage"])
+        return total
+
+    def may_be_completion_of(self, look):
+        declared = self.declared_damage()
+        return any(count > declared[kind] or any(d["damage"][kind] and d["at"] >= look["began"]
+                                                 for d in self.declarations)
+                   for kind, count in self.damage().items())
+
+    def missing_completion(self, look):
+        return (look["finished_at"] is not None and self.readable(look)
+                and not self.has_close(look) and not self.may_be_completion_of(look))
+
+    def undeclared(self):
+        lost = {label for d in self.declarations for label in d["looks"]}
+        closes = lost | {label for d in self.declarations for label in d["closes"]}
+        return ([l["label"] for l in self.looks if not self.readable(l) and l["label"] not in lost],
+                [l["label"] for l in self.looks
+                 if self.missing_completion(l) and l["label"] not in closes],
+                self.damage() - self.declared_damage())
+
+    def valid(self):
+        looks, closes, damage = self.undeclared()
+        return not (looks or closes or damage)
+
+    def resumable(self):
+        left_open = [l for l in self.looks if self.readable(l) and not self.closed(l)]
+        if not left_open:
+            return None
+        look = max(left_open, key=lambda l: l["seq"])
+        if look is not self.latest() or look["superseded"] or self.may_be_completion_of(look):
+            return None
+        for other in self.looks:
+            if other is not look and (
+                    (not self.readable(other) and not other["began"] < look["began"])
+                    or (self.missing_completion(other)
+                        and not other["finished_at"] < look["began"])):
+                return None
+        return look
+
+    def request(self):
+        if not self.valid():
+            return "refused", None
+        look = self.resumable()
+        if look:
+            return "resumed", look
+        return ("new", None) if len(self.looks) < self.allowance else ("refused", None)
+
+    def begin(self, step):
+        for other in self.looks:
+            if not self.closed(other):
+                other["superseded"] = True
+        look = {"label": "ABCDEFGH"[len(self.looks)], "seq": len(self.looks) + 1,
+                "began": step, "finished_at": None, "superseded": False}
+        self.looks.append(look)
+        self.lines.append(("open", look["label"]))
+        return look
+
+    def complete(self, look, step):
+        if look["finished_at"] is None:
+            look["finished_at"] = step
+        self.closes[look["label"]] = self.closes.get(look["label"], 0) + 1
+        self.lines.append(("close", look["label"], self.closes[look["label"]]))
+
+    def apply(self, op, arg, step, rng):
+        """Advance by one step; return what the step must do."""
+        if op in ("ask", "finish"):
+            outcome, look = self.request()
+            if outcome == "new":
+                look = self.begin(step)
+            if op == "finish" and look is not None:
+                self.complete(look, step)
+            return {"outcome": outcome, "look": look["label"] if look else None,
+                    "requests": 0 if outcome == "refused" else 1}
+        if op == "replay":
+            if not self.valid():
+                return {"outcome": "refused", "requests": 0}
+            look = self.latest()
+            if look is not None:
+                self.complete(look, step)
+            return {"outcome": "replayed", "look": look["label"] if look else None,
+                    "requests": 0}
+        if op == "authorise":
+            if not self.valid():
+                return {"outcome": "refused"}
+            self.allowance = len(self.looks) + 1
+            return {"outcome": "authorised"}
+        if op == "declare":
+            looks, closes, damage = self.undeclared()
+            if not (looks or closes or damage):
+                return {"outcome": "refused"}
+            self.declarations.append({"at": step, "looks": looks, "closes": closes,
+                                      "damage": damage})
+            self.declared += 1
+            self.lines.append(("declared", self.declared))
+            return {"outcome": "declared"}
+        genuine = [t for t in self.lines if t[0] in ("open", "close", "declared")]
+        if op == "lose log":
+            self.saved += genuine
+            self.lines = []
+        elif op == "drop open":
+            self.saved += [t for t in self.lines if t == ("open", arg)]
+            self.lines = [t for t in self.lines if t != ("open", arg)]
+        elif op == "drop close":
+            self.saved += [t for t in self.lines if t[0] == "close" and t[1] == arg]
+            self.lines = [t for t in self.lines if not (t[0] == "close" and t[1] == arg)]
+        elif op == "damage close":
+            at = max(i for i, t in enumerate(self.lines) if t[0] == "close" and t[1] == arg)
+            self.saved.append(self.lines[at])
+            self.lines[at] = ("half",) + self.lines[at][1:]
+        elif op == "junk":
+            self.lines.append(("junk",))
+        elif op == "drop junk":
+            del self.lines[max(i for i, t in enumerate(self.lines) if t == ("junk",))]
+        elif op == "restore before":
+            self.lines = self.saved + self.lines
+        elif op == "restore after":
+            self.lines = self.lines + self.saved
+        elif op == "restore twice":
+            self.lines = self.saved + self.saved + self.lines
+        elif op == "restore over the damage":
+            self.lines = [("close",) + t[1:] if t[0] == "half" and ("close",) + t[1:] in self.saved
+                          else t for t in self.lines]
+        elif op == "shuffle":
+            rng.shuffle(self.lines)
+        elif op == "duplicate":
+            self.lines.insert(rng.randrange(len(self.lines) + 1), rng.choice(genuine))
+        else:
+            raise AssertionError(f"unknown step {op!r}")
+        return {"outcome": "edited"}
+
+
+_GENERATED_OPS = {"ask": 3, "finish": 3, "replay": 1, "authorise": 2, "declare": 3,
+                  "lose log": 1, "drop open": 1, "drop close": 1, "damage close": 1, "junk": 2,
+                  "drop junk": 1, "restore before": 1, "restore after": 1, "restore twice": 1,
+                  "restore over the damage": 2, "shuffle": 1, "duplicate": 1}
+
+#: How a sequence may open before its random steps: nothing, or a history that sets up a case the
+#: policy distinguishes and a random walk rarely assembles on its own.
+_GENERATED_OPENINGS = [
+    (),
+    # a look interrupted, its log lost and declared, a replacement begun
+    (("ask", None), ("lose log", None), ("declare", None), ("authorise", None), ("ask", None)),
+    # a look interrupted, damage declared after it began, a replacement finished
+    (("ask", None), ("junk", None), ("declare", None), ("authorise", None), ("finish", None)),
+    # identical damage declared before a look began and again after it
+    (("finish", None), ("junk", None), ("declare", None), ("authorise", None), ("ask", None),
+     ("junk", None), ("declare", None)),
+    # a finished look's completion record damaged and declared, then a later look
+    (("finish", None), ("damage close", "A"), ("declare", None), ("authorise", None),
+     ("ask", None)),
+]
+_GENERATED_ENDING = ("ask", "declare", "ask", "replay")
+_GENERATED_SEQUENCES = 40
+
+
+def _generated_arguments(model, op):
+    """What `op` can act on now - nothing when it cannot happen. At most three looks and two
+    damaged lines of the one kind, so every sequence stays bounded."""
+    lines = model.lines
+    genuine = [t for t in lines if t[0] in ("open", "close", "declared")]
+    if op in ("ask", "finish", "declare"):
+        return [None]
+    if op == "replay":
+        return [None] if model.looks else []
+    if op == "authorise":
+        return [None] if len(model.looks) < 3 and model.allowance <= len(model.looks) else []
+    if op in ("lose log", "duplicate"):
+        return [None] if genuine else []
+    if op == "drop open":
+        return sorted({t[1] for t in lines if t[0] == "open"})
+    if op in ("drop close", "damage close"):
+        return sorted({t[1] for t in lines if t[0] == "close"})
+    if op == "junk":
+        return [None] if lines.count(("junk",)) < 2 else []
+    if op == "drop junk":
+        return [None] if ("junk",) in lines else []
+    if op in ("restore before", "restore after", "restore twice"):
+        return [None] if model.saved else []
+    if op == "restore over the damage":
+        return [None] if any(t[0] == "half" and ("close",) + t[1:] in model.saved
+                             for t in lines) else []
+    if op == "shuffle":
+        return [None] if len(lines) > 1 else []
+    raise AssertionError(f"unknown step {op!r}")
+
+
+def _generated_sequence(seed, length=14):
+    """Sequence `seed`: its opening, random steps up to `length`, then the ending."""
+    import random
+    rng, model, steps = random.Random(seed), _RecoveryModel(), []
+    opening = _GENERATED_OPENINGS[seed % len(_GENERATED_OPENINGS)]
+    while len(steps) < length + len(_GENERATED_ENDING):
+        number = len(steps) + 1
+        if len(steps) < len(opening):
+            op, arg = opening[len(steps)]
+        elif len(steps) < length:
+            op, arg = rng.choice([(op, arg) for op, weight in _GENERATED_OPS.items()
+                                  for arg in _generated_arguments(model, op)
+                                  for _ in range(weight)])
+        else:
+            op, arg = _GENERATED_ENDING[len(steps) - length], None
+        model.apply(op, arg, number, random.Random(seed * 1000 + number))
+        steps.append((op, arg))
+    return steps
+
+
+def test_the_generated_sequences_reach_every_case_the_policy_distinguishes():
+    """
+    A generator is only as good as what it reaches. Walked through the model alone, the sequences
+    must take every kind of step and reach legitimate resumes - some with older declared damage
+    still in the log - looks not resumed because damage was declared after they began, identical
+    damaged lines declared at different times, a superseded look's records restored, requests
+    refused at the allowance and until a declaration, and a declaration with nothing to declare.
+    """
+    import collections
+    import random
+    seen = collections.Counter()
+    for seed in range(_GENERATED_SEQUENCES):
+        model = _RecoveryModel()
+        for number, (op, arg) in enumerate(_generated_sequence(seed), start=1):
+            valid, latest = model.valid(), model.latest()
+            risky = bool(latest and model.readable(latest) and not model.closed(latest)
+                         and not latest["superseded"] and model.may_be_completion_of(latest))
+            outcome = model.apply(op, arg, number,
+                                  random.Random(seed * 1000 + number))["outcome"]
+            seen[op] += 1
+            if op in ("ask", "finish"):
+                seen[outcome if outcome != "refused" else
+                     "refused at the allowance" if valid else "refused until declared"] += 1
+                seen["resumed with declared damage in the log"] += (
+                    outcome == "resumed" and bool(model.damage()))
+                seen["not resumed: damage declared after the look began"] += (
+                    outcome != "resumed" and valid and risky)
+            if op == "declare":
+                seen["nothing to declare"] += outcome == "refused"
+                seen["identical damaged lines declared at different times"] += sum(
+                    1 for d in model.declarations if d["damage"][("junk",)]) >= 2
+            if op.startswith("restore"):
+                seen["a superseded look's records restored"] += any(
+                    look["superseded"] and model.readable(look) and not model.closed(look)
+                    for look in model.looks)
+    for op in _GENERATED_OPS:
+        assert seen[op] >= 2, f"the sequences take {op!r} {seen[op]} time(s): {dict(seen)}"
+    for case, least in {"resumed": 10, "new": 20, "resumed with declared damage in the log": 5,
+                        "not resumed: damage declared after the look began": 10,
+                        "identical damaged lines declared at different times": 10,
+                        "a superseded look's records restored": 5,
+                        "refused at the allowance": 20, "refused until declared": 20,
+                        "nothing to declare": 10}.items():
+        assert seen[case] >= least, f"{case}: {seen[case]}, fewer than {least}: {dict(seen)}"
+
+
+def _generated_log_records():
+    """The log's lines as bytes without their line endings - what the reader parses."""
+    if not dr.EXPOSURE_LOG.exists():
+        return []
+    return [line.rstrip(b"\r") for line in dr.EXPOSURE_LOG.read_bytes().split(b"\n")
+            if line.strip()]
+
+
+def _run_generated_sequence(w, monkeypatch, tmp_path, seed, steps):
+    """Run each step for real and hold it to the model: what the step does, the records the writers
+    append, and after every step the count, the allowance, whether the history is valid and which
+    look may resume. Log edits write the model's own lines, from bytes the writers produced."""
+    import collections
+    import random
+    from datetime import datetime, timedelta, timezone
+    at = _controlled_clock(monkeypatch)
+    start = datetime(2026, 9, 13, tzinfo=timezone.utc)
+    model, ids, written = _RecoveryModel(), {}, {}
+    closes, declared = collections.Counter(), 0
+
+    def raw(token):
+        if token == ("junk",):
+            return _DAMAGED_LINE.rstrip(b"\n")
+        if token[0] == "half":
+            intact = written[("close",) + token[1:]]
+            return intact[: len(intact) // 2]
+        return written[token]
+
+    dr.freeze_selection()
+    for number, (op, arg) in enumerate(steps, start=1):
+        at((start + timedelta(seconds=number)).isoformat())
+        where = f"sequence {seed}, step {number} ({op} {arg or ''}) of {steps}"
+        tokens_before, before = len(model.lines), _generated_log_records()
+        expected = model.apply(op, arg, number, random.Random(seed * 1000 + number))
+        question = f"generated sequence {seed}, step {number}"
+        sent, named = 0, None
+        if op == "ask":
+            event, sent = _holdout_request(monkeypatch, tmp_path, question)
+            outcome = ("refused" if isinstance(event, Exception)
+                       else "resumed" if event["resumed"] else "new")
+            named = None if isinstance(event, Exception) else event["event_id"]
+        elif op == "finish":
+            frame, sent = _run_benchmark(monkeypatch, tmp_path, question)
+            if isinstance(frame, Exception):
+                outcome = "refused"
+            else:
+                assert frame.attrs["exposure_was_fresh"], where
+                outcome, named = None, frame.attrs["exposure_event_id"]
+        elif op == "replay":
+            asked = w.requests["n"]
+            try:
+                dr._require_frozen_selection()
+                frame = w.benchmark()
+                outcome, named = "replayed", frame.attrs["exposure_event_id"]
+            except RuntimeError:
+                outcome = "refused"
+            assert w.requests["n"] == asked, f"a replay made a request - {where}"
+        elif op in ("authorise", "declare"):
+            note = f"synthetic: generated sequence {seed}, step {number}"
+            try:
+                if op == "authorise":
+                    dr.freeze_selection(revalidate=True, note=note)
+                else:
+                    _declare(note)
+                outcome = op + "d"
+            except RuntimeError:
+                outcome = "refused"
+        elif op == "lose log":
+            dr.EXPOSURE_LOG.unlink(missing_ok=True)
+            outcome = "edited"
+        else:
+            dr.EXPOSURE_LOG.write_bytes(b"".join(raw(t) + b"\n" for t in model.lines))
+            outcome = "edited"
+
+        if outcome != "edited":
+            after = _generated_log_records()
+            assert after[:len(before)] == before, f"a writer rewrote the log - {where}"
+            appended = []
+            for line in after[len(before):]:
+                record = json.loads(line)
+                if record["type"] == "log_loss_declared":
+                    declared += 1
+                    token = ("declared", declared)
+                else:
+                    label = next((l for l, e in ids.items() if e == record["event_id"]), None)
+                    if label is None:
+                        assert record["type"] == "open", f"{record} - {where}"
+                        label = "ABCDEFGH"[len(ids)]
+                        ids[label] = record["event_id"]
+                    if record["type"] == "open":
+                        token = ("open", label)
+                    else:
+                        closes[label] += 1
+                        token = ("close", label, closes[label])
+                written[token] = line
+                appended.append(token)
+            assert appended == model.lines[tokens_before:], (
+                f"the writers appended {appended}, the model {model.lines[tokens_before:]} - "
+                f"{where}")
+            if outcome is None:
+                outcome = "new" if ("open", expected["look"]) in appended else "resumed"
+        assert outcome == expected["outcome"], f"{outcome}, expected {expected} - {where}"
+        if "requests" in expected:
+            assert sent == expected["requests"], f"{sent} request(s) - {where}"
+        if expected.get("look"):
+            assert named == ids[expected["look"]], f"named {named}, ids {ids} - {where}"
+
+        rec = dr._read_selection()
+        assert dr.known_exposure_count() == len(model.looks), f"count - {where}"
+        assert rec.get("authorised_exposures") == model.allowance, f"allowance - {where}"
+        problems = dr.exposure_history_problems(rec, dr.exposure_events())
+        assert (not problems) == model.valid(), f"validity: {problems} - {where}"
+        look = model.resumable()
+        assert ((dr.open_exposure(rec["freeze_id"]) or {}).get("event_id")
+                == (ids[look["label"]] if look else None)), f"resumable - {where}"
+
+    w.submit(_report_naming(ids[model.latest()["label"]]))
+
+
+@pytest.mark.parametrize("seed", range(_GENERATED_SEQUENCES),
+                         ids=lambda seed: f"sequence {seed:02d}")
+def test_generated_recovery_sequences_agree_with_an_independent_model(cached_holdout, monkeypatch,
+                                                                     tmp_path, seed):
+    """Every step of every generated sequence does exactly what the model allows - no request the
+    policy does not grant, every legitimate resume taken - and the history submits at the end."""
+    _run_generated_sequence(cached_holdout, monkeypatch, tmp_path, seed,
+                            _generated_sequence(seed))
